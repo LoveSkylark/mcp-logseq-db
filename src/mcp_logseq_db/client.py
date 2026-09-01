@@ -1,6 +1,7 @@
 """Failure-isolated client for the Logseq DB HTTP API."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from collections.abc import Callable
 from functools import wraps
@@ -167,7 +168,7 @@ class LogseqDBClient:
         max_response_bytes: int = 5_000_000,
         client_factory: ClientFactory = httpx.AsyncClient,
     ) -> None:
-        self._url = f"{base_url.rstrip('/')}/api"
+        self._url = _api_endpoint(base_url)
         self._api_token = api_token
         self._timeout = httpx.Timeout(
             connect=connect_timeout,
@@ -246,31 +247,67 @@ class LogseqDBClient:
             verify=self._verify_ssl,
             headers=headers,
         ) as client:
-            response = await client.post(
+            async with client.stream(
+                "POST",
                 self._url,
                 json={"method": method, "args": args},
-            )
+            ) as response:
+                content = await self._read_limited(response, method)
+                encoding = response.encoding or "utf-8"
+                text = content.decode(encoding, errors="replace")
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as error:
+                    body = text.strip()[:2000]
+                    raise LogseqAPIError(
+                        f"{method} failed ({response.status_code}): "
+                        f"{body or '<empty response body>'}"
+                    ) from error
+                try:
+                    result = json.loads(content)
+                except (UnicodeDecodeError, ValueError) as error:
+                    content_type = response.headers.get("content-type", "").lower()
+                    if method in PLAIN_TEXT_METHODS and content_type.startswith("text/plain"):
+                        result = text
+                    else:
+                        raise LogseqProtocolError(
+                            f"{method} returned malformed JSON"
+                        ) from error
+            self._observed_methods.add(method)
+            return result
+
+    async def _read_limited(self, response: httpx.Response, method: str) -> bytes:
+        content_length = response.headers.get("content-length")
+        if content_length is not None:
             try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as error:
-                body = response.text.strip()[:2000]
-                raise LogseqAPIError(
-                    f"{method} failed ({response.status_code}): "
-                    f"{body or '<empty response body>'}"
-                ) from error
-            if len(response.content) > self.max_response_bytes:
+                if int(content_length) > self.max_response_bytes:
+                    raise LogseqProtocolError(
+                        f"{method} response exceeds {self.max_response_bytes} bytes"
+                    )
+            except ValueError:
+                pass
+
+        content = bytearray()
+        async for chunk in response.aiter_bytes():
+            content.extend(chunk)
+            if len(content) > self.max_response_bytes:
                 raise LogseqProtocolError(
                     f"{method} response exceeds {self.max_response_bytes} bytes"
                 )
-            try:
-                result = response.json()
-            except ValueError as error:
-                content_type = response.headers.get("content-type", "").lower()
-                if method in PLAIN_TEXT_METHODS and content_type.startswith("text/plain"):
-                    result = response.text
-                else:
-                    raise LogseqProtocolError(
-                        f"{method} returned malformed JSON"
-                    ) from error
-            self._observed_methods.add(method)
-            return result
+        return bytes(content)
+
+
+def _api_endpoint(base_url: str) -> str:
+    value = base_url.strip()
+    try:
+        url = httpx.URL(value)
+    except httpx.InvalidURL as error:
+        raise ValueError("Logseq API URL must be a valid absolute URL") from error
+    if url.scheme not in {"http", "https"} or not url.host:
+        raise ValueError("Logseq API URL must be an absolute HTTP(S) URL")
+    if url.query or url.fragment:
+        raise ValueError("Logseq API URL must not contain a query or fragment")
+    path = url.path.rstrip("/")
+    if not path.endswith("/api"):
+        path = f"{path}/api"
+    return str(url.copy_with(path=path or "/api"))

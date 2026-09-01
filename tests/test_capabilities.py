@@ -11,6 +11,8 @@ class ProbeClient:
     async def call(self, method: str, args: list[Any]) -> Any:
         if method == "logseq.DB.getAppInfo":
             return {"version": "2.0.1", "supportDb": True}
+        if method == "logseq.DB.checkCurrentIsDbGraph":
+            return True
         return []
 
 
@@ -71,3 +73,25 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
         "db_move_block_experimental",
         "db_delete_block_experimental",
     )
+
+
+@pytest.mark.asyncio
+async def test_capabilities_fail_when_logseq_is_unreachable() -> None:
+    class UnreachableClient(ProbeClient):
+        async def call(self, method: str, args: list[Any]) -> Any:
+            raise RuntimeError("connection refused")
+
+    with pytest.raises(RuntimeError, match="connection refused"):
+        await CapabilityDiscovery(UnreachableClient()).discover()  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_capabilities_fail_for_non_db_graph() -> None:
+    class FileGraphClient(ProbeClient):
+        async def call(self, method: str, args: list[Any]) -> Any:
+            if method == "logseq.DB.checkCurrentIsDbGraph":
+                return False
+            return await super().call(method, args)
+
+    with pytest.raises(RuntimeError, match="current Logseq graph is not a DB graph"):
+        await CapabilityDiscovery(FileGraphClient()).discover()  # type: ignore[arg-type]

@@ -9,6 +9,12 @@ dependencies = [
     "mcp>=2,<3",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+]
+
 [project.scripts]
 mcp-logseq-db = "mcp_logseq_db.server:main"
 
@@ -22,9 +28,3 @@ packages = ["src/mcp_logseq_db"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 asyncio_mode = "auto"
-
-[dependency-groups]
-dev = [
-    "pytest>=8",
-    "pytest-asyncio>=0.24",
-]

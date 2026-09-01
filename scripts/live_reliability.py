@@ -17,10 +17,12 @@ async def raw_call(
     method: str,
     args: list[object],
     read_timeout: float,
+    verify_ssl: bool,
 ) -> httpx.Response:
     timeout = httpx.Timeout(connect=3, read=read_timeout, write=3, pool=3)
     async with httpx.AsyncClient(
         timeout=timeout,
+        verify=verify_ssl,
         headers={"Authorization": f"Bearer {token}", "Connection": "close"},
     ) as client:
         return await client.post(
@@ -46,6 +48,7 @@ async def main() -> None:
         read_attempts=settings.read_attempts,
         readback_attempts=settings.readback_attempts,
         readback_delay=settings.readback_delay,
+        verify_ssl=settings.verify_ssl,
     )
 
     app_info = await client.call("logseq.DB.getAppInfo", [])
@@ -59,6 +62,7 @@ async def main() -> None:
             "logseq.DB.getBlock",
             ["00000000-0000-0000-0000-000000000000"],
             0.25,
+            settings.verify_ssl,
         )
         print("INFO timeout probe returned before deadline")
     except httpx.TimeoutException:
@@ -72,6 +76,7 @@ async def main() -> None:
             "logseq.DB.getBlock",
             ["00000000-0000-0000-0000-000000000000"],
             10,
+            settings.verify_ssl,
         )
     )
     await asyncio.sleep(0)
@@ -112,4 +117,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(main())

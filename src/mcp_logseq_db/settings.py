@@ -1,5 +1,6 @@
 """Environment settings for the DB-only server."""
 
+import math
 import os
 from dataclasses import dataclass
 
@@ -51,7 +52,7 @@ def _positive_float(name: str, default: float) -> float:
         value = float(raw)
     except ValueError as error:
         raise RuntimeError(f"{name} must be a positive number") from error
-    if value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise RuntimeError(f"{name} must be a positive number")
     return value
 
@@ -62,7 +63,7 @@ def _nonnegative_float(name: str, default: float) -> float:
         value = float(raw)
     except ValueError as error:
         raise RuntimeError(f"{name} must be a non-negative number") from error
-    if value < 0:
+    if not math.isfinite(value) or value < 0:
         raise RuntimeError(f"{name} must be a non-negative number")
     return value
 
@@ -83,4 +84,4 @@ def _csv(name: str) -> tuple[str, ...]:
         value.strip()
         for value in os.getenv(name, "").split(",")
         if value.strip()
-    )
+    )

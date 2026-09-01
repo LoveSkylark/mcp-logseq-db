@@ -38,7 +38,6 @@ class CapabilityDiscovery:
     async def discover(self) -> DBCapabilities:
         query = "[:find ?entity :where [?entity :block/uuid]]"
         methods = (
-            ("app-info", "logseq.DB.getAppInfo", []),
             ("properties", "logseq.DB.getAllProperties", []),
             ("tags", "logseq.DB.getAllTags", []),
             ("datascript", "logseq.DB.datascriptQuery", [query]),
@@ -47,8 +46,10 @@ class CapabilityDiscovery:
         )
         try:
             async with asyncio.timeout(20):
-                results = await asyncio.gather(
-                    *(self._probe(method, args) for _, method, args in methods)
+                app_info, is_db_graph, *results = await asyncio.gather(
+                    self._client.call("logseq.DB.getAppInfo", []),
+                    self._client.call("logseq.DB.checkCurrentIsDbGraph", []),
+                    *(self._probe(method, args) for _, method, args in methods),
                 )
         except TimeoutError as error:
             raise RuntimeError(
@@ -57,7 +58,10 @@ class CapabilityDiscovery:
         probed = {
             label: result for (label, _, _), result in zip(methods, results)
         }
-        app_info = probed["app-info"]
+        if not isinstance(app_info, dict) or app_info.get("supportDb") is not True:
+            raise RuntimeError("Connected Logseq instance does not report DB support")
+        if not is_db_graph:
+            raise RuntimeError("The current Logseq graph is not a DB graph")
         db_version = (
             str(app_info.get("version"))
             if isinstance(app_info, dict) and app_info.get("version")
@@ -65,11 +69,11 @@ class CapabilityDiscovery:
         )
         supported_reads = [
             method
-            for label, method, _ in methods[1:]
+            for label, method, _ in methods
             if probed[label] is not None
         ]
         query_features = [
-            label for label, _, _ in methods[3:] if probed[label] is not None
+            label for label, _, _ in methods[2:] if probed[label] is not None
         ]
 
         removals = tuple(

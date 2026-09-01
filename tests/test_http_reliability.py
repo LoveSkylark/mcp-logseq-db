@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -28,14 +29,15 @@ class ScriptedClient:
     async def __aexit__(self, *args: object) -> None:
         self._lifecycle.append("closed")
 
-    async def post(self, url: str, **_: Any) -> httpx.Response:
+    @asynccontextmanager
+    async def stream(self, method: str, url: str, **_: Any):
         outcome = self._outcomes.pop(0)
         if callable(outcome):
-            return await outcome()
+            outcome = await outcome()
         if isinstance(outcome, Exception):
             raise outcome
-        outcome.request = httpx.Request("POST", url)
-        return outcome
+        outcome.request = httpx.Request(method, url)
+        yield outcome
 
 
 def make_client(outcomes: list[Outcome], lifecycle: list[str]) -> LogseqDBClient:
@@ -303,3 +305,50 @@ async def test_oversized_response_is_rejected() -> None:
 
     with pytest.raises(LogseqProtocolError, match="exceeds 20 bytes"):
         await client.call("logseq.DB.getAllTags", [])
+
+
+@pytest.mark.asyncio
+async def test_http_wire_contract_and_existing_api_suffix() -> None:
+    captured_init: dict[str, Any] = {}
+    captured_post: dict[str, Any] = {}
+    outcomes: list[Outcome] = [httpx.Response(200, json=[])]
+
+    class CapturingClient(ScriptedClient):
+        @asynccontextmanager
+        async def stream(self, method: str, url: str, **kwargs: Any):
+            captured_post.update(method=method, url=url, **kwargs)
+            async with super().stream(method, url, **kwargs) as response:
+                yield response
+
+    def factory(**kwargs: Any) -> CapturingClient:
+        captured_init.update(kwargs)
+        return CapturingClient(outcomes, [], **kwargs)
+
+    client = LogseqDBClient(
+        "https://localhost:12315/api/",
+        "secret-token",
+        connect_timeout=2,
+        read_timeout=9,
+        verify_ssl=False,
+        client_factory=factory,
+    )
+
+    assert await client.call("logseq.DB.getAllTags", []) == []
+    assert captured_post == {
+        "method": "POST",
+        "url": "https://localhost:12315/api",
+        "json": {"method": "logseq.DB.getAllTags", "args": []},
+    }
+    assert captured_init["headers"] == {
+        "Authorization": "Bearer secret-token",
+        "Connection": "close",
+    }
+    assert captured_init["verify"] is False
+    assert captured_init["timeout"].connect == 2
+    assert captured_init["timeout"].read == 9
+
+
+@pytest.mark.parametrize("url", ["", "localhost:12315", "ftp://localhost/api"])
+def test_invalid_api_url_is_rejected(url: str) -> None:
+    with pytest.raises(ValueError, match="absolute HTTP\\(S\\) URL"):
+        LogseqDBClient(url, "token")

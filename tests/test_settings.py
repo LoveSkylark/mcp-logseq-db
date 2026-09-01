@@ -40,3 +40,12 @@ def test_settings_parse_reliability_and_write_scope(monkeypatch) -> None:
     assert settings.write_title_prefixes == ("Work/", "Lab/")
     assert settings.write_property_prefixes == (":user.property/work",)
     assert settings.write_entity_uuids == frozenset({"one", "two"})
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_settings_reject_non_finite_timeouts(monkeypatch, value: str) -> None:
+    monkeypatch.setenv("LOGSEQ_API_TOKEN", "test-token")
+    monkeypatch.setenv("LOGSEQ_API_READ_TIMEOUT", value)
+
+    with pytest.raises(RuntimeError, match="must be a positive number"):
+        Settings.from_env()
