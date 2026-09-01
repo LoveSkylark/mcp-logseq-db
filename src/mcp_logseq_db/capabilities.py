@@ -1,0 +1,164 @@
+"""Runtime capability discovery for the connected Logseq DB instance."""
+
+import asyncio
+from dataclasses import asdict, dataclass
+from typing import Any
+
+from .client import LogseqDBClient, VERIFIED_WRITE_METHODS, WRITE_METHODS
+
+
+@dataclass(frozen=True)
+class DBCapabilities:
+    db_version: str | None
+    verified_against_db_version: str
+    version_matches_manifest: bool
+    supported_entity_types: tuple[str, ...]
+    metadata_mutable_entity_types: tuple[str, ...]
+    supported_content_operations: tuple[str, ...]
+    supported_write_operations: tuple[str, ...]
+    supported_removal_operations: tuple[str, ...]
+    supported_query_features: tuple[str, ...]
+    supported_read_operations: tuple[str, ...]
+    candidate_write_operations: tuple[str, ...]
+    unavailable_over_http: tuple[str, ...]
+    rejected_operations: tuple[str, ...]
+    experimental_operations: tuple[str, ...]
+    experimental_writes_enabled: bool
+    supported_mcp_write_tools: tuple[str, ...]
+    experimental_mcp_write_tools: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class CapabilityDiscovery:
+    def __init__(self, client: LogseqDBClient) -> None:
+        self._client = client
+
+    async def discover(self) -> DBCapabilities:
+        query = "[:find ?entity :where [?entity :block/uuid]]"
+        methods = (
+            ("app-info", "logseq.DB.getAppInfo", []),
+            ("properties", "logseq.DB.getAllProperties", []),
+            ("tags", "logseq.DB.getAllTags", []),
+            ("datascript", "logseq.DB.datascriptQuery", [query]),
+            ("datalog", "logseq.DB.q", [query]),
+            ("custom-query", "logseq.DB.customQuery", [query]),
+        )
+        try:
+            async with asyncio.timeout(20):
+                results = await asyncio.gather(
+                    *(self._probe(method, args) for _, method, args in methods)
+                )
+        except TimeoutError as error:
+            raise RuntimeError(
+                "Capability probes exceeded 20 seconds; the Logseq DB worker may be wedged"
+            ) from error
+        probed = {
+            label: result for (label, _, _), result in zip(methods, results)
+        }
+        app_info = probed["app-info"]
+        db_version = (
+            str(app_info.get("version"))
+            if isinstance(app_info, dict) and app_info.get("version")
+            else None
+        )
+        supported_reads = [
+            method
+            for label, method, _ in methods[1:]
+            if probed[label] is not None
+        ]
+        query_features = [
+            label for label, _, _ in methods[3:] if probed[label] is not None
+        ]
+
+        removals = tuple(
+            sorted(
+                method
+                for method in VERIFIED_WRITE_METHODS
+                if ".remove" in method or method.endswith("deletePage")
+            )
+        )
+
+        return DBCapabilities(
+            db_version=db_version,
+            verified_against_db_version="2.0.1",
+            version_matches_manifest=db_version == "2.0.1",
+            supported_entity_types=("page", "block", "tag", "property"),
+            metadata_mutable_entity_types=("page", "block", "tag", "property"),
+            supported_content_operations=(
+                "create-page",
+                "create-top-level-block",
+                "edit-block-title",
+                "rename-page",
+                "recycle-page",
+                "rename-tag",
+                "delete-tag",
+            ),
+            supported_write_operations=tuple(sorted(VERIFIED_WRITE_METHODS)),
+            supported_removal_operations=removals,
+            supported_query_features=tuple(query_features),
+            supported_read_operations=tuple(supported_reads),
+            candidate_write_operations=tuple(
+                sorted(WRITE_METHODS - VERIFIED_WRITE_METHODS)
+            ),
+            unavailable_over_http=(
+                "logseq.DB.onChanged",
+                "logseq.DB.onBlockChanged",
+                "logseq.DB.getFavorites",
+                "logseq.DB.setPropertyNodeTags",
+            ),
+            rejected_operations=(
+                "logseq.DB.createPage",
+                "logseq.DB.getBlock",
+                "logseq.DB.getBlockProperties",
+                "logseq.DB.getBlockProperty",
+                "logseq.DB.getPageProperties",
+                "logseq.DB.insertBatchBlock",
+                "logseq.DB.prependBlockInPage",
+                "logseq.DB.updateBlock",
+            ),
+            experimental_operations=(
+                "logseq.DB.insertBlock",
+                "logseq.DB.moveBlock",
+                "logseq.DB.removeBlock",
+            ),
+            experimental_writes_enabled=bool(
+                getattr(self._client, "experimental_writes_enabled", False)
+            ),
+            supported_mcp_write_tools=(
+                "db_upsert_nodes",
+                "db_create_page",
+                "db_create_top_level_block",
+                "db_upsert_block",
+                "db_rename_page",
+                "db_recycle_page",
+                "db_upsert_property",
+                "db_remove_property",
+                "db_create_tag",
+                "db_rename_tag",
+                "db_delete_tag",
+                "db_add_tag_property",
+                "db_remove_tag_property",
+                "db_add_tag_extends",
+                "db_remove_tag_extends",
+                "db_upsert_block_property",
+                "db_remove_block_property",
+                "db_add_block_tag",
+                "db_remove_block_tag",
+                "db_set_block_icon",
+                "db_remove_block_icon",
+            ),
+            experimental_mcp_write_tools=(
+                "db_insert_block_experimental",
+                "db_move_block_experimental",
+                "db_delete_block_experimental",
+            ),
+        )
+
+    async def _probe(self, method: str, args: list[Any]) -> Any | None:
+        try:
+            return await self._client.call(method, args)
+        except Exception:
+            return None
+
