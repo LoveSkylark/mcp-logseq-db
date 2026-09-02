@@ -5,7 +5,7 @@ description: "Use when reading or modifying a Logseq 2.x DB graph through the mc
 
 # Logseq DB-Native MCP
 
-**Latest live status:** Logseq 2.0.1 DB graph, `mcp-logseq-db` 0.2.7.
+**Latest live status:** Logseq 2.0.1 DB graph, `mcp-logseq-db` 0.2.8.
 
 | Tested | Path | Status |
 |---|---|---|
