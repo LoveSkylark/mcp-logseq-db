@@ -390,6 +390,31 @@ def create_server(client: LogseqDBClient) -> MCPServer:
             )
         ).to_dict()
 
+    @server.tool(name="upsert_page_property", structured_output=True)
+    async def upsert_page_property(
+        page_uuid: str,
+        property_ident: str,
+        value: Any,
+        options: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Set an exact property on an exact page UUID and verify its value."""
+        return (
+            await VerifiedMutations(client).upsert_page_property(
+                page_uuid, property_ident, value, options
+            )
+        ).to_dict()
+
+    @server.tool(name="remove_page_property", structured_output=True)
+    async def remove_page_property(
+        page_uuid: str, property_ident: str
+    ) -> dict[str, Any]:
+        """Remove an exact property from a page UUID and verify its absence."""
+        return (
+            await VerifiedMutations(client).remove_page_property(
+                page_uuid, property_ident
+            )
+        ).to_dict()
+
     @server.tool(name="add_block_tag", structured_output=True)
     async def add_block_tag(block_uuid: str, tag_uuid: str) -> dict[str, Any]:
         """Add an exact tag UUID to an exact block UUID and verify it."""
@@ -468,6 +493,10 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         ),
         "upsert_block_property": (
             "Use an exact block UUID, a full namespaced property ident, "
+            "the schema-compatible value, and an optional options object."
+        ),
+        "upsert_page_property": (
+            "Use an exact page UUID, a full namespaced property ident, "
             "the schema-compatible value, and an optional options object."
         ),
         "add_block_tag": "Use exact block and tag UUIDs.",

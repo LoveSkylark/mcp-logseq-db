@@ -34,6 +34,8 @@ outliner operations.
 - `remove_tag_extends`
 - `upsert_block_property`
 - `remove_block_property`
+- `upsert_page_property`
+- `remove_page_property`
 - `add_block_tag`
 - `remove_block_tag`
 - `add_page_tag`
@@ -95,6 +97,8 @@ Tag and hierarchy details verified on Logseq 2.0.1:
   acknowledged.
 - Block tag tools are block-only. Page tag changes use `add_page_tag` and
   `remove_page_tag` through the native DB tag route.
+- Block and page property tools validate the target kind before calling the
+  shared DB property route.
 - CLI graph-worker child insertion and movement both preserved parent and owning
 	page in the 2026-09-02 live run.
 - `get_block` returns `found=false` for missing or deleted UUIDs.

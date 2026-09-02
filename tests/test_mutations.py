@@ -229,6 +229,66 @@ async def test_block_property_mismatch_retains_previous_and_observed_state() -> 
 
 
 @pytest.mark.asyncio
+async def test_page_property_verifies_exact_primitive_value() -> None:
+    page = {"id": 11, "uuid": PAGE_UUID, "name": "page"}
+    current = {"id": 11, "uuid": PAGE_UUID, "name": "page", IDENT: {"id": 99}}
+    client = RecordingClient([
+        {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "number"},
+        page,
+        None,
+        current,
+        [99],
+        {"id": 99, ":logseq.property/value": 42},
+    ])
+
+    result = await VerifiedMutations(client).upsert_page_property(  # type: ignore[arg-type]
+        PAGE_UUID, IDENT, 42
+    )
+
+    assert result.previous_state == page
+    assert result.verified_state == current
+    assert client.calls[2] == (
+        "logseq.DB.upsertBlockProperty",
+        [PAGE_UUID, IDENT, 42, {}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_page_property_rejects_block_uuid_before_mutation() -> None:
+    client = RecordingClient([
+        {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "default"},
+        {"id": 11, "uuid": TAG_UUID},
+    ])
+
+    with pytest.raises(ValueError, match="block, not a page"):
+        await VerifiedMutations(client).upsert_page_property(  # type: ignore[arg-type]
+            TAG_UUID, IDENT, "value"
+        )
+
+    assert all(method != "logseq.DB.upsertBlockProperty" for method, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_remove_page_property_verifies_absence() -> None:
+    page = {"id": 11, "uuid": PAGE_UUID, "name": "page", IDENT: "before"}
+    current = {"id": 11, "uuid": PAGE_UUID, "name": "page"}
+    client = RecordingClient([
+        {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "default"},
+        page,
+        None,
+        current,
+    ])
+
+    result = await VerifiedMutations(client).remove_page_property(  # type: ignore[arg-type]
+        PAGE_UUID, IDENT
+    )
+
+    assert result.previous_state == page
+    assert result.verified_state == current
+    assert client.calls[2] == ("logseq.DB.removeBlockProperty", [PAGE_UUID, IDENT])
+
+
+@pytest.mark.asyncio
 async def test_property_scope_denies_write_before_api_call() -> None:
     client = RecordingClient([])
     client.write_policy = WriteAccessPolicy(

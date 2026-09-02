@@ -157,6 +157,8 @@ class CapabilityDiscovery:
                 "remove_tag_extends",
                 "upsert_block_property",
                 "remove_block_property",
+                "upsert_page_property",
+                "remove_page_property",
                 "add_block_tag",
                 "remove_block_tag",
                 "add_page_tag",

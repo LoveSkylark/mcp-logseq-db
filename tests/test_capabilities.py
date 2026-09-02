@@ -70,6 +70,8 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     assert "move_block" in capabilities.supported_mcp_write_tools
     assert "add_page_tag" in capabilities.supported_mcp_write_tools
     assert "remove_page_tag" in capabilities.supported_mcp_write_tools
+    assert "upsert_page_property" in capabilities.supported_mcp_write_tools
+    assert "remove_page_property" in capabilities.supported_mcp_write_tools
     assert capabilities.experimental_mcp_write_tools == ()
 
 

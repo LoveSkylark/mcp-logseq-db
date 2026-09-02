@@ -379,6 +379,46 @@ class VerifiedMutations:
         )
 
     @serialized_write
+    async def upsert_page_property(
+        self,
+        page_uuid: str,
+        property_ident: str,
+        value: Any,
+        options: dict[str, Any] | None = None,
+    ) -> MutationResult:
+        page_uuid = self._validated_uuid(page_uuid)
+        self._require_entity(page_uuid)
+        self._require_property(property_ident)
+        property_entity = await self._property(property_ident)
+        previous = await self._page(page_uuid)
+        response, timed_out = await self._write(
+            "logseq.DB.upsertBlockProperty",
+            [page_uuid, property_ident, value, options or {}],
+        )
+        current, matches = await poll_readback(
+            self._client,
+            lambda: self._block_property_state(
+                page_uuid, property_ident, property_entity, value
+            ),
+            lambda state: state[1],
+        )
+        if not matches:
+            self._raise_verification(
+                "Page property value verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(
+            response,
+            current,
+            timed_out,
+            previous_state=previous,
+            observed_state=current,
+        )
+
+    @serialized_write
     async def remove_block_property(
         self, block_uuid: str, property_ident: str
     ) -> MutationResult:
@@ -398,6 +438,33 @@ class VerifiedMutations:
         if property_ident in current:
             self._raise_verification(
                 "Block property removal verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
+
+    @serialized_write
+    async def remove_page_property(
+        self, page_uuid: str, property_ident: str
+    ) -> MutationResult:
+        page_uuid = self._validated_uuid(page_uuid)
+        self._require_entity(page_uuid)
+        self._require_property(property_ident)
+        await self._property(property_ident)
+        previous = await self._page(page_uuid)
+        response, timed_out = await self._write(
+            "logseq.DB.removeBlockProperty", [page_uuid, property_ident]
+        )
+        current = await poll_readback(
+            self._client,
+            lambda: self._entity(page_uuid),
+            lambda entity: property_ident not in entity,
+        )
+        if property_ident in current:
+            self._raise_verification(
+                "Page property removal verification failed",
                 response=response,
                 previous_state=previous,
                 observed_state=current,
