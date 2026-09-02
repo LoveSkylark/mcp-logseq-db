@@ -4,6 +4,19 @@ version = "0.2.8"
 description = "DB-native MCP server for Logseq 2.x"
 readme = "README.md"
 requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Office/Business :: News/Diary",
+]
 dependencies = [
     "httpx>=0.27,<1",
     "mcp>=2,<3",
@@ -17,6 +30,11 @@ dev = [
 
 [project.scripts]
 mcp-logseq-db = "mcp_logseq_db.server:main"
+
+[project.urls]
+Homepage = "https://github.com/LoveSkylark/mcp-logseq-db"
+Repository = "https://github.com/LoveSkylark/mcp-logseq-db"
+Issues = "https://github.com/LoveSkylark/mcp-logseq-db/issues"
 
 [build-system]
 requires = ["hatchling"]

@@ -101,13 +101,95 @@ Tag and hierarchy details verified on Logseq 2.0.1:
 - `get_block_tree` returns nested `children` while excluding unrelated page
 	siblings.
 
-## Setup
+## Install from GitHub
+
+Install from the public repository with Python 3.11 or newer. On the Windows
+Logseq host used for validation, Python 3.13 is used:
 
 ```powershell
+git clone https://github.com/LoveSkylark/mcp-logseq-db.git
 cd mcp-logseq-db
-python -m pip install -e ".[dev]"
+py -3.13 -m pip install --upgrade pip
+py -3.13 -m pip install .
+```
+
+For editable development, install with test dependencies:
+
+```powershell
+git clone https://github.com/LoveSkylark/mcp-logseq-db.git
+cd mcp-logseq-db
+py -3.13 -m pip install -e ".[dev]"
+```
+
+To install a local release wheel after building it:
+
+```powershell
+py -3.13 -m pip wheel --no-deps . -w dist
+py -3.13 -m pip install --force-reinstall --no-deps .\dist\mcp_logseq_db-0.2.8-py3-none-any.whl
+```
+
+Run the server directly for a smoke test:
+
+```powershell
 $env:LOGSEQ_API_TOKEN = "your-token"
-python -m mcp_logseq_db.server
+py -3.13 -m mcp_logseq_db.server
+```
+
+Or, after installation, use the console script:
+
+```powershell
+$env:LOGSEQ_API_TOKEN = "your-token"
+mcp-logseq-db
+```
+
+### macOS install
+
+Install Python 3.11 or newer first. With Homebrew:
+
+```zsh
+brew install python git
+git clone https://github.com/LoveSkylark/mcp-logseq-db.git
+cd mcp-logseq-db
+python3 -m pip install --upgrade pip
+python3 -m pip install .
+```
+
+For editable development on macOS:
+
+```zsh
+git clone https://github.com/LoveSkylark/mcp-logseq-db.git
+cd mcp-logseq-db
+python3 -m pip install -e ".[dev]"
+```
+
+Run a smoke test from Terminal:
+
+```zsh
+export LOGSEQ_API_TOKEN="your-token"
+export LOGSEQ_API_URL="http://127.0.0.1:12315"
+python3 -m mcp_logseq_db.server
+```
+
+If the console script is on your `PATH`, this is equivalent:
+
+```zsh
+export LOGSEQ_API_TOKEN="your-token"
+mcp-logseq-db
+```
+
+To find the installed executable path for MCP client configuration:
+
+```zsh
+python3 -m site --user-base
+which mcp-logseq-db
+```
+
+Depending on how Python was installed, the command path is commonly one of:
+
+```text
+/opt/homebrew/bin/mcp-logseq-db
+/usr/local/bin/mcp-logseq-db
+~/Library/Python/3.x/bin/mcp-logseq-db
 ```
 
 Environment variables:
@@ -140,15 +222,345 @@ the MCP before writing again. `capabilities` reports
 `write_circuit_open` and `write_circuit_reason`. Query and search calls are
 single-attempt and are never retried after a timeout.
 
-The workspace `.vscode/mcp.json` prompts for the token and starts the same
-stdio server without storing the token.
+## Connect to Claude Desktop
 
-## Claude Desktop skill
+1. Enable the Logseq HTTP API server in Logseq Desktop and copy its API token.
+2. Install `mcp-logseq-db` into the same local user account that runs Claude
+  Desktop.
+3. Edit Claude Desktop's MCP configuration file:
 
-Import `dist/logseq-db-native.zip` through Claude Desktop Skills. The editable
-skill source is in `skills/logseq-db-native/`. Use this skill only with the
-`mcp-logseq-db` connector; do not enable the legacy DB/file graph skills in the
-same conversation.
+```text
+%APPDATA%\Claude\claude_desktop_config.json
+```
+
+Use either the installed console script:
+
+```json
+{
+  "mcpServers": {
+    "mcp-logseq-db": {
+      "command": "C:\\Users\\YOUR_USER\\AppData\\Local\\Programs\\Python\\Python313\\Scripts\\mcp-logseq-db.exe",
+      "env": {
+        "LOGSEQ_API_TOKEN": "paste-your-logseq-api-token-here",
+        "LOGSEQ_API_URL": "http://127.0.0.1:12315"
+      }
+    }
+  }
+}
+```
+
+Or run it through the Python launcher:
+
+```json
+{
+  "mcpServers": {
+    "mcp-logseq-db": {
+      "command": "py",
+      "args": ["-3.13", "-m", "mcp_logseq_db.server"],
+      "env": {
+        "LOGSEQ_API_TOKEN": "paste-your-logseq-api-token-here",
+        "LOGSEQ_API_URL": "http://127.0.0.1:12315"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after saving the file. In a new conversation, ask Claude
+to call `capabilities`; a healthy connection should report Logseq DB support and
+the `mcp-logseq-db` tool inventory.
+
+On macOS, Claude Desktop uses this configuration file:
+
+```text
+~/Library/Application Support/Claude/claude_desktop_config.json
+```
+
+Example macOS configuration using the Python module entry point:
+
+```json
+{
+  "mcpServers": {
+    "mcp-logseq-db": {
+      "command": "python3",
+      "args": ["-m", "mcp_logseq_db.server"],
+      "env": {
+        "LOGSEQ_API_TOKEN": "paste-your-logseq-api-token-here",
+        "LOGSEQ_API_URL": "http://127.0.0.1:12315"
+      }
+    }
+  }
+}
+```
+
+If `which mcp-logseq-db` prints a stable path, you can use the installed command
+instead:
+
+```json
+{
+  "mcpServers": {
+    "mcp-logseq-db": {
+      "command": "/opt/homebrew/bin/mcp-logseq-db",
+      "env": {
+        "LOGSEQ_API_TOKEN": "paste-your-logseq-api-token-here",
+        "LOGSEQ_API_URL": "http://127.0.0.1:12315"
+      }
+    }
+  }
+}
+```
+
+Do not enable this connector together with legacy Logseq file-graph or non-DB
+MCP servers in the same conversation. The tools intentionally target Logseq 2.x
+DB graphs and exact DB identifiers.
+
+## Connect to Claude Code with uv
+
+Claude Code can add a local stdio MCP server from the command line. This is the
+closest form to one-line MCP install snippets that use `uv` or `npx`.
+
+If you have `uv` installed, run this from the project where you want Claude Code
+to use Logseq:
+
+```bash
+claude mcp add mcp-logseq-db \
+  --env LOGSEQ_API_TOKEN=your_token_here \
+  --env LOGSEQ_API_URL=http://127.0.0.1:12315 \
+  -- uvx --from git+https://github.com/LoveSkylark/mcp-logseq-db.git mcp-logseq-db
+```
+
+The equivalent `uv run --with` form is:
+
+```bash
+claude mcp add mcp-logseq-db \
+  --env LOGSEQ_API_TOKEN=your_token_here \
+  --env LOGSEQ_API_URL=http://127.0.0.1:12315 \
+  -- uv run --with "mcp-logseq-db @ git+https://github.com/LoveSkylark/mcp-logseq-db.git" mcp-logseq-db
+```
+
+After adding it, check the connection:
+
+```bash
+claude mcp list
+claude mcp get mcp-logseq-db
+```
+
+Inside Claude Code, open `/mcp` and reconnect if the server was already cached
+or failed before Logseq was running.
+
+Use `--scope user` if you want the server available across all Claude Code
+projects, or `--scope project` if you want Claude Code to write a shareable
+`.mcp.json` entry for the current repository. Keep real tokens out of committed
+project files.
+
+This command configures Claude Code, not Claude Desktop. Claude Desktop still
+uses `claude_desktop_config.json` or an imported connector configuration.
+
+## Publish to PyPI
+
+Publishing to PyPI registers the `mcp-logseq-db` package name so users can run
+the short install command:
+
+```bash
+uvx mcp-logseq-db
+```
+
+and the short Claude Code MCP command:
+
+```bash
+claude mcp add mcp-logseq-db \
+  --env LOGSEQ_API_TOKEN=your_token_here \
+  --env LOGSEQ_API_URL=http://127.0.0.1:12315 \
+  -- uv run --with mcp-logseq-db mcp-logseq-db
+```
+
+Before the first upload, create accounts at both package indexes:
+
+- TestPyPI: `https://test.pypi.org/account/register/`
+- PyPI: `https://pypi.org/account/register/`
+
+Verify your email address and enable two-factor authentication. Check that the
+name is available before uploading:
+
+```powershell
+py -3.13 -m pip index versions mcp-logseq-db
+```
+
+If the package does not exist yet, the first successful upload creates the PyPI
+project. Build both a wheel and source distribution from a clean checkout:
+
+```powershell
+Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+py -3.13 -m pip install --upgrade build twine
+py -3.13 -m build
+py -3.13 -m twine check dist\*
+```
+
+Do a TestPyPI upload first:
+
+```powershell
+py -3.13 -m twine upload --repository testpypi dist\*
+```
+
+When prompted, use:
+
+```text
+username: __token__
+password: pypi-your-testpypi-token
+```
+
+Then test the package from TestPyPI in a fresh environment. Dependencies are
+resolved from real PyPI because TestPyPI may not mirror them all:
+
+```powershell
+py -3.13 -m venv .venv-testpypi
+.\.venv-testpypi\Scripts\Activate.ps1
+python -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple mcp-logseq-db
+python -m pip show mcp-logseq-db
+python -c "from importlib.metadata import version; print(version('mcp-logseq-db'))"
+deactivate
+```
+
+Publish to real PyPI only after the TestPyPI package installs cleanly:
+
+```powershell
+py -3.13 -m twine upload dist\*
+```
+
+Use the real PyPI API token for this upload:
+
+```text
+username: __token__
+password: pypi-your-real-pypi-token
+```
+
+For long-term releases, prefer PyPI Trusted Publishing from GitHub Actions over
+long-lived API tokens. On PyPI, add a trusted publisher for:
+
+```text
+Owner: LoveSkylark
+Repository: mcp-logseq-db
+Workflow name: publish.yml
+Environment name: pypi
+```
+
+Then a GitHub Actions workflow can build and publish with short-lived OIDC
+credentials instead of storing a PyPI token. The manual `twine upload` path above
+is simpler for the first local release.
+
+After publishing, verify the public install path:
+
+```powershell
+py -3.13 -m venv .venv-pypi
+.\.venv-pypi\Scripts\Activate.ps1
+python -m pip install mcp-logseq-db
+python -m pip show mcp-logseq-db
+python -c "from importlib.metadata import version; print(version('mcp-logseq-db'))"
+deactivate
+```
+
+`mcp-logseq-db` itself is a stdio MCP server command. Run it from an MCP client
+configuration, not as an interactive help command.
+
+## Connect to GitHub Copilot in VS Code
+
+GitHub Copilot Chat in VS Code can use MCP servers from a workspace or user MCP
+configuration. Create `.vscode/mcp.json` in your checkout if you want this MCP
+available only for the workspace:
+
+```json
+{
+  "inputs": [
+    {
+      "id": "logseq-api-token",
+      "type": "promptString",
+      "description": "Logseq API token",
+      "password": true
+    }
+  ],
+  "servers": {
+    "mcp-logseq-db": {
+      "type": "stdio",
+      "command": "py",
+      "args": ["-3.13", "-m", "mcp_logseq_db.server"],
+      "env": {
+        "LOGSEQ_API_TOKEN": "${input:logseq-api-token}",
+        "LOGSEQ_API_URL": "http://127.0.0.1:12315"
+      }
+    }
+  }
+}
+```
+
+On macOS, the VS Code workspace configuration can use `python3` as the command:
+
+```json
+{
+  "inputs": [
+    {
+      "id": "logseq-api-token",
+      "type": "promptString",
+      "description": "Logseq API token",
+      "password": true
+    }
+  ],
+  "servers": {
+    "mcp-logseq-db": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["-m", "mcp_logseq_db.server"],
+      "env": {
+        "LOGSEQ_API_TOKEN": "${input:logseq-api-token}",
+        "LOGSEQ_API_URL": "http://127.0.0.1:12315"
+      }
+    }
+  }
+}
+```
+
+For a machine-wide setup, add the same server definition to VS Code's user MCP
+configuration instead of the workspace file. Restart or reload VS Code, then use
+Copilot Chat's MCP tools view to enable `mcp-logseq-db` and run `capabilities`.
+
+## Deploy the Claude Skill
+
+The Claude Skill gives Claude operational guidance for using this MCP safely. It
+does not contain the Logseq API token; the token belongs only in the local MCP
+server configuration.
+
+Use the packaged skill:
+
+```text
+dist/logseq-db-native.zip
+```
+
+In Claude Desktop, open Settings, go to Skills, import the zip, then enable the
+`logseq-db-native` skill in conversations where the `mcp-logseq-db` connector is
+available. The editable skill source is in `skills/logseq-db-native/`.
+
+After editing the skill source, rebuild the zip from PowerShell:
+
+```powershell
+Compress-Archive -Path .\skills\logseq-db-native -DestinationPath .\dist\logseq-db-native.zip -Force
+```
+
+## GPT-style alternative to Claude Skills
+
+ChatGPT/GPT clients do not use Claude Skill zip files. Use the same knowledge as
+plain instructions instead:
+
+- Create a Custom GPT or project/workspace instruction set named
+  `logseq-db-native`.
+- Paste the contents of `skills/logseq-db-native/SKILL.md` into the instruction
+  or knowledge area.
+- If the GPT client supports MCP connectors, configure the same stdio command
+  and environment variables shown above.
+- If the GPT client does not support local MCP, it can still use the skill text
+  as guidance, but it cannot call `mcp-logseq-db` tools directly.
+
+Keep the MCP server configuration and API token local. Do not paste
+`LOGSEQ_API_TOKEN` into model instructions, skill text, repository files, or
+Custom GPT knowledge.
 
 ## Live verification baseline
 
