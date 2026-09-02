@@ -89,7 +89,8 @@ Tag and hierarchy details verified on Logseq 2.0.1:
 - `get_tag_objects` returns a mixed collection of pages and blocks.
 - Tag rename changes display/name fields but keeps the generated ident stable.
 - Tag deletion permanently removes the tag and its tag/ref relationships without
-  deleting tagged entities.
+  deleting tagged entities. If child tags extend the deleted tag, `delete_tag`
+  refuses until `acknowledge_child_reparent=true` is supplied.
 - `set_tag_parent` replaces the current parent only when explicitly
   acknowledged.
 - Block tag tools are block-only. Page tag changes use `add_page_tag` and

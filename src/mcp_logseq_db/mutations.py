@@ -160,10 +160,18 @@ class VerifiedMutations:
         return MutationResult(response, current, previous_state=previous)
 
     @serialized_write
-    async def delete_tag(self, tag_uuid: str) -> MutationResult:
+    async def delete_tag(
+        self, tag_uuid: str, *, acknowledge_child_reparent: bool = False
+    ) -> MutationResult:
         tag_uuid = self._validated_uuid(tag_uuid)
         self._require_entity(tag_uuid)
         previous = await self._tag(tag_uuid)
+        child_tags = await self._child_tags(previous["id"])
+        if child_tags and not acknowledge_child_reparent:
+            raise ValueError(
+                "Deleting this tag will reparent child tags; set "
+                "acknowledge_child_reparent=true to proceed"
+            )
         response = await self._client.call("logseq.DB.deletePage", [tag_uuid])
         current = await poll_readback(
             self._client,
@@ -189,7 +197,11 @@ class VerifiedMutations:
                 previous_state=previous,
                 observed_state={"referencing_entity_ids": sorted(dangling)},
             )
-        return MutationResult(response, None, previous_state=previous)
+        return MutationResult(
+            response,
+            None,
+            previous_state={"tag": previous, "child_tags": child_tags},
+        )
 
     @serialized_write
     async def add_tag_property(
@@ -602,6 +614,20 @@ class VerifiedMutations:
                 raise RuntimeError("Tag reference lookup returned an unexpected shape")
             references.update(value for value in result if isinstance(value, int))
         return references
+
+    async def _child_tags(self, parent_tag_id: int) -> list[dict[str, Any]]:
+        query = (
+            "[:find [(pull ?child [*]) ...] :in $ ?parent :where "
+            "[?child :logseq.property.class/extends ?parent]]"
+        )
+        result = await self._client.call(
+            "logseq.DB.datascriptQuery", [query, parent_tag_id]
+        )
+        if not isinstance(result, list) or not all(
+            isinstance(entity, dict) for entity in result
+        ):
+            raise RuntimeError("Child tag lookup returned an unexpected shape")
+        return result
 
     async def _property_removal_state(
         self, ident: str, property_id: int

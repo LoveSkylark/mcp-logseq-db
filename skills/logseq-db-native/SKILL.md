@@ -12,7 +12,7 @@ description: "Use when reading or modifying a Logseq 2.x DB graph through the mc
 | 2026-09-02 | Datascript-backed block readers | PASS, including an existing depth-3 tree |
 | 2026-09-02 | `upsertNodes` page/top-level-block creation and block edit | PASS |
 | 2026-09-02 | Property/tag definition creation, rename, and verified removals | PASS for tools still listed below |
-| 2026-09-02 | `upsertBlockProperty`, block/page tag changes, `setBlockIcon`, `addTagExtends` | PASS after isolated fresh Logseq restart; earlier same-session timeouts were write-path degradation |
+| 2026-09-02 | `upsertBlockProperty`, block/page tag changes, `setBlockIcon`, `set_tag_parent` | PASS after isolated fresh Logseq restart; earlier same-session timeouts were write-path degradation |
 | 2026-09-02 | CLI graph-worker `delete-blocks` operation | PASS with exact absence read-back |
 | 2026-09-02 | CLI graph-worker child insert and move | PASS with parent/page read-back |
 
@@ -389,7 +389,9 @@ result envelope. A completed MCP call is not proof of mutation:
   deleted snapshot in `previous_state`. It also verifies that no `:block/tags`
   or `:block/refs` datoms still point to the deleted tag. Deleting an in-use
   tag removes assignments/references graph-wide without deleting the tagged
-  entities.
+  entities. If child tags extend the target tag, the tool refuses before
+  mutation unless `acknowledge_child_reparent=true` is supplied because Logseq
+  reparents those children.
 
 ### Tag properties and inheritance
 
@@ -534,9 +536,10 @@ mean unrestricted writes and are appropriate only for a trusted graph.
   that timed out during live testing and are not exposed. Use `upsert_nodes`
   for page/top-level creation and block-title edits. Use `insert_block`,
   `move_block`, and `delete_block` for worker-backed structure changes.
-- `upsertBlockProperty`, `setBlockIcon`, and `addTagExtends` can time out in a
-  degraded write session but succeeded with exact read-back as the first write
-  after a fresh Logseq restart.
+- `upsert_block_property`, `set_block_icon`, and `set_tag_parent` can time out
+  in a degraded write session but succeeded with exact read-back as the first
+  write after a fresh Logseq restart. `set_tag_parent` routes through the raw
+  `addTagExtends` alias.
 - `add_block_tag` and `remove_block_tag` use the graph-worker path because it
   remained responsive when the equivalent DB HTTP aliases timed out.
 - `newBlockUUID` and `exportEdn` are bound but unnecessary for current safe

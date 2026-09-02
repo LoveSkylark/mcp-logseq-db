@@ -259,6 +259,7 @@ async def test_rename_tag_verifies_title_and_retains_previous_state() -> None:
 async def test_delete_tag_verifies_absence_and_retains_snapshot() -> None:
     client = RecordingClient([
         {"id": 10, "uuid": TAG_UUID, "title": "Disposable"},
+        [],
         None,
         None,
         [],
@@ -268,13 +269,39 @@ async def test_delete_tag_verifies_absence_and_retains_snapshot() -> None:
     result = await VerifiedMutations(client).delete_tag(TAG_UUID)  # type: ignore[arg-type]
 
     assert result.verified_state is None
-    assert result.previous_state["uuid"] == TAG_UUID
+    assert result.previous_state["tag"]["uuid"] == TAG_UUID
+    assert result.previous_state["child_tags"] == []
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_requires_acknowledgement_before_child_reparent() -> None:
+    previous = {"id": 10, "uuid": TAG_UUID, "title": "Parent"}
+    child = {"id": 11, "uuid": PAGE_UUID, "title": "Child"}
+    client = RecordingClient([previous, [child]])
+
+    with pytest.raises(ValueError, match="acknowledge_child_reparent"):
+        await VerifiedMutations(client).delete_tag(TAG_UUID)  # type: ignore[arg-type]
+
+    assert all(method != "logseq.DB.deletePage" for method, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_with_child_acknowledgement_retains_child_snapshot() -> None:
+    previous = {"id": 10, "uuid": TAG_UUID, "title": "Parent"}
+    child = {"id": 11, "uuid": PAGE_UUID, "title": "Child"}
+    client = RecordingClient([previous, [child], None, None, [], []])
+
+    result = await VerifiedMutations(client).delete_tag(  # type: ignore[arg-type]
+        TAG_UUID, acknowledge_child_reparent=True
+    )
+
+    assert result.previous_state == {"tag": previous, "child_tags": [child]}
 
 
 @pytest.mark.asyncio
 async def test_delete_tag_dangling_references_raise_with_evidence() -> None:
     previous = {"id": 10, "uuid": TAG_UUID, "title": "Disposable"}
-    client = RecordingClient([previous, None, None, [11], []])
+    client = RecordingClient([previous, [], None, None, [11], []])
 
     with pytest.raises(MutationVerificationError) as captured:
         await VerifiedMutations(client).delete_tag(TAG_UUID)  # type: ignore[arg-type]

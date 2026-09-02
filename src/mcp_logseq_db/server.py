@@ -319,9 +319,15 @@ def create_server(client: LogseqDBClient) -> MCPServer:
         return (await VerifiedMutations(client).rename_tag(tag_uuid, new_title)).to_dict()
 
     @server.tool(name="delete_tag", structured_output=True)
-    async def delete_tag(tag_uuid: str) -> dict[str, Any]:
-        """Permanently delete one exact tag UUID. verified_state is null after exact absence; previous_state contains the deleted tag snapshot."""
-        return (await VerifiedMutations(client).delete_tag(tag_uuid)).to_dict()
+    async def delete_tag(
+        tag_uuid: str, acknowledge_child_reparent: bool = False
+    ) -> dict[str, Any]:
+        """Permanently delete one tag, requiring acknowledgement before child tags are reparented."""
+        return (
+            await VerifiedMutations(client).delete_tag(
+                tag_uuid, acknowledge_child_reparent=acknowledge_child_reparent
+            )
+        ).to_dict()
 
     @server.tool(name="add_tag_property", structured_output=True)
     async def add_tag_property(tag_uuid: str, property_ident: str) -> dict[str, Any]:
