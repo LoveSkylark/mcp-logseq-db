@@ -1,6 +1,8 @@
 import asyncio
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
+import json
+import sys
 from typing import Any
 
 import httpx
@@ -92,6 +94,24 @@ async def test_timeout_does_not_poison_next_request() -> None:
         await client.call("logseq.DB.getAllProperties", [])
     assert await client.call("logseq.DB.getAllProperties", []) == {"ok": 2}
     assert lifecycle == ["created", "closed"] * 3
+
+
+@pytest.mark.asyncio
+async def test_hard_deadline_stops_a_response_that_never_completes() -> None:
+    async def stalled() -> httpx.Response:
+        await asyncio.Future()
+        raise AssertionError("unreachable")
+
+    client = LogseqDBClient(
+        "http://127.0.0.1:12315",
+        "token",
+        connect_timeout=0.01,
+        read_timeout=0.01,
+        client_factory=lambda **kwargs: ScriptedClient([stalled], [], **kwargs),
+    )
+
+    with pytest.raises(httpx.ReadTimeout, match="hard request deadline"):
+        await client.call("logseq.DB.datascriptQuery", ["[:find ?entity]"])
 
 
 @pytest.mark.asyncio
@@ -265,6 +285,161 @@ async def test_write_transport_failure_is_never_retried(
 
 
 @pytest.mark.asyncio
+async def test_write_timeout_blocks_later_writes_but_allows_readback() -> None:
+    outcomes: list[Outcome] = [
+        httpx.ReadTimeout("ambiguous write"),
+        httpx.Response(200, json={"readback": True}),
+    ]
+    lifecycle: list[str] = []
+    client = LogseqDBClient(
+        "http://127.0.0.1:12315",
+        "token",
+        client_factory=lambda **kwargs: ScriptedClient(outcomes, lifecycle, **kwargs),
+    )
+
+    with pytest.raises(httpx.ReadTimeout):
+        await client.call("logseq.DB.addBlockTag", ["block", "tag"])
+
+    with pytest.raises(RuntimeError, match="restart Logseq.*reconnect the MCP"):
+        await client.call("logseq.DB.setBlockIcon", ["block", "tabler-icon", "test"])
+
+    assert await client.call("logseq.DB.getAllTags", []) == {"readback": True}
+    assert client.write_circuit_open is True
+    assert "addBlockTag" in str(client.write_circuit_reason)
+    assert lifecycle == ["created", "closed"] * 2
+
+
+@pytest.mark.asyncio
+async def test_cli_block_delete_targets_current_graph_root_and_uuid() -> None:
+    outcomes: list[Outcome] = [
+        httpx.Response(
+            200,
+            json={
+                "name": "logseq_db_work",
+                "path": "C:/Users/test/logseq/graphs/work",
+            },
+        )
+    ]
+    captured: dict[str, Any] = {}
+
+    def runner(command: list[str], **kwargs: Any):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return __import__("subprocess").CompletedProcess(
+            command,
+            0,
+            stdout='{"status":"ok","data":{"result":true}}',
+            stderr="",
+        )
+
+    client = LogseqDBClient(
+        "http://127.0.0.1:12315",
+        "token",
+        client_factory=lambda **kwargs: ScriptedClient(outcomes, [], **kwargs),
+        cli_command=sys.executable,
+        cli_runner=runner,
+    )
+
+    result = await client.delete_block_via_cli(
+        "87654321-4321-8765-4321-876543218765"
+    )
+
+    assert result is True
+    assert captured["command"][1:] == [
+        "--root-dir",
+        "C:/Users/test/logseq",
+        "--graph",
+        "work",
+        "--output",
+        "json",
+        "remove",
+        "block",
+        "--uuid",
+        "87654321-4321-8765-4321-876543218765",
+    ]
+    assert "shell" not in captured["kwargs"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected_tail", "cli_result"),
+    [
+        (
+            "insert",
+            [
+                "upsert", "block", "--target-uuid", "target-uuid",
+                "--pos", "last-child", "--content", "Child",
+            ],
+            [42],
+        ),
+        (
+            "move",
+            [
+                "upsert", "block", "--uuid", "source-uuid",
+                "--target-uuid", "target-uuid", "--pos", "sibling",
+            ],
+            True,
+        ),
+        (
+            "add-tag",
+            [
+                "upsert", "block", "--uuid", "source-uuid",
+                "--update-tags", "[:plugin.class/test]",
+            ],
+            True,
+        ),
+        (
+            "remove-tag",
+            [
+                "upsert", "block", "--uuid", "source-uuid",
+                "--remove-tags", "[:plugin.class/test]",
+            ],
+            True,
+        ),
+    ],
+)
+async def test_cli_insert_and_move_use_graph_worker_commands(
+    operation: str, expected_tail: list[str], cli_result: Any
+) -> None:
+    outcomes: list[Outcome] = [
+        httpx.Response(200, json={"path": "C:/Users/test/logseq/graphs/work"})
+    ]
+    captured: dict[str, Any] = {}
+
+    def runner(command: list[str], **kwargs: Any):
+        captured["command"] = command
+        return __import__("subprocess").CompletedProcess(
+            command,
+            0,
+            stdout=json.dumps({"status": "ok", "data": {"result": cli_result}}),
+            stderr="",
+        )
+
+    client = LogseqDBClient(
+        "http://127.0.0.1:12315",
+        "token",
+        client_factory=lambda **kwargs: ScriptedClient(outcomes, [], **kwargs),
+        cli_command=sys.executable,
+        cli_runner=runner,
+    )
+
+    if operation == "insert":
+        assert await client.insert_block_via_cli("target-uuid", "Child", "child") == 42
+    elif operation == "move":
+        assert await client.move_block_via_cli(
+            "source-uuid", "target-uuid", "after"
+        ) is True
+    else:
+        assert await client.update_block_tag_via_cli(
+            "source-uuid",
+            ":plugin.class/test",
+            remove=operation == "remove-tag",
+        ) is True
+
+    assert captured["command"][-len(expected_tail):] == expected_tail
+
+
+@pytest.mark.asyncio
 async def test_datascript_timeout_is_never_retried() -> None:
     outcomes: list[Outcome] = [
         httpx.ReadTimeout("expensive query timed out"),
@@ -351,4 +526,4 @@ async def test_http_wire_contract_and_existing_api_suffix() -> None:
 @pytest.mark.parametrize("url", ["", "localhost:12315", "ftp://localhost/api"])
 def test_invalid_api_url_is_rejected(url: str) -> None:
     with pytest.raises(ValueError, match="absolute HTTP\\(S\\) URL"):
-        LogseqDBClient(url, "token")
+        LogseqDBClient(url, "token")

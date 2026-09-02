@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import shutil
+import subprocess
 from contextlib import asynccontextmanager
 from collections.abc import Callable
 from functools import wraps
@@ -126,7 +128,12 @@ class LogseqAPIError(RuntimeError):
     """Raised for a non-success response while retaining Logseq diagnostics."""
 
 
+class WriteCircuitOpenError(RuntimeError):
+    """Raised when an earlier ambiguous timeout has blocked later writes."""
+
+
 ClientFactory = Callable[..., httpx.AsyncClient]
+CLIRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def serialized_write(method):
@@ -167,6 +174,8 @@ class LogseqDBClient:
         write_policy: WriteAccessPolicy | None = None,
         max_response_bytes: int = 5_000_000,
         client_factory: ClientFactory = httpx.AsyncClient,
+        cli_command: str = "logseq",
+        cli_runner: CLIRunner = subprocess.run,
     ) -> None:
         self._url = _api_endpoint(base_url)
         self._api_token = api_token
@@ -176,10 +185,14 @@ class LogseqDBClient:
             write=read_timeout,
             pool=connect_timeout,
         )
+        self._request_deadline = connect_timeout + read_timeout
         self._verify_ssl = verify_ssl
         self._client_factory = client_factory
+        self._cli_command = cli_command
+        self._cli_runner = cli_runner
         self._observed_methods: set[str] = set()
         self._write_lock = asyncio.Lock()
+        self._write_circuit_reason: str | None = None
         self.readback_attempts = max(1, readback_attempts)
         self.readback_delay = max(0.0, readback_delay)
         self.read_attempts = max(1, read_attempts)
@@ -190,6 +203,14 @@ class LogseqDBClient:
     @property
     def observed_methods(self) -> frozenset[str]:
         return frozenset(self._observed_methods)
+
+    @property
+    def write_circuit_open(self) -> bool:
+        return self._write_circuit_reason is not None
+
+    @property
+    def write_circuit_reason(self) -> str | None:
+        return self._write_circuit_reason
 
     @asynccontextmanager
     async def write_scope(self):
@@ -215,23 +236,159 @@ class LogseqDBClient:
             raise last_error
         return last_value
 
+    async def delete_block_via_cli(self, block_uuid: str) -> Any:
+        """Delete a block through Logseq's graph-worker outliner operation."""
+        result = await self._run_graph_cli(["remove", "block", "--uuid", block_uuid])
+        return result
+
+    async def insert_block_via_cli(
+        self, target_uuid: str, title: str, placement: str
+    ) -> int:
+        """Insert a block through Logseq's graph-worker outliner operation."""
+        position = {"child": "last-child", "after": "sibling"}.get(placement)
+        if position is None:
+            raise ValueError("Stable block insertion supports child or after placement")
+        result = await self._run_graph_cli([
+            "upsert",
+            "block",
+            "--target-uuid",
+            target_uuid,
+            "--pos",
+            position,
+            "--content",
+            title,
+        ])
+        if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], int):
+            raise LogseqProtocolError("Logseq CLI insertion did not return one entity id")
+        return result[0]
+
+    async def move_block_via_cli(
+        self, block_uuid: str, target_uuid: str, placement: str
+    ) -> Any:
+        """Move a block through Logseq's graph-worker outliner operation."""
+        position = {"child": "last-child", "after": "sibling"}.get(placement)
+        if position is None:
+            raise ValueError("Stable block movement supports child or after placement")
+        return await self._run_graph_cli([
+            "upsert",
+            "block",
+            "--uuid",
+            block_uuid,
+            "--target-uuid",
+            target_uuid,
+            "--pos",
+            position,
+        ])
+
+    async def update_block_tag_via_cli(
+        self, block_uuid: str, tag_ident: str, *, remove: bool
+    ) -> Any:
+        """Add or remove one exact tag through the graph-worker outliner path."""
+        if not tag_ident.startswith(":") or "/" not in tag_ident:
+            raise ValueError("Tag ident must be an exact namespaced keyword")
+        option = "--remove-tags" if remove else "--update-tags"
+        return await self._run_graph_cli([
+            "upsert",
+            "block",
+            "--uuid",
+            block_uuid,
+            option,
+            f"[{tag_ident}]",
+        ])
+
+    async def _run_graph_cli(self, arguments: list[str]) -> Any:
+        """Run one fixed Logseq CLI operation against the connected graph."""
+        if self._write_circuit_reason is not None:
+            raise WriteCircuitOpenError(
+                "Writes are blocked because an earlier write timed out with an "
+                f"ambiguous result: {self._write_circuit_reason}. Read the target "
+                "state, restart Logseq, then reconnect the MCP before another write."
+            )
+
+        graph_info = await self.call("logseq.DB.getCurrentGraph", [])
+        if not isinstance(graph_info, dict) or not isinstance(graph_info.get("path"), str):
+            raise LogseqProtocolError("Current graph did not provide an absolute path")
+        normalized_path = graph_info["path"].replace("\\", "/").rstrip("/")
+        if "/graphs/" not in normalized_path:
+            raise LogseqProtocolError("Current graph path is not under a graphs directory")
+        root_dir, graph_name = normalized_path.rsplit("/graphs/", 1)
+        if not root_dir or not graph_name or "/" in graph_name:
+            raise LogseqProtocolError("Current graph path cannot identify one graph")
+
+        executable = shutil.which(self._cli_command)
+        if executable is None:
+            raise RuntimeError(
+                "Logseq CLI is required for supported DB block deletion but was not found"
+            )
+        command = [
+            executable,
+            "--root-dir",
+            root_dir,
+            "--graph",
+            graph_name,
+            "--output",
+            "json",
+            *arguments,
+        ]
+        try:
+            completed = await asyncio.to_thread(
+                self._cli_runner,
+                command,
+                capture_output=True,
+                text=True,
+                timeout=self._request_deadline,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            self._write_circuit_reason = "Logseq CLI write timed out"
+            raise httpx.ReadTimeout(self._write_circuit_reason) from error
+
+        try:
+            result = json.loads(completed.stdout)
+        except ValueError as error:
+            raise LogseqProtocolError(
+                "Logseq CLI write returned malformed JSON"
+            ) from error
+        if completed.returncode != 0 or not isinstance(result, dict) or result.get("status") != "ok":
+            detail = completed.stderr.strip() or json.dumps(result)
+            raise LogseqAPIError(f"Logseq CLI write failed: {detail[:2000]}")
+        return result.get("data", {}).get("result")
+
     async def call(self, method: str, args: list[Any]) -> Any:
         if method not in ALLOWED_METHODS:
             raise ValueError(f"Logseq DB API method is not allowed: {method!r}")
         if not isinstance(args, list):
             raise TypeError("Logseq API args must be a list")
 
+        is_write = method in WRITE_METHODS or method in EXPERIMENTAL_WRITE_METHODS
+        if is_write and self._write_circuit_reason is not None:
+            raise WriteCircuitOpenError(
+                "Writes are blocked because an earlier write timed out with an "
+                f"ambiguous result: {self._write_circuit_reason}. Read the target "
+                "state, restart Logseq, then reconnect the MCP before another write."
+            )
+
         attempts = (
             1
-            if method in WRITE_METHODS
-            or method in EXPERIMENTAL_WRITE_METHODS
-            or method in NO_RETRY_READ_METHODS
+            if is_write or method in NO_RETRY_READ_METHODS
             else self.read_attempts
         )
         for attempt in range(attempts):
             try:
-                return await self._call_once(method, args)
-            except httpx.TransportError:
+                async with asyncio.timeout(self._request_deadline):
+                    return await self._call_once(method, args)
+            except TimeoutError as error:
+                timeout = httpx.ReadTimeout(
+                    f"{method} exceeded the {self._request_deadline:g}-second "
+                    "hard request deadline"
+                )
+                if is_write:
+                    self._write_circuit_reason = str(timeout)
+                if attempt + 1 == attempts:
+                    raise timeout from error
+            except httpx.TransportError as error:
+                if is_write and isinstance(error, httpx.TimeoutException):
+                    self._write_circuit_reason = f"{method}: {error or 'request timed out'}"
                 if attempt + 1 == attempts:
                     raise
         raise RuntimeError("unreachable")
@@ -310,4 +467,4 @@ def _api_endpoint(base_url: str) -> str:
     path = url.path.rstrip("/")
     if not path.endswith("/api"):
         path = f"{path}/api"
-    return str(url.copy_with(path=path or "/api"))
+    return str(url.copy_with(path=path or "/api"))

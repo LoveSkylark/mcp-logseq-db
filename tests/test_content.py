@@ -148,11 +148,80 @@ async def test_find_block_returns_explicit_missing_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_block_readers_return_page_target_reason() -> None:
+    page = {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"}
+    client = RecordingClient([page, page])
+
+    block = await VerifiedContent(client).find_block(PAGE_UUID)  # type: ignore[arg-type]
+    tree = await VerifiedContent(client).find_block_tree(PAGE_UUID)  # type: ignore[arg-type]
+
+    assert block["found"] is False
+    assert block["reason"] == "target is a page, not a block"
+    assert tree["found"] is False
+    assert tree["reason"] == "target is a page, not a block"
+
+
+@pytest.mark.asyncio
+async def test_find_block_tree_uses_one_page_query_and_excludes_siblings() -> None:
+    child_uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    grandchild_uuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    root = {
+        "id": 11,
+        "uuid": BLOCK_UUID,
+        "title": "Root",
+        "parent": {"id": 10},
+        "page": {"id": 10},
+        "order": "b2",
+    }
+    client = RecordingClient([
+        root,
+        [
+            root,
+            {"id": 12, "uuid": child_uuid, "title": "Child", "parent": {"id": 11}, "page": {"id": 10}, "order": "b1"},
+            {"id": 13, "uuid": grandchild_uuid, "title": "Grandchild", "parent": {"id": 12}, "page": {"id": 10}, "order": "b1"},
+            {"id": 14, "uuid": PAGE_UUID, "title": "Sibling", "parent": {"id": 10}, "page": {"id": 10}, "order": "b3"},
+        ],
+    ])
+
+    result = await VerifiedContent(client).find_block_tree(BLOCK_UUID)  # type: ignore[arg-type]
+
+    assert result["node_count"] == 3
+    assert result["truncated"] is False
+    assert result["block"]["children"][0]["uuid"] == child_uuid
+    assert result["block"]["children"][0]["children"][0]["uuid"] == grandchild_uuid
+    assert len(client.calls) == 2
+    assert client.calls[1][1][1] == 10
+
+
+@pytest.mark.asyncio
+async def test_find_block_tree_reports_depth_truncation() -> None:
+    root = {
+        "id": 11,
+        "uuid": BLOCK_UUID,
+        "title": "Root",
+        "parent": {"id": 10},
+        "page": {"id": 10},
+    }
+    client = RecordingClient([
+        root,
+        [root, {"id": 12, "uuid": PAGE_UUID, "title": "Child", "parent": {"id": 11}, "page": {"id": 10}}],
+    ])
+
+    result = await VerifiedContent(client).find_block_tree(  # type: ignore[arg-type]
+        BLOCK_UUID, max_depth=0
+    )
+
+    assert result["node_count"] == 1
+    assert result["truncated"] is True
+    assert result["block"]["children"] == []
+
+
+@pytest.mark.asyncio
 async def test_insert_timeout_is_accepted_only_after_exact_readback() -> None:
     client = RecordingClient([
-        {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"},
+        {"id": 11, "uuid": PAGE_UUID, "title": "Parent", "parent": {"id": 10}, "page": {"id": 10}},
         httpx.ReadTimeout("ambiguous"),
-        {"id": 11, "uuid": BLOCK_UUID, "title": "Child", "parent": {"id": 10}, "page": {"id": 10}},
+        {"id": 12, "uuid": BLOCK_UUID, "title": "Child", "parent": {"id": 11}, "page": {"id": 10}},
     ])
 
     with patch("mcp_logseq_db.content.uuid4", return_value=BLOCK_UUID):
@@ -170,9 +239,39 @@ async def test_insert_timeout_is_accepted_only_after_exact_readback() -> None:
 
 
 @pytest.mark.asyncio
+async def test_insert_missing_target_stops_before_mutation() -> None:
+    client = RecordingClient([None])
+
+    with pytest.raises(LookupError, match="Target block does not exist"):
+        await VerifiedContent(client).insert_block(PAGE_UUID, "Child")  # type: ignore[arg-type]
+
+    assert [method for method, _ in client.calls] == ["logseq.DB.datascriptQuery"]
+
+
+@pytest.mark.asyncio
+async def test_move_missing_source_stops_before_mutation() -> None:
+    client = RecordingClient([None])
+
+    with pytest.raises(LookupError, match="Source block does not exist"):
+        await VerifiedContent(client).move_block(BLOCK_UUID, PAGE_UUID)  # type: ignore[arg-type]
+
+    assert [method for method, _ in client.calls] == ["logseq.DB.datascriptQuery"]
+
+
+@pytest.mark.asyncio
+async def test_delete_missing_block_stops_before_mutation() -> None:
+    client = RecordingClient([None])
+
+    with pytest.raises(LookupError, match="Target block does not exist"):
+        await VerifiedContent(client).delete_block(BLOCK_UUID)  # type: ignore[arg-type]
+
+    assert [method for method, _ in client.calls] == ["logseq.DB.datascriptQuery"]
+
+
+@pytest.mark.asyncio
 async def test_insert_timeout_without_observed_entity_returns_diagnostic() -> None:
     client = RecordingClient([
-        {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"},
+        {"id": 11, "uuid": PAGE_UUID, "title": "Parent", "parent": {"id": 10}, "page": {"id": 10}},
         httpx.ReadTimeout("ambiguous"),
         None,
     ])
@@ -185,6 +284,30 @@ async def test_insert_timeout_without_observed_entity_returns_diagnostic() -> No
     assert result.verified is False
     assert result.recovered_after_timeout is True
     assert "not observed" in str(result.diagnostic)
+
+
+@pytest.mark.asyncio
+async def test_insert_page_target_stops_before_mutation() -> None:
+    client = RecordingClient([
+        {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"},
+    ])
+
+    with pytest.raises(ValueError, match="Target UUID identifies a page"):
+        await VerifiedContent(client).insert_block(PAGE_UUID, "Child")  # type: ignore[arg-type]
+
+    assert [method for method, _ in client.calls] == ["logseq.DB.datascriptQuery"]
+
+
+@pytest.mark.asyncio
+async def test_move_missing_relationship_stops_before_mutation() -> None:
+    client = RecordingClient([
+        {"id": 11, "uuid": BLOCK_UUID, "title": "Source", "parent": {"id": 10}},
+    ])
+
+    with pytest.raises(RuntimeError, match="Source block is missing required information: page"):
+        await VerifiedContent(client).move_block(BLOCK_UUID, PAGE_UUID)  # type: ignore[arg-type]
+
+    assert [method for method, _ in client.calls] == ["logseq.DB.datascriptQuery"]
 
 
 @pytest.mark.asyncio
@@ -278,6 +401,25 @@ async def test_delete_timeout_requires_exact_absence() -> None:
         "logseq.DB.removeBlock",
         [BLOCK_UUID, {}],
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_delete_reports_survivor_as_observed() -> None:
+    block = {
+        "id": 11,
+        "uuid": BLOCK_UUID,
+        "title": "Block",
+        "parent": {"id": 10},
+        "page": {"id": 10},
+    }
+    client = RecordingClient([block, [], httpx.ReadTimeout("ambiguous"), block])
+
+    result = await VerifiedContent(client).delete_block(BLOCK_UUID)  # type: ignore[arg-type]
+
+    assert result.verified is False
+    assert result.verified_entities == ()
+    assert result.observed_entities == (block,)
+    assert result.previous_entities == (block,)
 
 
 @pytest.mark.asyncio

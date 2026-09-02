@@ -42,6 +42,21 @@ async def test_upsert_property_writes_and_reads_back_exact_ident() -> None:
 
 
 @pytest.mark.asyncio
+async def test_upsert_property_reports_title_normalization() -> None:
+    current = {"ident": IDENT, "title": "SpacedTitle"}
+    client = RecordingClient([{"ident": IDENT}, current])
+
+    result = await VerifiedMutations(client).upsert_property(  # type: ignore[arg-type]
+        "Spaced Title", {"type": "default"}
+    )
+
+    assert result.verified_state == current
+    assert result.diagnostic is not None
+    assert "normalized property title 'Spaced Title' to 'SpacedTitle'" in result.diagnostic
+    assert IDENT in result.diagnostic
+
+
+@pytest.mark.asyncio
 async def test_timed_out_upsert_is_resolved_by_read_back() -> None:
     client = RecordingClient([httpx.ReadTimeout("ambiguous")])
 

@@ -24,6 +24,8 @@ class DBCapabilities:
     rejected_operations: tuple[str, ...]
     experimental_operations: tuple[str, ...]
     experimental_writes_enabled: bool
+    write_circuit_open: bool
+    write_circuit_reason: str | None
     supported_mcp_write_tools: tuple[str, ...]
     experimental_mcp_write_tools: tuple[str, ...]
 
@@ -93,7 +95,10 @@ class CapabilityDiscovery:
             supported_content_operations=(
                 "create-page",
                 "create-top-level-block",
+                "create-nested-block",
                 "edit-block-title",
+                "delete-block-subtree",
+                "move-block-subtree",
                 "rename-page",
                 "recycle-page",
                 "rename-tag",
@@ -120,44 +125,46 @@ class CapabilityDiscovery:
                 "logseq.DB.getPageProperties",
                 "logseq.DB.insertBatchBlock",
                 "logseq.DB.prependBlockInPage",
+                "logseq.DB.removeBlock",
                 "logseq.DB.updateBlock",
             ),
-            experimental_operations=(
-                "logseq.DB.insertBlock",
-                "logseq.DB.moveBlock",
-                "logseq.DB.removeBlock",
-            ),
+            experimental_operations=(),
             experimental_writes_enabled=bool(
                 getattr(self._client, "experimental_writes_enabled", False)
             ),
+            write_circuit_open=bool(
+                getattr(self._client, "write_circuit_open", False)
+            ),
+            write_circuit_reason=getattr(
+                self._client, "write_circuit_reason", None
+            ),
             supported_mcp_write_tools=(
-                "db_upsert_nodes",
-                "db_create_page",
-                "db_create_top_level_block",
-                "db_upsert_block",
-                "db_rename_page",
-                "db_recycle_page",
-                "db_upsert_property",
-                "db_remove_property",
-                "db_create_tag",
-                "db_rename_tag",
-                "db_delete_tag",
-                "db_add_tag_property",
-                "db_remove_tag_property",
-                "db_add_tag_extends",
-                "db_remove_tag_extends",
-                "db_upsert_block_property",
-                "db_remove_block_property",
-                "db_add_block_tag",
-                "db_remove_block_tag",
-                "db_set_block_icon",
-                "db_remove_block_icon",
+                "upsert_nodes",
+                "create_page",
+                "create_top_level_block",
+                "insert_block",
+                "upsert_block",
+                "delete_block",
+                "move_block",
+                "rename_page",
+                "recycle_page",
+                "upsert_property",
+                "remove_property",
+                "create_tag",
+                "rename_tag",
+                "delete_tag",
+                "add_tag_property",
+                "remove_tag_property",
+                "add_tag_extends",
+                "remove_tag_extends",
+                "upsert_block_property",
+                "remove_block_property",
+                "add_block_tag",
+                "remove_block_tag",
+                "set_block_icon",
+                "remove_block_icon",
             ),
-            experimental_mcp_write_tools=(
-                "db_insert_block_experimental",
-                "db_move_block_experimental",
-                "db_delete_block_experimental",
-            ),
+            experimental_mcp_write_tools=(),
         )
 
     async def _probe(self, method: str, args: list[Any]) -> Any | None:

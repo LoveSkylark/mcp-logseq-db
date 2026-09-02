@@ -14,6 +14,7 @@ class MutationResult:
     verified_state: Any
     recovered_after_timeout: bool = False
     previous_state: Any = None
+    diagnostic: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -51,7 +52,14 @@ class VerifiedMutations:
         )
         if not self._has_ident(current, ident):
             raise RuntimeError(f"Write verification failed for property {ident}")
-        return MutationResult(response, current, timed_out)
+        actual_title = current.get("title") if isinstance(current, dict) else None
+        diagnostic = None
+        if isinstance(actual_title, str) and actual_title != title:
+            diagnostic = (
+                f"Logseq normalized property title {title!r} to {actual_title!r}; "
+                f"use exact ident {ident!r} for later operations"
+            )
+        return MutationResult(response, current, timed_out, diagnostic=diagnostic)
 
     @serialized_write
     async def remove_property(self, property_ident: str) -> MutationResult:
@@ -287,9 +295,14 @@ class VerifiedMutations:
         self._require_entity(block_uuid)
         self._require_entity(self._validated_uuid(tag_uuid))
         tag = await self._tag(tag_uuid)
-        response, timed_out = await self._write(
-            "logseq.DB.addBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
-        )
+        cli_update = getattr(self._client, "update_block_tag_via_cli", None)
+        if cli_update is None:
+            response, timed_out = await self._write(
+                "logseq.DB.addBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
+            )
+        else:
+            response = await cli_update(block_uuid, tag["ident"], remove=False)
+            timed_out = False
         current = await poll_readback(
             self._client,
             lambda: self._entity(block_uuid),
@@ -305,9 +318,14 @@ class VerifiedMutations:
         self._require_entity(block_uuid)
         self._require_entity(self._validated_uuid(tag_uuid))
         tag = await self._tag(tag_uuid)
-        response, timed_out = await self._write(
-            "logseq.DB.removeBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
-        )
+        cli_update = getattr(self._client, "update_block_tag_via_cli", None)
+        if cli_update is None:
+            response, timed_out = await self._write(
+                "logseq.DB.removeBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
+            )
+        else:
+            response = await cli_update(block_uuid, tag["ident"], remove=True)
+            timed_out = False
         current = await poll_readback(
             self._client,
             lambda: self._entity(block_uuid),

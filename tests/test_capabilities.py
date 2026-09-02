@@ -33,7 +33,10 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     assert capabilities.supported_content_operations == (
         "create-page",
         "create-top-level-block",
+        "create-nested-block",
         "edit-block-title",
+        "delete-block-subtree",
+        "move-block-subtree",
         "rename-page",
         "recycle-page",
         "rename-tag",
@@ -60,19 +63,26 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     )
     assert "logseq.DB.createPage" in capabilities.rejected_operations
     assert "logseq.DB.updateBlock" in capabilities.rejected_operations
-    assert capabilities.experimental_operations == (
-        "logseq.DB.insertBlock",
-        "logseq.DB.moveBlock",
-        "logseq.DB.removeBlock",
-    )
+    assert capabilities.experimental_operations == ()
     assert capabilities.experimental_writes_enabled is False
-    assert "db_rename_tag" in capabilities.supported_mcp_write_tools
-    assert "db_delete_tag" in capabilities.supported_mcp_write_tools
-    assert capabilities.experimental_mcp_write_tools == (
-        "db_insert_block_experimental",
-        "db_move_block_experimental",
-        "db_delete_block_experimental",
-    )
+    assert capabilities.write_circuit_open is False
+    assert capabilities.write_circuit_reason is None
+    assert "rename_tag" in capabilities.supported_mcp_write_tools
+    assert "delete_tag" in capabilities.supported_mcp_write_tools
+    assert "delete_block" in capabilities.supported_mcp_write_tools
+    assert "insert_block" in capabilities.supported_mcp_write_tools
+    assert "move_block" in capabilities.supported_mcp_write_tools
+    assert capabilities.experimental_mcp_write_tools == ()
+
+
+@pytest.mark.asyncio
+async def test_capabilities_do_not_list_replaced_experimental_tools() -> None:
+    client = ProbeClient()
+    client.experimental_writes_enabled = True
+
+    capabilities = await CapabilityDiscovery(client).discover()  # type: ignore[arg-type]
+
+    assert capabilities.experimental_mcp_write_tools == ()
 
 
 @pytest.mark.asyncio
@@ -94,4 +104,4 @@ async def test_capabilities_fail_for_non_db_graph() -> None:
             return await super().call(method, args)
 
     with pytest.raises(RuntimeError, match="current Logseq graph is not a DB graph"):
-        await CapabilityDiscovery(FileGraphClient()).discover()  # type: ignore[arg-type]
+        await CapabilityDiscovery(FileGraphClient()).discover()  # type: ignore[arg-type]
