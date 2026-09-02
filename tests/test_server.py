@@ -8,9 +8,6 @@ from mcp_logseq_db.server import create_server
 
 
 class FakeClient:
-    observed_methods: frozenset[str] = frozenset()
-    experimental_writes_enabled = True
-
     async def call(self, method: str, args: list[Any]) -> Any:
         return []
 
@@ -81,16 +78,6 @@ async def test_server_exposes_only_verified_read_tools() -> None:
         "set_block_icon",
         "remove_block_icon",
     }
-
-
-@pytest.mark.asyncio
-async def test_server_exposes_no_experimental_tools() -> None:
-    client = FakeClient()
-    client.experimental_writes_enabled = False
-
-    tools = await create_server(client).list_tools()  # type: ignore[arg-type]
-
-    assert not any(tool.name.endswith("_experimental") for tool in tools)
 
 
 @pytest.mark.asyncio

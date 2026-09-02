@@ -22,12 +22,9 @@ class DBCapabilities:
     candidate_write_operations: tuple[str, ...]
     unavailable_over_http: tuple[str, ...]
     rejected_operations: tuple[str, ...]
-    experimental_operations: tuple[str, ...]
-    experimental_writes_enabled: bool
     write_circuit_open: bool
     write_circuit_reason: str | None
     supported_mcp_write_tools: tuple[str, ...]
-    experimental_mcp_write_tools: tuple[str, ...]
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -126,10 +123,6 @@ class CapabilityDiscovery:
                 "logseq.DB.removeBlock",
                 "logseq.DB.updateBlock",
             ),
-            experimental_operations=(),
-            experimental_writes_enabled=bool(
-                getattr(self._client, "experimental_writes_enabled", False)
-            ),
             write_circuit_open=bool(
                 getattr(self._client, "write_circuit_open", False)
             ),
@@ -166,7 +159,6 @@ class CapabilityDiscovery:
                 "set_block_icon",
                 "remove_block_icon",
             ),
-            experimental_mcp_write_tools=(),
         )
 
     async def _probe(self, method: str, args: list[Any]) -> Any | None:

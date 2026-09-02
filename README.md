@@ -208,7 +208,6 @@ Environment variables:
 | `LOGSEQ_READ_ATTEMPTS` | `2` for read-only transport failures |
 | `LOGSEQ_READBACK_ATTEMPTS` | `3` |
 | `LOGSEQ_READBACK_DELAY` | `0.15` seconds |
-| `LOGSEQ_ENABLE_EXPERIMENTAL_WRITES` | Legacy compatibility setting; no current tools use it |
 | `LOGSEQ_WRITE_TITLE_PREFIXES` | Unrestricted when empty |
 | `LOGSEQ_WRITE_PROPERTY_PREFIXES` | Unrestricted when empty |
 | `LOGSEQ_WRITE_ENTITY_UUIDS` | Unrestricted when empty |

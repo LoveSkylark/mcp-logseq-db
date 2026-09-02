@@ -4,12 +4,12 @@ from dataclasses import asdict, dataclass
 import re
 from typing import Any
 from uuid import UUID
-import httpx
 
+from ._shared import VerifiedWriteHelpers
 from .client import LogseqDBClient, poll_readback, serialized_write
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class MutationResult:
     response: Any
     verified_state: Any
@@ -29,7 +29,7 @@ class MutationVerificationError(RuntimeError):
         self.result = result
 
 
-class VerifiedMutations:
+class VerifiedMutations(VerifiedWriteHelpers):
     def __init__(self, client: LogseqDBClient) -> None:
         self._client = client
 
@@ -43,7 +43,7 @@ class VerifiedMutations:
         if not title.strip():
             raise ValueError("Property title must not be empty")
         self._require_title(title)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.upsertProperty", [title, schema, options or {}]
         )
         if timed_out:
@@ -68,7 +68,9 @@ class VerifiedMutations:
                 f"Logseq normalized property title {title!r} to {actual_title!r}; "
                 f"use exact ident {ident!r} for later operations"
             )
-        return MutationResult(response, current, timed_out, diagnostic=diagnostic)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, diagnostic=diagnostic
+        )
 
     @serialized_write
     async def remove_property(self, property_ident: str) -> MutationResult:
@@ -79,7 +81,7 @@ class VerifiedMutations:
             raise LookupError(f"No property exists with exact ident {ident}")
         usage_before = await self._property_usage(ident, existing["id"])
 
-        response, timed_out = await self._write("logseq.DB.removeProperty", [ident])
+        response, timed_out = await self._call_ambiguous("logseq.DB.removeProperty", [ident])
         current, usage_after = await poll_readback(
             self._client,
             lambda: self._property_removal_state(ident, existing["id"]),
@@ -103,9 +105,9 @@ class VerifiedMutations:
                 timed_out=timed_out,
             )
         return MutationResult(
-            response,
-            None,
-            timed_out,
+            response=response,
+            verified_state=None,
+            recovered_after_timeout=timed_out,
             previous_state={"property": existing, "usage": usage_before},
         )
 
@@ -116,7 +118,7 @@ class VerifiedMutations:
         if not title.strip():
             raise ValueError("Tag title must not be empty")
         self._require_title(title)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.createTag", [title, options or {}]
         )
         if timed_out:
@@ -132,7 +134,7 @@ class VerifiedMutations:
         )
         if not isinstance(current, dict) or current.get("uuid") != response.get("uuid"):
             raise RuntimeError("Tag creation verification failed")
-        return MutationResult(response, current)
+        return MutationResult(response=response, verified_state=current)
 
     @serialized_write
     async def rename_tag(self, tag_uuid: str, new_title: str) -> MutationResult:
@@ -157,7 +159,7 @@ class VerifiedMutations:
                 previous_state=previous,
                 observed_state=current,
             )
-        return MutationResult(response, current, previous_state=previous)
+        return MutationResult(response=response, verified_state=current, previous_state=previous)
 
     @serialized_write
     async def delete_tag(
@@ -198,8 +200,8 @@ class VerifiedMutations:
                 observed_state={"referencing_entity_ids": sorted(dangling)},
             )
         return MutationResult(
-            response,
-            None,
+            response=response,
+            verified_state=None,
             previous_state={"tag": previous, "child_tags": child_tags},
         )
 
@@ -212,7 +214,7 @@ class VerifiedMutations:
         self._require_property(property_ident)
         property_entity = await self._property(property_ident)
         previous = await self._tag(tag_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.addTagProperty", [tag_uuid, property_ident]
         )
         current = await poll_readback(
@@ -229,7 +231,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def remove_tag_property(
@@ -241,7 +245,7 @@ class VerifiedMutations:
         property_entity = await self._property(property_ident)
         previous = await self._tag(tag_uuid)
         property_uuid = self._validated_uuid(str(property_entity.get("uuid")))
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeTagProperty", [tag_uuid, property_uuid]
         )
         current = await poll_readback(
@@ -258,7 +262,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def set_tag_parent(
@@ -282,7 +288,7 @@ class VerifiedMutations:
                 "Tag already has a different parent; set acknowledge_replacement=true "
                 "to replace it"
             )
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.addTagExtends", [tag_uuid, self._validated_uuid(parent_tag_uuid)]
         )
         current = await poll_readback(
@@ -304,7 +310,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def remove_tag_extends(
@@ -315,7 +323,7 @@ class VerifiedMutations:
         self._require_entity(self._validated_uuid(parent_tag_uuid))
         parent = await self._tag(parent_tag_uuid)
         previous = await self._tag(tag_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeTagExtends", [tag_uuid, self._validated_uuid(parent_tag_uuid)]
         )
         current = await poll_readback(
@@ -332,7 +340,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def upsert_block_property(
@@ -347,7 +357,7 @@ class VerifiedMutations:
         self._require_property(property_ident)
         property_entity = await self._property(property_ident)
         previous = await self._block(block_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.upsertBlockProperty",
             [block_uuid, property_ident, value, options or {}],
         )
@@ -359,21 +369,17 @@ class VerifiedMutations:
             lambda state: state[1],
         )
         if not matches:
-            raise MutationVerificationError(
-                MutationResult(
-                    response,
-                    None,
-                    timed_out,
-                    previous_state=previous,
-                    diagnostic="Block property value verification failed",
-                    verified=False,
-                    observed_state=current,
-                )
+            self._raise_verification(
+                "Block property value verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
             )
         return MutationResult(
-            response,
-            current,
-            timed_out,
+            response=response,
+            verified_state=current,
+            recovered_after_timeout=timed_out,
             previous_state=previous,
             observed_state=current,
         )
@@ -391,7 +397,7 @@ class VerifiedMutations:
         self._require_property(property_ident)
         property_entity = await self._property(property_ident)
         previous = await self._page(page_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.upsertBlockProperty",
             [page_uuid, property_ident, value, options or {}],
         )
@@ -411,9 +417,9 @@ class VerifiedMutations:
                 timed_out=timed_out,
             )
         return MutationResult(
-            response,
-            current,
-            timed_out,
+            response=response,
+            verified_state=current,
+            recovered_after_timeout=timed_out,
             previous_state=previous,
             observed_state=current,
         )
@@ -427,7 +433,7 @@ class VerifiedMutations:
         self._require_property(property_ident)
         await self._property(property_ident)
         previous = await self._block(block_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeBlockProperty", [block_uuid, property_ident]
         )
         current = await poll_readback(
@@ -443,7 +449,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def remove_page_property(
@@ -454,7 +462,7 @@ class VerifiedMutations:
         self._require_property(property_ident)
         await self._property(property_ident)
         previous = await self._page(page_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeBlockProperty", [page_uuid, property_ident]
         )
         current = await poll_readback(
@@ -470,7 +478,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def add_block_tag(self, block_uuid: str, tag_uuid: str) -> MutationResult:
@@ -481,7 +491,7 @@ class VerifiedMutations:
         tag = await self._tag(tag_uuid)
         cli_update = getattr(self._client, "update_block_tag_via_cli", None)
         if cli_update is None:
-            response, timed_out = await self._write(
+            response, timed_out = await self._call_ambiguous(
                 "logseq.DB.addBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
             )
         else:
@@ -500,7 +510,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def remove_block_tag(self, block_uuid: str, tag_uuid: str) -> MutationResult:
@@ -511,7 +523,7 @@ class VerifiedMutations:
         tag = await self._tag(tag_uuid)
         cli_update = getattr(self._client, "update_block_tag_via_cli", None)
         if cli_update is None:
-            response, timed_out = await self._write(
+            response, timed_out = await self._call_ambiguous(
                 "logseq.DB.removeBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
             )
         else:
@@ -530,7 +542,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def add_page_tag(self, page_uuid: str, tag_uuid: str) -> MutationResult:
@@ -549,7 +563,7 @@ class VerifiedMutations:
         if icon_type not in {"tabler-icon", "emoji"}:
             raise ValueError("icon_type must be 'tabler-icon' or 'emoji'")
         previous = await self._block(block_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.setBlockIcon", [block_uuid, icon_type, icon_name]
         )
         current = await poll_readback(
@@ -582,14 +596,16 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     @serialized_write
     async def remove_block_icon(self, block_uuid: str) -> MutationResult:
         block_uuid = self._validated_uuid(block_uuid)
         self._require_entity(block_uuid)
         previous = await self._block(block_uuid)
-        response, timed_out = await self._write(
+        response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeBlockIcon", [block_uuid]
         )
         current = await poll_readback(
@@ -605,7 +621,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     async def _update_page_tag(
         self, page_uuid: str, tag_uuid: str, *, remove: bool
@@ -617,7 +635,7 @@ class VerifiedMutations:
         previous = await self._page(page_uuid)
         tag = await self._tag(tag_uuid)
         method = "logseq.DB.removeBlockTag" if remove else "logseq.DB.addBlockTag"
-        response, timed_out = await self._write(method, [page_uuid, tag_uuid])
+        response, timed_out = await self._call_ambiguous(method, [page_uuid, tag_uuid])
         current = await poll_readback(
             self._client,
             lambda: self._page(page_uuid),
@@ -637,13 +655,9 @@ class VerifiedMutations:
                 observed_state=current,
                 timed_out=timed_out,
             )
-        return MutationResult(response, current, timed_out, previous_state=previous)
-
-    async def _write(self, method: str, args: list[Any]) -> tuple[Any, bool]:
-        try:
-            return await self._client.call(method, args), False
-        except httpx.TimeoutException:
-            return None, True
+        return MutationResult(
+            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
+        )
 
     async def _block_property_state(
         self,
@@ -787,9 +801,9 @@ class VerifiedMutations:
     ) -> None:
         raise MutationVerificationError(
             MutationResult(
-                response,
-                None,
-                timed_out,
+                response=response,
+                verified_state=None,
+                recovered_after_timeout=timed_out,
                 previous_state=previous_state,
                 diagnostic=diagnostic,
                 verified=False,
@@ -804,13 +818,6 @@ class VerifiedMutations:
                 "Expected an exact namespaced property ident such as :user.property/status"
             )
         return value
-
-    @staticmethod
-    def _validated_uuid(value: str) -> str:
-        try:
-            return str(UUID(value))
-        except (TypeError, ValueError, AttributeError) as error:
-            raise ValueError(f"Expected an exact UUID, got {value!r}") from error
 
     @staticmethod
     def _has_ident(entity: Any, expected_ident: str) -> bool:
@@ -828,17 +835,7 @@ class VerifiedMutations:
             if isinstance(reference, dict) and isinstance(reference.get("id"), int)
         }
 
-    def _require_title(self, title: str) -> None:
-        policy = getattr(self._client, "write_policy", None)
-        if policy is not None:
-            policy.require_title(title)
-
     def _require_property(self, ident: str) -> None:
         policy = getattr(self._client, "write_policy", None)
         if policy is not None:
             policy.require_property(ident)
-
-    def _require_entity(self, entity_uuid: str) -> None:
-        policy = getattr(self._client, "write_policy", None)
-        if policy is not None:
-            policy.require_entity(entity_uuid)

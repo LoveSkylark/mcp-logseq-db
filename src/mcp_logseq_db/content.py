@@ -4,14 +4,15 @@ import json
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import httpx
 
+from ._shared import VerifiedWriteHelpers
 from .client import LogseqDBClient, poll_readback, serialized_write
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ContentResult:
     validation: Any
     response: Any
@@ -26,7 +27,7 @@ class ContentResult:
         return asdict(self)
 
 
-class VerifiedContent:
+class VerifiedContent(VerifiedWriteHelpers):
     def __init__(self, client: LogseqDBClient) -> None:
         self._client = client
 
@@ -217,12 +218,12 @@ class VerifiedContent:
         )
         if block is None:
             return ContentResult(
-                None,
-                response,
-                (),
-                timed_out,
-                False,
-                "Insert was not observed at the predetermined UUID",
+                validation=None,
+                response=response,
+                verified_entities=(),
+                recovered_after_timeout=timed_out,
+                verified=False,
+                diagnostic="Insert was not observed at the predetermined UUID",
             )
         expected_parent_id = (
             target["id"] if placement == "child" else self._reference_id(target.get("parent"))
@@ -236,16 +237,18 @@ class VerifiedContent:
             or self._reference_id(block.get("page")) != expected_page_id
         ):
             return ContentResult(
-                None,
-                response,
-                (block,),
-                timed_out,
-                False,
-                "Inserted block exists but its title, parent, or owning page is incorrect",
+                validation=None,
+                response=response,
+                verified_entities=(block,),
+                recovered_after_timeout=timed_out,
+                verified=False,
+                diagnostic="Inserted block exists but its title, parent, or owning page is incorrect",
             )
         if placement in {"before", "after"}:
             self._verify_relative_order(block, target, placement)
-        return ContentResult(None, response, (block,), timed_out)
+        return ContentResult(
+            validation=None, response=response, verified_entities=(block,), recovered_after_timeout=timed_out
+        )
 
     @serialized_write
     async def move_block(
@@ -302,12 +305,12 @@ class VerifiedContent:
             or self._reference_id(moved.get("page")) != expected_page_id
         ):
             return ContentResult(
-                None,
-                response,
-                (moved,),
-                timed_out,
-                False,
-                "Move was not observed with the requested parent and owning page",
+                validation=None,
+                response=response,
+                verified_entities=(moved,),
+                recovered_after_timeout=timed_out,
+                verified=False,
+                diagnostic="Move was not observed with the requested parent and owning page",
             )
         if placement in {"before", "after"}:
             self._verify_relative_order(moved, target, placement)
@@ -316,12 +319,12 @@ class VerifiedContent:
         after_by_uuid = {entity["uuid"]: entity for entity in moved_subtree}
         if before_by_uuid.keys() != after_by_uuid.keys():
             return ContentResult(
-                None,
-                response,
-                tuple(moved_subtree),
-                timed_out,
-                False,
-                "Move changed the subtree entity set",
+                validation=None,
+                response=response,
+                verified_entities=tuple(moved_subtree),
+                recovered_after_timeout=timed_out,
+                verified=False,
+                diagnostic="Move changed the subtree entity set",
             )
         for entity_uuid, previous in before_by_uuid.items():
             if entity_uuid == block_uuid:
@@ -333,14 +336,19 @@ class VerifiedContent:
                 or self._reference_id(current.get("page")) != expected_page_id
             ):
                 return ContentResult(
-                    None,
-                    response,
-                    tuple(moved_subtree),
-                    timed_out,
-                    False,
-                    "Move did not preserve descendant parent/page relationships",
+                    validation=None,
+                    response=response,
+                    verified_entities=tuple(moved_subtree),
+                    recovered_after_timeout=timed_out,
+                    verified=False,
+                    diagnostic="Move did not preserve descendant parent/page relationships",
                 )
-        return ContentResult(None, response, tuple(moved_subtree), timed_out)
+        return ContentResult(
+            validation=None,
+            response=response,
+            verified_entities=tuple(moved_subtree),
+            recovered_after_timeout=timed_out,
+        )
 
     @serialized_write
     async def delete_block(self, block_uuid: str) -> ContentResult:
@@ -368,14 +376,14 @@ class VerifiedContent:
         )
         if current is not None:
             return ContentResult(
-                None,
-                response,
-                (),
-                timed_out,
-                False,
-                "Deletion was not observed; the block is still visible",
-                tuple(subtree),
-                (current,),
+                validation=None,
+                response=response,
+                verified_entities=(),
+                recovered_after_timeout=timed_out,
+                verified=False,
+                diagnostic="Deletion was not observed; the block is still visible",
+                previous_entities=tuple(subtree),
+                observed_entities=(current,),
             )
         remaining = []
         for entity in subtree[1:]:
@@ -390,23 +398,23 @@ class VerifiedContent:
                 remaining.append(descendant)
         if remaining:
             return ContentResult(
-                None,
-                response,
-                (),
-                timed_out,
-                False,
-                "Target is absent but one or more descendants remain",
-                tuple(subtree),
-                tuple(remaining),
+                validation=None,
+                response=response,
+                verified_entities=(),
+                recovered_after_timeout=timed_out,
+                verified=False,
+                diagnostic="Target is absent but one or more descendants remain",
+                previous_entities=tuple(subtree),
+                observed_entities=tuple(remaining),
             )
         return ContentResult(
-            None,
-            response,
-            (),
-            timed_out,
-            True,
-            "Exact UUID is absent after deletion",
-            tuple(subtree),
+            validation=None,
+            response=response,
+            verified_entities=(),
+            recovered_after_timeout=timed_out,
+            verified=True,
+            diagnostic="Exact UUID is absent after deletion",
+            previous_entities=tuple(subtree),
         )
 
     async def upsert_block(
@@ -437,7 +445,7 @@ class VerifiedContent:
             "logseq.DB.upsertNodes", [normalized, {"dry-run": True}]
         )
         if dry_run:
-            return ContentResult(validation, None, ())
+            return ContentResult(validation=validation, response=None, verified_entities=())
 
         before_ids = {
             index: {entity["id"] for entity in await self._entities_by_title(op["data"]["title"])}
@@ -508,7 +516,9 @@ class VerifiedContent:
                 await self._verify_title_uuid_refs(entity, operation["data"]["title"])
             verified.append(entity)
 
-        return ContentResult(validation, response, tuple(verified), timed_out)
+        return ContentResult(
+            validation=validation, response=response, verified_entities=tuple(verified), recovered_after_timeout=timed_out
+        )
 
     @serialized_write
     async def rename_page(self, page_uuid: str, new_title: str) -> ContentResult:
@@ -527,8 +537,18 @@ class VerifiedContent:
             lambda value: value.get("title") == new_title,
         )
         if current.get("title") != new_title:
-            raise RuntimeError("Page rename verification failed")
-        return ContentResult(None, response, (current,))
+            return ContentResult(
+                validation=None,
+                response=response,
+                verified_entities=(),
+                verified=False,
+                diagnostic="Page rename verification failed",
+                previous_entities=(page,),
+                observed_entities=(current,),
+            )
+        return ContentResult(
+            validation=None, response=response, verified_entities=(current,), previous_entities=(page,)
+        )
 
     @serialized_write
     async def delete_page(
@@ -546,15 +566,15 @@ class VerifiedContent:
         previous = (page, *page_blocks)
         if inbound_references and not acknowledge_reference_rewrite:
             return ContentResult(
-                None,
-                None,
-                (),
-                False,
-                False,
-                "Recycling can rewrite inbound page references; set "
+                validation=None,
+                response=None,
+                verified_entities=(),
+                recovered_after_timeout=False,
+                verified=False,
+                diagnostic="Recycling can rewrite inbound page references; set "
                 "acknowledge_reference_rewrite=true to proceed",
-                previous,
-                tuple(inbound_references),
+                previous_entities=previous,
+                observed_entities=tuple(inbound_references),
             )
         response = await self._client.call("logseq.DB.deletePage", [page["title"]])
         current = await poll_readback(
@@ -564,19 +584,19 @@ class VerifiedContent:
         )
         if current.get(":logseq.property/deleted-at") is None:
             return ContentResult(
-                None,
-                response,
-                (),
-                False,
-                False,
-                "Page recycle verification failed",
-                previous,
-                (current, *inbound_references),
+                validation=None,
+                response=response,
+                verified_entities=(),
+                recovered_after_timeout=False,
+                verified=False,
+                diagnostic="Page recycle verification failed",
+                previous_entities=previous,
+                observed_entities=(current, *inbound_references),
             )
         return ContentResult(
-            None,
-            response,
-            (current,),
+            validation=None,
+            response=response,
+            verified_entities=(current,),
             previous_entities=previous,
             observed_entities=tuple(inbound_references),
         )
@@ -674,12 +694,6 @@ class VerifiedContent:
         if not page.get("name"):
             raise LookupError(f"No page exists with exact UUID {page_uuid}")
         return page
-
-    async def _call_ambiguous(self, method: str, args: list[Any]) -> tuple[Any, bool]:
-        try:
-            return await self._client.call(method, args), False
-        except httpx.TimeoutException:
-            return None, True
 
     async def _optional_entity_by_uuid(self, entity_uuid: str) -> dict[str, Any] | None:
         entity_uuid = self._validated_uuid(entity_uuid)
@@ -826,20 +840,3 @@ class VerifiedContent:
                 reference_uuids.add(value.lower())
         if not referenced_uuids <= reference_uuids:
             raise RuntimeError("Block title UUID reference verification failed")
-
-    @staticmethod
-    def _validated_uuid(value: Any) -> str:
-        try:
-            return str(UUID(value))
-        except (TypeError, ValueError, AttributeError) as error:
-            raise ValueError(f"Expected an exact UUID, got {value!r}") from error
-
-    def _require_title(self, title: str) -> None:
-        policy = getattr(self._client, "write_policy", None)
-        if policy is not None:
-            policy.require_title(title)
-
-    def _require_entity(self, entity_uuid: str) -> None:
-        policy = getattr(self._client, "write_policy", None)
-        if policy is not None:
-            policy.require_entity(entity_uuid)

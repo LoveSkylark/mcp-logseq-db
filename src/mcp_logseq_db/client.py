@@ -86,7 +86,8 @@ WRITE_METHODS = frozenset({
     "logseq.DB.deletePage",
 })
 
-EXPERIMENTAL_WRITE_METHODS = frozenset({
+# Used only as the ambiguous-timeout fallback when a CLI-backed write path is unavailable.
+RAW_FALLBACK_WRITE_METHODS = frozenset({
     "logseq.DB.insertBlock",
     "logseq.DB.moveBlock",
     "logseq.DB.removeBlock",
@@ -164,7 +165,6 @@ class LogseqDBClient:
         readback_attempts: int = 3,
         readback_delay: float = 0.15,
         read_attempts: int = 1,
-        experimental_writes_enabled: bool = False,
         write_policy: WriteAccessPolicy | None = None,
         max_response_bytes: int = 5_000_000,
         client_factory: ClientFactory = httpx.AsyncClient,
@@ -184,19 +184,13 @@ class LogseqDBClient:
         self._client_factory = client_factory
         self._cli_command = cli_command
         self._cli_runner = cli_runner
-        self._observed_methods: set[str] = set()
         self._write_lock = asyncio.Lock()
         self._write_circuit_reason: str | None = None
         self.readback_attempts = max(1, readback_attempts)
         self.readback_delay = max(0.0, readback_delay)
         self.read_attempts = max(1, read_attempts)
-        self.experimental_writes_enabled = experimental_writes_enabled
         self.write_policy = write_policy or WriteAccessPolicy()
         self.max_response_bytes = max(1, max_response_bytes)
-
-    @property
-    def observed_methods(self) -> frozenset[str]:
-        return frozenset(self._observed_methods)
 
     @property
     def write_circuit_open(self) -> bool:
@@ -354,7 +348,7 @@ class LogseqDBClient:
         if not isinstance(args, list):
             raise TypeError("Logseq API args must be a list")
 
-        is_write = method in WRITE_METHODS or method in EXPERIMENTAL_WRITE_METHODS
+        is_write = method in WRITE_METHODS or method in RAW_FALLBACK_WRITE_METHODS
         if is_write and self._write_circuit_reason is not None:
             raise WriteCircuitOpenError(
                 "Writes are blocked because an earlier write timed out with an "
@@ -424,7 +418,6 @@ class LogseqDBClient:
                         raise LogseqProtocolError(
                             f"{method} returned malformed JSON"
                         ) from error
-            self._observed_methods.add(method)
             return result
 
     async def _read_limited(self, response: httpx.Response, method: str) -> bytes:

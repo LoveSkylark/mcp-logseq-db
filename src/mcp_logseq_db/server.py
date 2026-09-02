@@ -29,7 +29,7 @@ def create_server(client: LogseqDBClient) -> MCPServer:
         instructions=(
             "Use exact DB identifiers. Prefer promoted DB reads and writes. "
             "Treat verified_state as evidence, never a raw null response. "
-            "Experimental tools may time out and are successful only when "
+            "Structural writes may time out and are successful only when "
             "their result reports verified=true."
         ),
     )
@@ -68,16 +68,10 @@ def create_server(client: LogseqDBClient) -> MCPServer:
 
     server.tool = safe_tool  # type: ignore[method-assign]
 
-    async def visible(awaitable):
-        try:
-            return await awaitable
-        except Exception as error:
-            raise ToolError(str(error)) from error
-
     @server.tool(name="capabilities", structured_output=True)
     async def capabilities() -> dict[str, Any]:
         """Probe and report DB methods supported by the connected instance."""
-        capabilities = await visible(CapabilityDiscovery(client).discover())
+        capabilities = await CapabilityDiscovery(client).discover()
         return capabilities.to_dict()
 
     @server.tool(name="check_current_is_db_graph")
@@ -86,7 +80,7 @@ def create_server(client: LogseqDBClient) -> MCPServer:
         try:
             async with asyncio.timeout(20):
                 return bool(
-                    await visible(client.call("logseq.DB.checkCurrentIsDbGraph", []))
+                    await client.call("logseq.DB.checkCurrentIsDbGraph", [])
                 )
         except TimeoutError as error:
             raise RuntimeError(
@@ -97,37 +91,37 @@ def create_server(client: LogseqDBClient) -> MCPServer:
     @server.tool(name="get_app_info")
     async def get_app_info() -> Any:
         """Return connected Logseq version and DB support metadata."""
-        return await visible(client.call("logseq.DB.getAppInfo", []))
+        return await client.call("logseq.DB.getAppInfo", [])
 
     @server.tool(name="get_current_graph")
     async def get_current_graph() -> Any:
         """Return the current graph identity and path metadata."""
-        return await visible(client.call("logseq.DB.getCurrentGraph", []))
+        return await client.call("logseq.DB.getCurrentGraph", [])
 
     @server.tool(name="list_pages")
     async def list_pages(expand: bool = False) -> Any:
         """List DB pages with UUIDs and optional expanded metadata."""
-        return await visible(client.call("logseq.DB.listPages", [{"expand": expand}]))
+        return await client.call("logseq.DB.listPages", [{"expand": expand}])
 
     @server.tool(name="get_page_data")
     async def get_page_data(page_name_or_uuid: str) -> Any:
         """Read a page and only blocks directly parented by it. Nested descendants require get_block_tree or a Datascript parent/page query."""
-        return await visible(client.call("logseq.DB.getPageData", [page_name_or_uuid]))
+        return await client.call("logseq.DB.getPageData", [page_name_or_uuid])
 
     @server.tool(name="search")
     async def search(query: str) -> Any:
         """Search the DB graph through the verified DB namespace alias."""
-        return await visible(client.call("logseq.DB.search", [query]))
+        return await client.call("logseq.DB.search", [query])
 
     @server.tool(name="list_properties")
     async def list_properties(expand: bool = False) -> Any:
         """List DB properties with optional expanded metadata."""
-        return await visible(client.call("logseq.DB.listProperties", [{"expand": expand}]))
+        return await client.call("logseq.DB.listProperties", [{"expand": expand}])
 
     @server.tool(name="list_tags")
     async def list_tags(expand: bool = False) -> Any:
         """List DB tags with optional expanded metadata."""
-        return await visible(client.call("logseq.DB.listTags", [{"expand": expand}]))
+        return await client.call("logseq.DB.listTags", [{"expand": expand}])
 
     @server.tool(name="upsert_nodes", structured_output=True)
     async def upsert_nodes(
@@ -254,39 +248,39 @@ def create_server(client: LogseqDBClient) -> MCPServer:
     @server.tool(name="datascript_query")
     async def datascript_query(query: str) -> Any:
         """Run a read-only Datascript query through logseq.DB.datascriptQuery."""
-        return await visible(client.call("logseq.DB.datascriptQuery", [query]))
+        return await client.call("logseq.DB.datascriptQuery", [query])
 
     @server.tool(name="get_all_properties")
     async def get_all_properties() -> Any:
         """Return all DB property definitions."""
-        return await visible(client.call("logseq.DB.getAllProperties", []))
+        return await client.call("logseq.DB.getAllProperties", [])
 
     @server.tool(name="get_property")
     async def get_property(property_ident: str) -> Any:
         """Get a property by its exact namespaced ident."""
         if not property_ident.startswith(":") or "/" not in property_ident:
             raise ValueError("property_ident must be an exact namespaced ident")
-        return await visible(client.call("logseq.DB.getProperty", [property_ident]))
+        return await client.call("logseq.DB.getProperty", [property_ident])
 
     @server.tool(name="get_all_tags")
     async def get_all_tags() -> Any:
         """Return all DB tags/classes."""
-        return await visible(client.call("logseq.DB.getAllTags", []))
+        return await client.call("logseq.DB.getAllTags", [])
 
     @server.tool(name="get_tag")
     async def get_tag(identifier: str) -> Any:
         """Get a tag by exact ident, UUID, or title."""
-        return await visible(client.call("logseq.DB.getTag", [identifier]))
+        return await client.call("logseq.DB.getTag", [identifier])
 
     @server.tool(name="get_tags_by_name")
     async def get_tags_by_name(title: str) -> Any:
         """Get tags matching an exact title."""
-        return await visible(client.call("logseq.DB.getTagsByName", [title]))
+        return await client.call("logseq.DB.getTagsByName", [title])
 
     @server.tool(name="get_tag_objects")
     async def get_tag_objects(identifier: str) -> Any:
         """Return a mixed list of pages and blocks associated with a tag ident, UUID, or title."""
-        return await visible(client.call("logseq.DB.getTagObjects", [identifier]))
+        return await client.call("logseq.DB.getTagObjects", [identifier])
 
     @server.tool(name="upsert_property", structured_output=True)
     async def upsert_property(
@@ -531,7 +525,6 @@ def main() -> None:
         readback_attempts=settings.readback_attempts,
         readback_delay=settings.readback_delay,
         read_attempts=settings.read_attempts,
-        experimental_writes_enabled=settings.experimental_writes_enabled,
         write_policy=WriteAccessPolicy(
             title_prefixes=settings.write_title_prefixes,
             property_prefixes=settings.write_property_prefixes,

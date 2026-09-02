@@ -6,8 +6,6 @@ from mcp_logseq_db.capabilities import CapabilityDiscovery
 
 
 class ProbeClient:
-    observed_methods: frozenset[str] = frozenset()
-
     async def call(self, method: str, args: list[Any]) -> Any:
         if method == "logseq.DB.getAppInfo":
             return {"version": "2.0.1", "supportDb": True}
@@ -59,8 +57,6 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     )
     assert "logseq.DB.createPage" in capabilities.rejected_operations
     assert "logseq.DB.updateBlock" in capabilities.rejected_operations
-    assert capabilities.experimental_operations == ()
-    assert capabilities.experimental_writes_enabled is False
     assert capabilities.write_circuit_open is False
     assert capabilities.write_circuit_reason is None
     assert "rename_tag" in capabilities.supported_mcp_write_tools
@@ -72,17 +68,6 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     assert "remove_page_tag" in capabilities.supported_mcp_write_tools
     assert "upsert_page_property" in capabilities.supported_mcp_write_tools
     assert "remove_page_property" in capabilities.supported_mcp_write_tools
-    assert capabilities.experimental_mcp_write_tools == ()
-
-
-@pytest.mark.asyncio
-async def test_capabilities_do_not_list_replaced_experimental_tools() -> None:
-    client = ProbeClient()
-    client.experimental_writes_enabled = True
-
-    capabilities = await CapabilityDiscovery(client).discover()  # type: ignore[arg-type]
-
-    assert capabilities.experimental_mcp_write_tools == ()
 
 
 @pytest.mark.asyncio
