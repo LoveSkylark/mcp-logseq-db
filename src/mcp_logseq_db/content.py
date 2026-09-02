@@ -531,12 +531,31 @@ class VerifiedContent:
         return ContentResult(None, response, (current,))
 
     @serialized_write
-    async def delete_page(self, page_uuid: str) -> ContentResult:
+    async def delete_page(
+        self,
+        page_uuid: str,
+        *,
+        acknowledge_reference_rewrite: bool = False,
+    ) -> ContentResult:
         page_uuid = self._validated_uuid(page_uuid)
         self._require_entity(page_uuid)
         page = await self._page_by_uuid(page_uuid)
         if page.get(":logseq.property/deleted-at") is not None:
             raise ValueError("Page is already recycled")
+        page_blocks, inbound_references = await self._page_recycle_context(page["id"])
+        previous = (page, *page_blocks)
+        if inbound_references and not acknowledge_reference_rewrite:
+            return ContentResult(
+                None,
+                None,
+                (),
+                False,
+                False,
+                "Recycling can rewrite inbound page references; set "
+                "acknowledge_reference_rewrite=true to proceed",
+                previous,
+                tuple(inbound_references),
+            )
         response = await self._client.call("logseq.DB.deletePage", [page["title"]])
         current = await poll_readback(
             self._client,
@@ -544,8 +563,50 @@ class VerifiedContent:
             lambda value: value.get(":logseq.property/deleted-at") is not None,
         )
         if current.get(":logseq.property/deleted-at") is None:
-            raise RuntimeError("Page recycle verification failed")
-        return ContentResult(None, response, (current,))
+            return ContentResult(
+                None,
+                response,
+                (),
+                False,
+                False,
+                "Page recycle verification failed",
+                previous,
+                (current, *inbound_references),
+            )
+        return ContentResult(
+            None,
+            response,
+            (current,),
+            previous_entities=previous,
+            observed_entities=tuple(inbound_references),
+        )
+
+    async def _page_recycle_context(
+        self, page_id: int
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        blocks_query = (
+            "[:find [(pull ?block [*]) ...] :in $ ?page :where "
+            "[?block :block/page ?page]]"
+        )
+        references_query = (
+            "[:find [(pull ?entity [*]) ...] :in $ ?page :where "
+            "[?entity :block/refs ?page]]"
+        )
+        blocks = await self._client.call(
+            "logseq.DB.datascriptQuery", [blocks_query, page_id]
+        )
+        references = await self._client.call(
+            "logseq.DB.datascriptQuery", [references_query, page_id]
+        )
+        if not isinstance(blocks, list) or not all(
+            isinstance(entity, dict) for entity in blocks
+        ):
+            raise RuntimeError("Page block snapshot returned an unexpected shape")
+        if not isinstance(references, list) or not all(
+            isinstance(entity, dict) for entity in references
+        ):
+            raise RuntimeError("Page reference lookup returned an unexpected shape")
+        return blocks, references
 
     async def _validate_operations(
         self, operations: list[dict[str, Any]]

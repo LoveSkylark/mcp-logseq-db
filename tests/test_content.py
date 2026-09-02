@@ -459,6 +459,39 @@ async def test_delete_verifies_descendant_cascade() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recycle_page_requires_acknowledgement_for_inbound_references() -> None:
+    page = {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"}
+    block = {"id": 11, "uuid": BLOCK_UUID, "title": "Child", "page": {"id": 10}}
+    reference = {"id": 12, "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+    client = RecordingClient([page, [block], [reference]])
+
+    result = await VerifiedContent(client).delete_page(PAGE_UUID)  # type: ignore[arg-type]
+
+    assert result.verified is False
+    assert result.response is None
+    assert result.previous_entities == (page, block)
+    assert result.observed_entities == (reference,)
+    assert all(method != "logseq.DB.deletePage" for method, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_recycle_page_with_acknowledgement_retains_reference_evidence() -> None:
+    page = {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"}
+    recycled = dict(page, **{":logseq.property/deleted-at": 123})
+    reference = {"id": 12, "uuid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}
+    client = RecordingClient([page, [], [reference], True, recycled])
+
+    result = await VerifiedContent(client).delete_page(  # type: ignore[arg-type]
+        PAGE_UUID, acknowledge_reference_rewrite=True
+    )
+
+    assert result.verified is True
+    assert result.previous_entities == (page,)
+    assert result.observed_entities == (reference,)
+    assert client.calls[3] == ("logseq.DB.deletePage", ["Page"])
+
+
+@pytest.mark.asyncio
 async def test_title_scope_denies_creation_before_api_call() -> None:
     client = RecordingClient([])
     client.write_policy = WriteAccessPolicy(title_prefixes=("Allowed/",))

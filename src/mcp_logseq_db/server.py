@@ -18,7 +18,7 @@ from .client import (
     WriteCircuitOpenError,
 )
 from .content import VerifiedContent
-from .mutations import VerifiedMutations
+from .mutations import MutationVerificationError, VerifiedMutations
 from .settings import Settings
 
 
@@ -45,7 +45,7 @@ def create_server(client: LogseqDBClient) -> MCPServer:
                 try:
                     return await method(*method_args, **method_kwargs)
                 except Exception as error:
-                    payload = {
+                    payload: dict[str, Any] = {
                         "verified": False,
                         "failure_stage": _failure_stage(error),
                         "diagnostic": str(error),
@@ -58,6 +58,8 @@ def create_server(client: LogseqDBClient) -> MCPServer:
                         "previous_state": None,
                         "previous_entities": [],
                     }
+                    if isinstance(error, MutationVerificationError):
+                        payload.update(error.result.to_dict())
                     raise ToolError(json.dumps(payload)) from error
 
             return register(wrapped)
@@ -109,7 +111,7 @@ def create_server(client: LogseqDBClient) -> MCPServer:
 
     @server.tool(name="get_page_data")
     async def get_page_data(page_name_or_uuid: str) -> Any:
-        """Read a page and only blocks directly parented by it. Nested descendants require get_block or a Datascript parent/page query."""
+        """Read a page and only blocks directly parented by it. Nested descendants require get_block_tree or a Datascript parent/page query."""
         return await visible(client.call("logseq.DB.getPageData", [page_name_or_uuid]))
 
     @server.tool(name="search")
@@ -226,24 +228,28 @@ def create_server(client: LogseqDBClient) -> MCPServer:
         return (await VerifiedContent(client).rename_page(page_uuid, new_title)).to_dict()
 
     @server.tool(name="delete_page", structured_output=True)
-    async def delete_page(page_uuid: str) -> dict[str, Any]:
+    async def delete_page(
+        page_uuid: str, acknowledge_reference_rewrite: bool = False
+    ) -> dict[str, Any]:
         """Compatibility alias for recycle_page."""
-        return (await VerifiedContent(client).delete_page(page_uuid)).to_dict()
+        return (
+            await VerifiedContent(client).delete_page(
+                page_uuid,
+                acknowledge_reference_rewrite=acknowledge_reference_rewrite,
+            )
+        ).to_dict()
 
     @server.tool(name="recycle_page", structured_output=True)
-    async def recycle_page(page_uuid: str) -> dict[str, Any]:
-        """Recycle an exact page UUID and verify its deleted-at marker."""
-        return (await VerifiedContent(client).delete_page(page_uuid)).to_dict()
-
-    @server.tool(name="q")
-    async def q(query: str) -> Any:
-        """Run a query through logseq.DB.q."""
-        return await visible(client.call("logseq.DB.q", [query]))
-
-    @server.tool(name="custom_query")
-    async def custom_query(query: str) -> Any:
-        """Run a custom query through logseq.DB.customQuery."""
-        return await visible(client.call("logseq.DB.customQuery", [query]))
+    async def recycle_page(
+        page_uuid: str, acknowledge_reference_rewrite: bool = False
+    ) -> dict[str, Any]:
+        """Recycle a page after checking for reference-rewrite side effects."""
+        return (
+            await VerifiedContent(client).delete_page(
+                page_uuid,
+                acknowledge_reference_rewrite=acknowledge_reference_rewrite,
+            )
+        ).to_dict()
 
     @server.tool(name="datascript_query")
     async def datascript_query(query: str) -> Any:
@@ -331,11 +337,19 @@ def create_server(client: LogseqDBClient) -> MCPServer:
             await VerifiedMutations(client).remove_tag_property(tag_uuid, property_ident)
         ).to_dict()
 
-    @server.tool(name="add_tag_extends", structured_output=True)
-    async def add_tag_extends(tag_uuid: str, parent_tag_uuid: str) -> dict[str, Any]:
-        """Add and verify inheritance between two exact tag UUIDs."""
+    @server.tool(name="set_tag_parent", structured_output=True)
+    async def set_tag_parent(
+        tag_uuid: str,
+        parent_tag_uuid: str,
+        acknowledge_replacement: bool = False,
+    ) -> dict[str, Any]:
+        """Set one tag parent, requiring acknowledgement before replacement."""
         return (
-            await VerifiedMutations(client).add_tag_extends(tag_uuid, parent_tag_uuid)
+            await VerifiedMutations(client).set_tag_parent(
+                tag_uuid,
+                parent_tag_uuid,
+                acknowledge_replacement=acknowledge_replacement,
+            )
         ).to_dict()
 
     @server.tool(name="remove_tag_extends", structured_output=True)
@@ -372,16 +386,30 @@ def create_server(client: LogseqDBClient) -> MCPServer:
 
     @server.tool(name="add_block_tag", structured_output=True)
     async def add_block_tag(block_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Add an exact tag UUID to an exact page or block UUID and verify it."""
+        """Add an exact tag UUID to an exact block UUID and verify it."""
         return (
             await VerifiedMutations(client).add_block_tag(block_uuid, tag_uuid)
         ).to_dict()
 
     @server.tool(name="remove_block_tag", structured_output=True)
     async def remove_block_tag(block_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Remove an exact tag UUID from a page or block UUID and verify absence."""
+        """Remove an exact tag UUID from an exact block UUID and verify absence."""
         return (
             await VerifiedMutations(client).remove_block_tag(block_uuid, tag_uuid)
+        ).to_dict()
+
+    @server.tool(name="add_page_tag", structured_output=True)
+    async def add_page_tag(page_uuid: str, tag_uuid: str) -> dict[str, Any]:
+        """Add an exact tag UUID to an exact page UUID through the native DB API."""
+        return (
+            await VerifiedMutations(client).add_page_tag(page_uuid, tag_uuid)
+        ).to_dict()
+
+    @server.tool(name="remove_page_tag", structured_output=True)
+    async def remove_page_tag(page_uuid: str, tag_uuid: str) -> dict[str, Any]:
+        """Remove an exact tag UUID from an exact page UUID through the native DB API."""
+        return (
+            await VerifiedMutations(client).remove_page_tag(page_uuid, tag_uuid)
         ).to_dict()
 
     @server.tool(name="set_block_icon", structured_output=True)
@@ -433,12 +461,17 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "and max_nodes from 1 to 1000."
         ),
         "upsert_block_property": (
-            "Use an exact block/page UUID, a full namespaced property ident, "
+            "Use an exact block UUID, a full namespaced property ident, "
             "the schema-compatible value, and an optional options object."
         ),
-        "add_block_tag": "Use exact block/page and tag UUIDs.",
-        "remove_block_tag": "Use exact block/page and tag UUIDs.",
-        "add_tag_extends": "Use exact child-tag and parent-tag UUIDs.",
+        "add_block_tag": "Use exact block and tag UUIDs.",
+        "remove_block_tag": "Use exact block and tag UUIDs.",
+        "add_page_tag": "Use exact page and tag UUIDs.",
+        "remove_page_tag": "Use exact page and tag UUIDs.",
+        "set_tag_parent": (
+            "Use exact child and parent tag UUIDs and acknowledge replacement "
+            "when the child already has a different parent."
+        ),
         "remove_tag_extends": "Use exact child-tag and parent-tag UUIDs.",
         "set_block_icon": (
             "Use an exact block UUID, icon_type tabler-icon or emoji, and a "

@@ -12,7 +12,7 @@ description: "Use when reading or modifying a Logseq 2.x DB graph through the mc
 | 2026-09-02 | Datascript-backed block readers | PASS, including an existing depth-3 tree |
 | 2026-09-02 | `upsertNodes` page/top-level-block creation and block edit | PASS |
 | 2026-09-02 | Property/tag definition creation, rename, and verified removals | PASS for tools still listed below |
-| 2026-09-02 | `upsertBlockProperty`, `addBlockTag`, `removeBlockTag`, `setBlockIcon`, `addTagExtends` | PASS after isolated fresh Logseq restart; earlier same-session timeouts were write-path degradation |
+| 2026-09-02 | `upsertBlockProperty`, block/page tag changes, `setBlockIcon`, `addTagExtends` | PASS after isolated fresh Logseq restart; earlier same-session timeouts were write-path degradation |
 | 2026-09-02 | CLI graph-worker `delete-blocks` operation | PASS with exact absence read-back |
 | 2026-09-02 | CLI graph-worker child insert and move | PASS with parent/page read-back |
 
@@ -194,8 +194,9 @@ construct or predict an ident from a display title.
    - `get_tag_objects` for nodes associated with a known tag. Its result is
      mixed and may contain both pages and blocks; distinguish pages by
      `:block/name`/`name`.
-3. Use `q`, `custom_query`, or `datascript_query` only when the
-   structured readers cannot answer the question.
+3. Use `datascript_query` only when the structured readers cannot answer the
+  question. `q` and `custom_query` are blocked because their tested result
+  shapes were not reliable enough for the public tool contract.
 4. Preserve `id`, `ident`, and `uuid` in the working plan. Do not reduce an
    entity to display text.
 
@@ -206,6 +207,9 @@ construct or predict an ident from a display title.
   predicate can wedge that worker even when the MCP process is healthy.
 - Query/search calls are single-attempt. Never automatically repeat a timed-out
   query against the same worker.
+- `search` can return highlight markers as presentation text. Do not paste
+  those markers into mutation inputs; read the exact page or block first and
+  write only the intended title/content.
 - Prefer bounded queries that return only fields needed for the task.
 - Use DB attributes such as `:block/title`, `:block/uuid`, and `:block/tags`.
 - Validate query results before using any returned UUID in a write.
@@ -279,6 +283,10 @@ Supported operation shapes:
   without committing.
 - `recycle_page` recycles an exact page UUID and verifies its
   `:logseq.property/deleted-at` marker. It does not permanently erase it.
+  Before mutation, the tool snapshots page-owned blocks and inbound
+  `:block/refs`. If inbound references exist, it returns `verified=false`
+  unless `acknowledge_reference_rewrite=true` is supplied, because Logseq can
+  rewrite visible inbound page references during recycle.
 - `delete_page` is retained only as a compatibility alias. Prefer
   `recycle_page` in plans and user-facing language.
 - Use `insert_block` and `move_block` for verified `child` or `after`
@@ -352,7 +360,7 @@ result envelope. A completed MCP call is not proof of mutation:
 
 ### Block properties
 
-- Use `upsert_block_property` with an exact page/block UUID, exact property
+- Use `upsert_block_property` with an exact block UUID, exact property
   ident, typed value, and optional options object. Never pass a property display
   name. The raw verified shape is `[block_uuid, property_ident, value, options]`;
   the MCP supplies `{}` when options are omitted.
@@ -376,10 +384,12 @@ result envelope. A completed MCP call is not proof of mutation:
   `get_tag(old_title)` may still resolve through the old title fragment in
   the unchanged ident, while `get_tags_by_name(old_title)` returns nothing.
   Use UUID or exact ident when lookup semantics matter.
-- Use `delete_tag(tag_uuid)` only after explicit confirmation. It verifies
-  that `get_tag` returns no entity and returns the deleted snapshot in
-  `previous_state`. It also verifies that no `:block/tags` or `:block/refs`
-  datoms still point to the deleted tag.
+- Use `delete_tag(tag_uuid)` only after explicit confirmation. It permanently
+  removes the tag, verifies that `get_tag` returns no entity, and returns the
+  deleted snapshot in `previous_state`. It also verifies that no `:block/tags`
+  or `:block/refs` datoms still point to the deleted tag. Deleting an in-use
+  tag removes assignments/references graph-wide without deleting the tagged
+  entities.
 
 ### Tag properties and inheritance
 
@@ -389,17 +399,25 @@ result envelope. A completed MCP call is not proof of mutation:
 - `remove_tag_property(tag_uuid, property_ident)` removes it. The server
   resolves the property ident to the UUID form required by Logseq.
 - `remove_tag_extends(tag_uuid, parent_tag_uuid)` removes inheritance.
-- `add_tag_extends` and `remove_tag_extends` require exact child and
-  parent tag UUIDs. Do not pass titles or numeric ids.
+- `set_tag_parent(tag_uuid, parent_tag_uuid, acknowledge_replacement=false)`
+  sets one parent through Logseq's `addTagExtends` route. If the child already
+  has a different parent, the tool refuses before mutation unless replacement
+  is explicitly acknowledged.
+- `set_tag_parent` and `remove_tag_extends` require exact child and parent tag
+  UUIDs. Do not pass titles or numeric ids.
 
 ### Tagging a page or block
 
 - `create_top_level_block(page_uuid, title, tag_uuids)` can apply tags in
   the same creation call.
-- `add_block_tag` and `remove_block_tag` require an exact page/block UUID
-  and exact tag UUID. The MCP does not resolve display titles for these writes.
-  These tools use the graph-worker path because it remained responsive when
-  the equivalent DB HTTP aliases timed out in mixed write sequences.
+- `add_block_tag` and `remove_block_tag` require an exact block UUID and exact
+  tag UUID. They reject page UUIDs before mutation. The MCP does not resolve
+  display titles for these writes. These tools use the graph-worker path
+  because it remained responsive when the equivalent DB HTTP aliases timed out
+  in mixed write sequences.
+- `add_page_tag` and `remove_page_tag` require an exact page UUID and exact tag
+  UUID. They use the native DB tag route because the graph-worker block path is
+  intentionally block-only.
 - Do not insert `#tag` text as a substitute for changing `:block/tags`.
 
 ## Block icons
@@ -426,8 +444,11 @@ verified/observed/previous fields when state was unavailable. Stages are
 - `verified_state` is the server's post-write read-back. Claim success only
   when it contains the expected attribute or relationship.
 - For `remove_property`, both `response` and `verified_state` are `null`
-  after verified absence. For relationship/icon removals, `verified_state`
-  normally contains the surviving entity without the removed value.
+  after verified absence. The tool also verifies no direct attribute use or
+  property-created value entity remains. For relationship/icon removals,
+  `verified_state` normally contains the surviving entity without the removed
+  value. If read-back fails after a write, the error includes `previous_state`
+  and `observed_state` when they are available.
 - `recovered_after_timeout=true` means the original response was ambiguous but
   read-back established the resulting state. Mention that recovery explicitly.
 - A timed-out write may have committed. Never immediately repeat it.
@@ -541,8 +562,6 @@ Reads and capabilities:
 - `search`
 - `list_properties`
 - `list_tags`
-- `q`
-- `custom_query`
 - `datascript_query`
 - `get_all_properties`
 - `get_property`
@@ -572,12 +591,14 @@ Promoted writes:
 - `delete_tag`
 - `add_tag_property`
 - `remove_tag_property`
-- `add_tag_extends`
+- `set_tag_parent`
 - `remove_tag_extends`
 - `upsert_block_property`
 - `remove_block_property`
 - `add_block_tag`
 - `remove_block_tag`
+- `add_page_tag`
+- `remove_page_tag`
 - `set_block_icon`
 - `remove_block_icon`
 

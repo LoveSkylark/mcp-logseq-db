@@ -1,6 +1,7 @@
 """DB property mutations with exact resolution and mandatory read-back."""
 
 from dataclasses import asdict, dataclass
+import re
 from typing import Any
 from uuid import UUID
 import httpx
@@ -15,9 +16,17 @@ class MutationResult:
     recovered_after_timeout: bool = False
     previous_state: Any = None
     diagnostic: str | None = None
+    verified: bool = True
+    observed_state: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+class MutationVerificationError(RuntimeError):
+    def __init__(self, result: MutationResult) -> None:
+        super().__init__(result.diagnostic or "Mutation verification failed")
+        self.result = result
 
 
 class VerifiedMutations:
@@ -78,9 +87,21 @@ class VerifiedMutations:
         )
         if current is not None:
             detail = " after a timeout" if timed_out else ""
-            raise RuntimeError(f"Property {ident} is still visible{detail}")
+            self._raise_verification(
+                f"Property {ident} is still visible{detail}",
+                response=response,
+                previous_state={"property": existing, "usage": usage_before},
+                observed_state={"property": current, "usage": usage_after},
+                timed_out=timed_out,
+            )
         if usage_after[0] or usage_after[1]:
-            raise RuntimeError("Property removal left attributes or value entities behind")
+            self._raise_verification(
+                "Property removal left attributes or value entities behind",
+                response=response,
+                previous_state={"property": existing, "usage": usage_before},
+                observed_state={"property": current, "usage": usage_after},
+                timed_out=timed_out,
+            )
         return MutationResult(
             response,
             None,
@@ -130,7 +151,12 @@ class VerifiedMutations:
             lambda entity: isinstance(entity, dict) and entity.get("title") == new_title,
         )
         if not isinstance(current, dict) or current.get("title") != new_title:
-            raise RuntimeError("Tag rename verification failed")
+            self._raise_verification(
+                "Tag rename verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+            )
         return MutationResult(response, current, previous_state=previous)
 
     @serialized_write
@@ -145,15 +171,23 @@ class VerifiedMutations:
             lambda entity: entity is None,
         )
         if current is not None:
-            raise RuntimeError("Tag deletion verification failed; tag is still visible")
+            self._raise_verification(
+                "Tag deletion verification failed; tag is still visible",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+            )
         dangling = await poll_readback(
             self._client,
             lambda: self._tag_reference_ids(previous["id"]),
             lambda entity_ids: not entity_ids,
         )
         if dangling:
-            raise RuntimeError(
-                f"Tag deletion left dangling references on entities {sorted(dangling)!r}"
+            self._raise_verification(
+                f"Tag deletion left dangling references on entities {sorted(dangling)!r}",
+                response=response,
+                previous_state=previous,
+                observed_state={"referencing_entity_ids": sorted(dangling)},
             )
         return MutationResult(response, None, previous_state=previous)
 
@@ -165,6 +199,7 @@ class VerifiedMutations:
         self._require_entity(tag_uuid)
         self._require_property(property_ident)
         property_entity = await self._property(property_ident)
+        previous = await self._tag(tag_uuid)
         response, timed_out = await self._write(
             "logseq.DB.addTagProperty", [tag_uuid, property_ident]
         )
@@ -175,8 +210,14 @@ class VerifiedMutations:
             in entity.get(":logseq.property.class/properties", []),
         )
         if property_entity["id"] not in current.get(":logseq.property.class/properties", []):
-            raise RuntimeError("Tag property addition verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Tag property addition verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
     async def remove_tag_property(
@@ -186,6 +227,7 @@ class VerifiedMutations:
         self._require_entity(tag_uuid)
         self._require_property(property_ident)
         property_entity = await self._property(property_ident)
+        previous = await self._tag(tag_uuid)
         property_uuid = self._validated_uuid(str(property_entity.get("uuid")))
         response, timed_out = await self._write(
             "logseq.DB.removeTagProperty", [tag_uuid, property_uuid]
@@ -197,29 +239,60 @@ class VerifiedMutations:
             not in entity.get(":logseq.property.class/properties", []),
         )
         if property_entity["id"] in current.get(":logseq.property.class/properties", []):
-            raise RuntimeError("Tag property removal verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Tag property removal verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
-    async def add_tag_extends(
-        self, tag_uuid: str, parent_tag_uuid: str
+    async def set_tag_parent(
+        self,
+        tag_uuid: str,
+        parent_tag_uuid: str,
+        *,
+        acknowledge_replacement: bool = False,
     ) -> MutationResult:
         tag_uuid = self._validated_uuid(tag_uuid)
         self._require_entity(tag_uuid)
         self._require_entity(self._validated_uuid(parent_tag_uuid))
         parent = await self._tag(parent_tag_uuid)
+        previous = await self._tag(tag_uuid)
+        previous_parent_ids = set(
+            previous.get(":logseq.property.class/extends", [])
+        )
+        replaced_parent_ids = previous_parent_ids - {parent["id"]}
+        if replaced_parent_ids and not acknowledge_replacement:
+            raise ValueError(
+                "Tag already has a different parent; set acknowledge_replacement=true "
+                "to replace it"
+            )
         response, timed_out = await self._write(
             "logseq.DB.addTagExtends", [tag_uuid, self._validated_uuid(parent_tag_uuid)]
         )
         current = await poll_readback(
             self._client,
             lambda: self._tag(tag_uuid),
-            lambda entity: parent["id"]
-            in entity.get(":logseq.property.class/extends", []),
+            lambda entity: parent["id"] in entity.get(":logseq.property.class/extends", [])
+            and not replaced_parent_ids.intersection(
+                entity.get(":logseq.property.class/extends", [])
+            ),
         )
-        if parent["id"] not in current.get(":logseq.property.class/extends", []):
-            raise RuntimeError("Tag inheritance addition verification failed")
-        return MutationResult(response, current, timed_out)
+        current_parent_ids = set(current.get(":logseq.property.class/extends", []))
+        if parent["id"] not in current_parent_ids or replaced_parent_ids.intersection(
+            current_parent_ids
+        ):
+            self._raise_verification(
+                "Tag parent verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
     async def remove_tag_extends(
@@ -229,6 +302,7 @@ class VerifiedMutations:
         self._require_entity(tag_uuid)
         self._require_entity(self._validated_uuid(parent_tag_uuid))
         parent = await self._tag(parent_tag_uuid)
+        previous = await self._tag(tag_uuid)
         response, timed_out = await self._write(
             "logseq.DB.removeTagExtends", [tag_uuid, self._validated_uuid(parent_tag_uuid)]
         )
@@ -239,8 +313,14 @@ class VerifiedMutations:
             not in entity.get(":logseq.property.class/extends", []),
         )
         if parent["id"] in current.get(":logseq.property.class/extends", []):
-            raise RuntimeError("Tag inheritance removal verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Tag inheritance removal verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
     async def upsert_block_property(
@@ -254,6 +334,7 @@ class VerifiedMutations:
         self._require_entity(block_uuid)
         self._require_property(property_ident)
         property_entity = await self._property(property_ident)
+        previous = await self._block(block_uuid)
         response, timed_out = await self._write(
             "logseq.DB.upsertBlockProperty",
             [block_uuid, property_ident, value, options or {}],
@@ -266,8 +347,24 @@ class VerifiedMutations:
             lambda state: state[1],
         )
         if not matches:
-            raise RuntimeError("Block property value verification failed")
-        return MutationResult(response, current, timed_out)
+            raise MutationVerificationError(
+                MutationResult(
+                    response,
+                    None,
+                    timed_out,
+                    previous_state=previous,
+                    diagnostic="Block property value verification failed",
+                    verified=False,
+                    observed_state=current,
+                )
+            )
+        return MutationResult(
+            response,
+            current,
+            timed_out,
+            previous_state=previous,
+            observed_state=current,
+        )
 
     @serialized_write
     async def remove_block_property(
@@ -277,6 +374,7 @@ class VerifiedMutations:
         self._require_entity(block_uuid)
         self._require_property(property_ident)
         await self._property(property_ident)
+        previous = await self._block(block_uuid)
         response, timed_out = await self._write(
             "logseq.DB.removeBlockProperty", [block_uuid, property_ident]
         )
@@ -286,14 +384,21 @@ class VerifiedMutations:
             lambda entity: property_ident not in entity,
         )
         if property_ident in current:
-            raise RuntimeError("Block property removal verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Block property removal verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
     async def add_block_tag(self, block_uuid: str, tag_uuid: str) -> MutationResult:
         block_uuid = self._validated_uuid(block_uuid)
         self._require_entity(block_uuid)
         self._require_entity(self._validated_uuid(tag_uuid))
+        previous = await self._block(block_uuid)
         tag = await self._tag(tag_uuid)
         cli_update = getattr(self._client, "update_block_tag_via_cli", None)
         if cli_update is None:
@@ -309,14 +414,21 @@ class VerifiedMutations:
             lambda entity: tag["id"] in self._reference_ids(entity.get("tags", [])),
         )
         if tag["id"] not in self._reference_ids(current.get("tags", [])):
-            raise RuntimeError("Block tag addition verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Block tag addition verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
     async def remove_block_tag(self, block_uuid: str, tag_uuid: str) -> MutationResult:
         block_uuid = self._validated_uuid(block_uuid)
         self._require_entity(block_uuid)
         self._require_entity(self._validated_uuid(tag_uuid))
+        previous = await self._block(block_uuid)
         tag = await self._tag(tag_uuid)
         cli_update = getattr(self._client, "update_block_tag_via_cli", None)
         if cli_update is None:
@@ -332,8 +444,22 @@ class VerifiedMutations:
             lambda entity: tag["id"] not in self._reference_ids(entity.get("tags", [])),
         )
         if tag["id"] in self._reference_ids(current.get("tags", [])):
-            raise RuntimeError("Block tag removal verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Block tag removal verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
+
+    @serialized_write
+    async def add_page_tag(self, page_uuid: str, tag_uuid: str) -> MutationResult:
+        return await self._update_page_tag(page_uuid, tag_uuid, remove=False)
+
+    @serialized_write
+    async def remove_page_tag(self, page_uuid: str, tag_uuid: str) -> MutationResult:
+        return await self._update_page_tag(page_uuid, tag_uuid, remove=True)
 
     @serialized_write
     async def set_block_icon(
@@ -343,6 +469,7 @@ class VerifiedMutations:
         self._require_entity(block_uuid)
         if icon_type not in {"tabler-icon", "emoji"}:
             raise ValueError("icon_type must be 'tabler-icon' or 'emoji'")
+        previous = await self._block(block_uuid)
         response, timed_out = await self._write(
             "logseq.DB.setBlockIcon", [block_uuid, icon_type, icon_name]
         )
@@ -353,17 +480,36 @@ class VerifiedMutations:
         )
         icon = current.get(":logseq.property/icon")
         if not isinstance(icon, dict) or icon.get("type") != icon_type:
-            raise RuntimeError("Block icon verification failed")
+            self._raise_verification(
+                "Block icon verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
         if icon_type == "tabler-icon" and icon.get("id") != icon_name:
-            raise RuntimeError("Block icon verification failed")
-        if icon_type == "emoji" and not icon.get("id"):
-            raise RuntimeError("Block emoji verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Block icon verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        if icon_type == "emoji" and icon.get("id") != self._normalized_emoji_id(icon_name):
+            self._raise_verification(
+                "Block emoji verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     @serialized_write
     async def remove_block_icon(self, block_uuid: str) -> MutationResult:
         block_uuid = self._validated_uuid(block_uuid)
         self._require_entity(block_uuid)
+        previous = await self._block(block_uuid)
         response, timed_out = await self._write(
             "logseq.DB.removeBlockIcon", [block_uuid]
         )
@@ -373,8 +519,46 @@ class VerifiedMutations:
             lambda entity: ":logseq.property/icon" not in entity,
         )
         if ":logseq.property/icon" in current:
-            raise RuntimeError("Block icon removal verification failed")
-        return MutationResult(response, current, timed_out)
+            self._raise_verification(
+                "Block icon removal verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
+
+    async def _update_page_tag(
+        self, page_uuid: str, tag_uuid: str, *, remove: bool
+    ) -> MutationResult:
+        page_uuid = self._validated_uuid(page_uuid)
+        self._require_entity(page_uuid)
+        tag_uuid = self._validated_uuid(tag_uuid)
+        self._require_entity(tag_uuid)
+        previous = await self._page(page_uuid)
+        tag = await self._tag(tag_uuid)
+        method = "logseq.DB.removeBlockTag" if remove else "logseq.DB.addBlockTag"
+        response, timed_out = await self._write(method, [page_uuid, tag_uuid])
+        current = await poll_readback(
+            self._client,
+            lambda: self._page(page_uuid),
+            lambda entity: (
+                tag["id"] not in self._reference_ids(entity.get("tags", []))
+                if remove
+                else tag["id"] in self._reference_ids(entity.get("tags", []))
+            ),
+        )
+        present = tag["id"] in self._reference_ids(current.get("tags", []))
+        if present == remove:
+            action = "removal" if remove else "addition"
+            self._raise_verification(
+                f"Page tag {action} verification failed",
+                response=response,
+                previous_state=previous,
+                observed_state=current,
+                timed_out=timed_out,
+            )
+        return MutationResult(response, current, timed_out, previous_state=previous)
 
     async def _write(self, method: str, args: list[Any]) -> tuple[Any, bool]:
         try:
@@ -482,6 +666,43 @@ class VerifiedMutations:
         if not isinstance(entity, dict) or entity.get("uuid") != entity_uuid:
             raise LookupError(f"No entity exists with exact UUID {entity_uuid}")
         return entity
+
+    async def _block(self, block_uuid: str) -> dict[str, Any]:
+        entity = await self._entity(block_uuid)
+        if entity.get("name"):
+            raise ValueError("UUID identifies a page, not a block")
+        return entity
+
+    async def _page(self, page_uuid: str) -> dict[str, Any]:
+        entity = await self._entity(page_uuid)
+        if not entity.get("name"):
+            raise ValueError("UUID identifies a block, not a page")
+        return entity
+
+    @staticmethod
+    def _normalized_emoji_id(icon_name: str) -> str:
+        return re.sub(r"[\s-]+", "_", icon_name.strip().lower())
+
+    @staticmethod
+    def _raise_verification(
+        diagnostic: str,
+        *,
+        response: Any,
+        previous_state: Any,
+        observed_state: Any,
+        timed_out: bool = False,
+    ) -> None:
+        raise MutationVerificationError(
+            MutationResult(
+                response,
+                None,
+                timed_out,
+                previous_state=previous_state,
+                diagnostic=diagnostic,
+                verified=False,
+                observed_state=observed_state,
+            )
+        )
 
     @staticmethod
     def _validated_ident(value: str) -> str:

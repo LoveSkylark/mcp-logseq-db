@@ -18,8 +18,6 @@ ALLOWED_METHODS = frozenset({
     "logseq.DB.checkCurrentIsDbGraph",
     "logseq.DB.getAppInfo",
     "logseq.DB.getCurrentGraph",
-    "logseq.DB.q",
-    "logseq.DB.customQuery",
     "logseq.DB.datascriptQuery",
     "logseq.DB.search",
     "logseq.DB.listPages",
@@ -58,15 +56,11 @@ ALLOWED_METHODS = frozenset({
 })
 
 PLAIN_TEXT_METHODS = frozenset({
-    "logseq.DB.q",
-    "logseq.DB.customQuery",
     "logseq.DB.datascriptQuery",
     "logseq.DB.upsertNodes",
 })
 
 NO_RETRY_READ_METHODS = frozenset({
-    "logseq.DB.q",
-    "logseq.DB.customQuery",
     "logseq.DB.datascriptQuery",
     "logseq.DB.search",
 })

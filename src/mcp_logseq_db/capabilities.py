@@ -43,8 +43,6 @@ class CapabilityDiscovery:
             ("properties", "logseq.DB.getAllProperties", []),
             ("tags", "logseq.DB.getAllTags", []),
             ("datascript", "logseq.DB.datascriptQuery", [query]),
-            ("datalog", "logseq.DB.q", [query]),
-            ("custom-query", "logseq.DB.customQuery", [query]),
         )
         try:
             async with asyncio.timeout(20):
@@ -155,12 +153,14 @@ class CapabilityDiscovery:
                 "delete_tag",
                 "add_tag_property",
                 "remove_tag_property",
-                "add_tag_extends",
+                "set_tag_parent",
                 "remove_tag_extends",
                 "upsert_block_property",
                 "remove_block_property",
                 "add_block_tag",
                 "remove_block_tag",
+                "add_page_tag",
+                "remove_page_tag",
                 "set_block_icon",
                 "remove_block_icon",
             ),

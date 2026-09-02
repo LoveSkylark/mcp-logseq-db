@@ -5,12 +5,13 @@ import httpx
 import pytest
 
 from mcp_logseq_db.access import WriteAccessPolicy
-from mcp_logseq_db.mutations import VerifiedMutations
+from mcp_logseq_db.mutations import MutationVerificationError, VerifiedMutations
 
 
 IDENT = ":user.property/status"
 PROPERTY_UUID = "12345678-1234-5678-1234-567812345678"
 TAG_UUID = "87654321-4321-8765-4321-876543218765"
+PAGE_UUID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 
 
 class RecordingClient:
@@ -93,13 +94,14 @@ async def test_remove_requires_exact_ident_and_verifies_absence() -> None:
 async def test_remove_tag_property_resolves_ident_to_property_uuid() -> None:
     client = RecordingClient([
         {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID},
+        {"uuid": TAG_UUID, ":logseq.property.class/properties": [42]},
         None,
         {"uuid": TAG_UUID, ":logseq.property.class/properties": []},
     ])
 
     await VerifiedMutations(client).remove_tag_property(TAG_UUID, IDENT)  # type: ignore[arg-type]
 
-    assert client.calls[1] == (
+    assert client.calls[2] == (
         "logseq.DB.removeTagProperty",
         [TAG_UUID, PROPERTY_UUID],
     )
@@ -124,6 +126,7 @@ async def test_icon_type_is_restricted() -> None:
 @pytest.mark.asyncio
 async def test_emoji_verification_accepts_normalized_stored_id() -> None:
     client = RecordingClient([
+        {"uuid": TAG_UUID},
         None,
         {"uuid": TAG_UUID, ":logseq.property/icon": {"type": "emoji", "id": "test_tube"}},
     ])
@@ -136,9 +139,25 @@ async def test_emoji_verification_accepts_normalized_stored_id() -> None:
 
 
 @pytest.mark.asyncio
+async def test_emoji_verification_rejects_stale_icon_with_evidence() -> None:
+    previous = {"uuid": TAG_UUID, ":logseq.property/icon": {"type": "emoji", "id": "books"}}
+    observed = {"uuid": TAG_UUID, ":logseq.property/icon": {"type": "emoji", "id": "books"}}
+    client = RecordingClient([previous, None, observed])
+
+    with pytest.raises(MutationVerificationError) as captured:
+        await VerifiedMutations(client).set_block_icon(  # type: ignore[arg-type]
+            TAG_UUID, "emoji", "Test Tube"
+        )
+
+    assert captured.value.result.previous_state == previous
+    assert captured.value.result.observed_state == observed
+
+
+@pytest.mark.asyncio
 async def test_block_property_verifies_exact_primitive_value() -> None:
     client = RecordingClient([
         {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "number"},
+        {"id": 11, "uuid": TAG_UUID},
         None,
         {"id": 11, "uuid": TAG_UUID, IDENT: {"id": 99}},
         [99],
@@ -156,6 +175,7 @@ async def test_block_property_verifies_exact_primitive_value() -> None:
 async def test_block_property_resolves_value_entity_before_comparing() -> None:
     client = RecordingClient([
         {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "default"},
+        {"id": 11, "uuid": TAG_UUID},
         None,
         {"id": 11, "uuid": TAG_UUID, IDENT: {"id": 99}},
         [99],
@@ -171,6 +191,7 @@ async def test_block_property_resolves_value_entity_before_comparing() -> None:
 async def test_checkbox_literal_is_not_treated_as_entity_id() -> None:
     client = RecordingClient([
         {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "checkbox"},
+        {"id": 11, "uuid": TAG_UUID},
         None,
         {"id": 11, "uuid": TAG_UUID, IDENT: True},
         [True],
@@ -180,7 +201,31 @@ async def test_checkbox_literal_is_not_treated_as_entity_id() -> None:
         TAG_UUID, IDENT, True
     )
 
-    assert len(client.calls) == 4
+    assert len(client.calls) == 5
+
+
+@pytest.mark.asyncio
+async def test_block_property_mismatch_retains_previous_and_observed_state() -> None:
+    previous = {"id": 11, "uuid": TAG_UUID, IDENT: "before"}
+    observed = {"id": 11, "uuid": TAG_UUID, IDENT: "unexpected"}
+    client = RecordingClient([
+        {"ident": IDENT, "id": 42, "uuid": PROPERTY_UUID, "type": "default"},
+        previous,
+        {"ok": True},
+        observed,
+        ["unexpected"],
+    ])
+
+    with pytest.raises(MutationVerificationError) as captured:
+        await VerifiedMutations(client).upsert_block_property(  # type: ignore[arg-type]
+            TAG_UUID, IDENT, "expected"
+        )
+
+    result = captured.value.result
+    assert result.verified is False
+    assert result.previous_state == previous
+    assert result.observed_state == observed
+    assert result.response == {"ok": True}
 
 
 @pytest.mark.asyncio
@@ -224,3 +269,81 @@ async def test_delete_tag_verifies_absence_and_retains_snapshot() -> None:
 
     assert result.verified_state is None
     assert result.previous_state["uuid"] == TAG_UUID
+
+
+@pytest.mark.asyncio
+async def test_delete_tag_dangling_references_raise_with_evidence() -> None:
+    previous = {"id": 10, "uuid": TAG_UUID, "title": "Disposable"}
+    client = RecordingClient([previous, None, None, [11], []])
+
+    with pytest.raises(MutationVerificationError) as captured:
+        await VerifiedMutations(client).delete_tag(TAG_UUID)  # type: ignore[arg-type]
+
+    assert captured.value.result.previous_state == previous
+    assert captured.value.result.observed_state == {"referencing_entity_ids": [11]}
+
+
+@pytest.mark.asyncio
+async def test_set_tag_parent_requires_acknowledgement_before_replacement() -> None:
+    child = {"id": 10, "uuid": TAG_UUID, ":logseq.property.class/extends": [99]}
+    parent = {"id": 20, "uuid": PAGE_UUID}
+    client = RecordingClient([parent, child])
+
+    with pytest.raises(ValueError, match="acknowledge_replacement"):
+        await VerifiedMutations(client).set_tag_parent(TAG_UUID, PAGE_UUID)  # type: ignore[arg-type]
+
+    assert all(method != "logseq.DB.addTagExtends" for method, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_set_tag_parent_with_acknowledgement_verifies_replacement() -> None:
+    child = {"id": 10, "uuid": TAG_UUID, ":logseq.property.class/extends": [99]}
+    parent = {"id": 20, "uuid": PAGE_UUID}
+    current = {"id": 10, "uuid": TAG_UUID, ":logseq.property.class/extends": [20]}
+    client = RecordingClient([parent, child, True, current])
+
+    result = await VerifiedMutations(client).set_tag_parent(  # type: ignore[arg-type]
+        TAG_UUID, PAGE_UUID, acknowledge_replacement=True
+    )
+
+    assert result.previous_state == child
+    assert result.verified_state == current
+
+
+@pytest.mark.asyncio
+async def test_block_tag_rejects_page_uuid_before_mutation() -> None:
+    page = {"id": 10, "uuid": PAGE_UUID, "name": "page"}
+    client = RecordingClient([page])
+
+    with pytest.raises(ValueError, match="page, not a block"):
+        await VerifiedMutations(client).add_block_tag(PAGE_UUID, TAG_UUID)  # type: ignore[arg-type]
+
+    assert all(method != "logseq.DB.addBlockTag" for method, _ in client.calls)
+
+
+@pytest.mark.asyncio
+async def test_page_tag_uses_native_route_and_verifies_page_state() -> None:
+    page = {"id": 10, "uuid": PAGE_UUID, "name": "page", "tags": []}
+    tag = {"id": 20, "uuid": TAG_UUID, "ident": ":user.class/test"}
+    current = dict(page, tags=[{"id": 20}])
+    client = RecordingClient([page, tag, True, current])
+
+    result = await VerifiedMutations(client).add_page_tag(PAGE_UUID, TAG_UUID)  # type: ignore[arg-type]
+
+    assert result.previous_state == page
+    assert result.verified_state == current
+    assert client.calls[2] == ("logseq.DB.addBlockTag", [PAGE_UUID, TAG_UUID])
+
+
+@pytest.mark.asyncio
+async def test_remove_page_tag_uses_native_route_and_verifies_page_state() -> None:
+    page = {"id": 10, "uuid": PAGE_UUID, "name": "page", "tags": [{"id": 20}]}
+    tag = {"id": 20, "uuid": TAG_UUID, "ident": ":user.class/test"}
+    current = dict(page, tags=[])
+    client = RecordingClient([page, tag, True, current])
+
+    result = await VerifiedMutations(client).remove_page_tag(PAGE_UUID, TAG_UUID)  # type: ignore[arg-type]
+
+    assert result.previous_state == page
+    assert result.verified_state == current
+    assert client.calls[2] == ("logseq.DB.removeBlockTag", [PAGE_UUID, TAG_UUID])

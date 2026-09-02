@@ -46,11 +46,7 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     assert "logseq.DB.addBlockTag" in capabilities.supported_write_operations
     assert "logseq.DB.upsertNodes" in capabilities.supported_write_operations
     assert "logseq.DB.removeProperty" in capabilities.supported_removal_operations
-    assert capabilities.supported_query_features == (
-        "datascript",
-        "datalog",
-        "custom-query",
-    )
+    assert capabilities.supported_query_features == ("datascript",)
     assert capabilities.candidate_write_operations == (
         "logseq.DB.addPropertyValueChoices",
         "logseq.DB.setFileContent",
@@ -72,6 +68,8 @@ async def test_fresh_capabilities_report_live_verified_writes() -> None:
     assert "delete_block" in capabilities.supported_mcp_write_tools
     assert "insert_block" in capabilities.supported_mcp_write_tools
     assert "move_block" in capabilities.supported_mcp_write_tools
+    assert "add_page_tag" in capabilities.supported_mcp_write_tools
+    assert "remove_page_tag" in capabilities.supported_mcp_write_tools
     assert capabilities.experimental_mcp_write_tools == ()
 
 

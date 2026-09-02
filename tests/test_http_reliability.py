@@ -70,7 +70,12 @@ async def test_non_db_namespaces_are_rejected(method: str) -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "method",
-    ["logseq.DB.getFavorites", "logseq.DB.setPropertyNodeTags"],
+    [
+        "logseq.DB.getFavorites",
+        "logseq.DB.setPropertyNodeTags",
+        "logseq.DB.q",
+        "logseq.DB.customQuery",
+    ],
 )
 async def test_live_rejected_db_methods_are_blocked(method: str) -> None:
     client = make_client([], [])

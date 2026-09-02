@@ -16,8 +16,6 @@ outliner operations.
 - `search`
 - `list_properties`
 - `list_tags`
-- `q`
-- `custom_query`
 - `datascript_query`
 - `get_all_properties`
 - `get_property`
@@ -32,12 +30,14 @@ outliner operations.
 - `delete_tag`
 - `add_tag_property`
 - `remove_tag_property`
-- `add_tag_extends`
+- `set_tag_parent`
 - `remove_tag_extends`
 - `upsert_block_property`
 - `remove_block_property`
 - `add_block_tag`
 - `remove_block_tag`
+- `add_page_tag`
+- `remove_page_tag`
 - `set_block_icon`
 - `remove_block_icon`
 - `upsert_nodes`
@@ -57,7 +57,9 @@ Every HTTP API call uses a new client and sends `Connection: close`. Connect and
 read timeouts are configured independently. Read-only transport failures may be
 retried with fresh connections; writes are never retried. Writes are serialized
 and their read-back is polled for bounded delayed visibility. Property values
-are verified semantically, and removals verify exact absence.
+are verified semantically, and removals verify exact absence. When a metadata
+write reaches Logseq but verification fails, the MCP error includes
+`previous_state` and `observed_state` whenever the server could read them back.
 
 `capabilities` distinguishes queryable entity types, metadata-mutable entity
 types, content operations, candidates, unavailable methods, and bound but
@@ -67,7 +69,9 @@ and subtree deletion. Structural block operations use Logseq's graph-worker CLI
 outliner operations rather than timeout-prone plugin aliases. Stable insert and
 move support `child` and `after`; `before` placement is unavailable. The tools
 return `verified=false` with a diagnostic when the requested state is not
-observed. No experimental tools are registered.
+observed. `q` and `custom_query` are intentionally blocked because the tested
+result shapes were not useful enough for a safe public contract. No
+experimental tools are registered.
 
 `get_page_data` returns only blocks directly parented by the page. Use
 `get_block` for one exact block or `get_block_tree` for a recursive
@@ -84,7 +88,12 @@ Tag and hierarchy details verified on Logseq 2.0.1:
 
 - `get_tag_objects` returns a mixed collection of pages and blocks.
 - Tag rename changes display/name fields but keeps the generated ident stable.
-- Tag deletion removes tag/ref relationships without deleting tagged entities.
+- Tag deletion permanently removes the tag and its tag/ref relationships without
+  deleting tagged entities.
+- `set_tag_parent` replaces the current parent only when explicitly
+  acknowledged.
+- Block tag tools are block-only. Page tag changes use `add_page_tag` and
+  `remove_page_tag` through the native DB tag route.
 - CLI graph-worker child insertion and movement both preserved parent and owning
 	page in the 2026-09-02 live run.
 - `get_block` returns `found=false` for missing or deleted UUIDs.
@@ -127,7 +136,8 @@ kinds, and current target state are validated before mutation. If any write
 times out, a process-local circuit breaker blocks every later write before HTTP
 while leaving reads available for reconciliation. Restart Logseq and reconnect
 the MCP before writing again. `capabilities` reports
-`write_circuit_open` and `write_circuit_reason`.
+`write_circuit_open` and `write_circuit_reason`. Query and search calls are
+single-attempt and are never retried after a timeout.
 
 The workspace `.vscode/mcp.json` prompts for the token and starts the same
 stdio server without storing the token.
@@ -151,8 +161,8 @@ Tested against the local Logseq 2.0.1 DB graph on 2026-09-01:
 | `logseq.DB.getTag` | HTTP 200 for ident, UUID, and exact title |
 | `logseq.DB.getTagsByName` | HTTP 200; exact title returns an array |
 | `logseq.DB.getTagObjects` | HTTP 200; no positive instances in test graph |
-| `logseq.DB.q` | HTTP 200 |
-| `logseq.DB.customQuery` | HTTP 200 |
+| `logseq.DB.q` | HTTP 200; blocked because result projection was too limited |
+| `logseq.DB.customQuery` | HTTP 200; blocked because result shape was not usable |
 | `logseq.DB.datascriptQuery` | HTTP 200 |
 | `logseq.DB.listPages` | HTTP 200; DB namespace alias verified |
 | `logseq.DB.listTags` | HTTP 200; DB namespace alias verified |
@@ -172,12 +182,12 @@ Tested against the local Logseq 2.0.1 DB graph on 2026-09-01:
 | `logseq.DB.createTag` | HTTP 200; `(title, options)`; exact identity verified |
 | `logseq.DB.addTagProperty` | HTTP 200; tag UUID and property ident; verified |
 | `logseq.DB.removeTagProperty` | HTTP 200; tag UUID and property UUID; verified |
-| `logseq.DB.addTagExtends` | Exact two-UUID shape verified after fresh restart |
+| `logseq.DB.addTagExtends` | Exact two-UUID shape verified after fresh restart; exposed as `set_tag_parent` |
 | `logseq.DB.removeTagExtends` | HTTP 200; child and parent tag UUIDs; verified |
-| `logseq.DB.upsertBlockProperty` | Exact UUID/ident/value/options shape verified after fresh restart |
+| `logseq.DB.upsertBlockProperty` | Exact block UUID/ident/value/options shape verified after fresh restart |
 | `logseq.DB.removeBlockProperty` | HTTP 200; block UUID and property ident; verified |
-| `logseq.DB.addBlockTag` | Exact block/tag UUID shape verified after fresh restart |
-| `logseq.DB.removeBlockTag` | Exact block/tag UUID shape verified after fresh restart |
+| `logseq.DB.addBlockTag` | Exact block/tag and page/tag UUID shapes verified after fresh restart |
+| `logseq.DB.removeBlockTag` | Exact block/tag and page/tag UUID shapes verified after fresh restart |
 | `logseq.DB.setBlockIcon` | Exact UUID/type/name shape verified after fresh restart |
 | `logseq.DB.removeBlockIcon` | HTTP 200; absence verified |
 | `logseq.DB.addPropertyValueChoices` | HTTP 200; effect not observable; not exposed |
@@ -214,7 +224,17 @@ reliability sequence:
 python scripts/live_reliability.py
 ```
 
-Datascript/custom-query predicates run inside Logseq's DB worker. Query and
-search requests are never retried after a timeout. If a trivial health check
+Datascript predicates run inside Logseq's DB worker. Query and search requests
+are never retried after a timeout. If a trivial health check
 also times out afterward, restart Logseq itself before reconnecting the MCP;
 restarting only the relay cannot clear a wedged Logseq worker.
+
+`search` may return highlight markers as presentation text. Do not paste those
+markers into mutation inputs; read the exact page or block first and write only
+the intended title/content.
+
+`recycle_page` snapshots page-owned blocks and inbound `:block/refs` before it
+mutates. If inbound references exist, it returns `verified=false` unless
+`acknowledge_reference_rewrite=true` is supplied. Recycling marks the page with
+`:logseq.property/deleted-at`; it does not guarantee that page-owned blocks are
+erased from query results.

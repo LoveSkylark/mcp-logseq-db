@@ -1,4 +1,5 @@
 from typing import Any
+from collections import deque
 
 import pytest
 from mcp import Client
@@ -12,6 +13,17 @@ class FakeClient:
 
     async def call(self, method: str, args: list[Any]) -> Any:
         return []
+
+
+class RecordingClient(FakeClient):
+    def __init__(self, responses: list[Any]) -> None:
+        self.responses = deque(responses)
+
+    async def call(self, method: str, args: list[Any]) -> Any:
+        response = self.responses.popleft()
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 @pytest.mark.asyncio
@@ -42,8 +54,6 @@ async def test_server_exposes_only_verified_read_tools() -> None:
         "rename_page",
         "delete_page",
         "recycle_page",
-        "q",
-        "custom_query",
         "datascript_query",
         "get_all_properties",
         "get_property",
@@ -58,12 +68,14 @@ async def test_server_exposes_only_verified_read_tools() -> None:
         "delete_tag",
         "add_tag_property",
         "remove_tag_property",
-        "add_tag_extends",
+        "set_tag_parent",
         "remove_tag_extends",
         "upsert_block_property",
         "remove_block_property",
         "add_block_tag",
         "remove_block_tag",
+        "add_page_tag",
+        "remove_page_tag",
         "set_block_icon",
         "remove_block_icon",
     }
@@ -116,3 +128,29 @@ async def test_move_validation_failure_suggests_public_input_format() -> None:
     assert result.is_error is True
     assert "Use distinct exact block and target UUIDs" in result.content[0].text
     assert "positional" not in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_mutation_verification_failure_returns_observed_state() -> None:
+    block_uuid = "87654321-4321-8765-4321-876543218765"
+    ident = ":user.property/status"
+    previous = {"id": 11, "uuid": block_uuid, ident: "before"}
+    observed = {"id": 11, "uuid": block_uuid, ident: "unexpected"}
+    client_impl = RecordingClient([
+        {"ident": ident, "id": 42, "type": "default"},
+        previous,
+        {"ok": True},
+        observed,
+        ["unexpected"],
+    ])
+
+    async with Client(create_server(client_impl)) as client:  # type: ignore[arg-type]
+        result = await client.call_tool(
+            "upsert_block_property",
+            {"block_uuid": block_uuid, "property_ident": ident, "value": "expected"},
+        )
+
+    assert result.is_error is True
+    assert '"error_type": "MutationVerificationError"' in result.content[0].text
+    assert '"previous_state": {"id": 11' in result.content[0].text
+    assert '"observed_state": {"id": 11' in result.content[0].text
