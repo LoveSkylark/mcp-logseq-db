@@ -1,15 +1,58 @@
-"""Verified DB page and top-level block operations."""
+"""Verified page and block operations.
+
+WHAT CHANGED, AND WHY
+---------------------
+`insert_block` and `move_block` are gone. Both routed through
+`logseq.DB.insertBlock` / `logseq.DB.moveBlock` with graph-worker CLI
+fallbacks, and both existed because a hardcoded capability list reported the
+HTTP block methods as rejected. `removeBlock` works over HTTP, and nested
+creation works through `upsertNodes` -- so the CLI path was routing around
+methods that were never broken. Block movement has no established route and no
+tool; it stays out until one is found by testing.
+
+`data["page-id"]` is a PARENT pointer, not a page pointer. Passing a page UUID
+creates a top-level block; passing a block UUID nests. The previous
+implementation rejected block parents outright, which is what forced nesting
+onto the CLI in the first place.
+
+`data` is a closed allowlist -- only `title` and `page-id`. `tags` at creation
+is rejected by the API as a disallowed key, so tagging is a follow-up call.
+
+Page edits through `upsertNodes` are gone: `edit` + `page` returns "Editing a
+page, tag or property isn't supported yet" from Logseq itself.
+
+VERIFICATION
+------------
+This API returns success for calls that do nothing. Every write here is
+followed by a read-back, and an unverified write is an error rather than a
+quiet success. `{:block N}` responses are recorded but never treated as
+evidence.
+"""
+
+from __future__ import annotations
 
 import json
 import re
 from dataclasses import asdict, dataclass
 from typing import Any
-from uuid import uuid4
 
 import httpx
 
 from ._shared import VerifiedWriteHelpers
 from .client import LogseqDBClient, poll_readback, serialized_write
+
+MAX_BATCH_OPERATIONS = 100
+MAX_SUBTREE_NODES = 1000
+
+UUID_PATTERN = re.compile(
+    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
+)
+
+# getPage detail selectors. Each answers a different question; they are not
+# interchangeable. A page's own tags and its blocks' tags live in different
+# places, and properties that are declared but unset appear in neither.
+PAGE_DETAILS = ("page", "blocks", "tags", "properties", "declared", "all")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -31,8 +74,143 @@ class VerifiedContent(VerifiedWriteHelpers):
     def __init__(self, client: LogseqDBClient) -> None:
         self._client = client
 
+    # ------------------------------------------------------------ page reads
+
+    async def get_page_uuid(self, title: str) -> dict[str, Any]:
+        """
+        Resolve a page title to exactly one UUID.
+
+        Refuses an ambiguous match rather than returning the first hit. Page
+        titles are not unique, and selecting a write target from a fuzzy match
+        is how the wrong entity gets modified.
+        """
+        self._require_title(title)
+        query = (
+            "[:find [(pull ?page [:db/id :block/uuid :block/name :block/title]) "
+            "...] :where [?page :block/name] "
+            f"[?page :block/title {json.dumps(title)}]]"
+        )
+        pages = await self._query_list(query, "Page title lookup")
+        live = [p for p in pages
+                if p.get(":logseq.property/deleted-at") is None]
+        if not live:
+            return {"found": False, "title": title, "page_uuid": None}
+        if len(live) > 1:
+            return {
+                "found": False,
+                "title": title,
+                "page_uuid": None,
+                "reason": f"{len(live)} pages share this title; use a UUID",
+                "candidates": [p.get("uuid") for p in live],
+            }
+        return {"found": True, "title": title, "page_uuid": live[0].get("uuid")}
+
+    async def get_page(
+        self, page_uuid: str, detail: str = "page"
+    ) -> dict[str, Any]:
+        """Read one page at the requested level of detail."""
+        page_uuid = self._validated_uuid(page_uuid)
+        if detail not in PAGE_DETAILS:
+            raise ValueError(
+                "detail must be one of: " + ", ".join(PAGE_DETAILS))
+
+        page = await self._optional_entity_by_uuid(page_uuid)
+        if page is None:
+            return {"found": False, "page_uuid": page_uuid, "page": None}
+        if not page.get("name"):
+            return {
+                "found": False,
+                "page_uuid": page_uuid,
+                "page": None,
+                "reason": "target is a block, not a page",
+            }
+
+        result: dict[str, Any] = {
+            "found": True, "page_uuid": page_uuid, "page": page}
+        if detail == "page":
+            return result
+        if detail in ("blocks", "all"):
+            result["blocks"] = await self.get_block_uuid(page_uuid)
+        if detail in ("tags", "all"):
+            result["tags"] = await self._page_scope_tags(page["id"])
+        if detail in ("properties", "all"):
+            result["properties"] = await self._page_scope_properties(page["id"])
+        if detail in ("declared", "all"):
+            result["declared_properties"] = await self._declared_properties(
+                page["id"])
+        return result
+
+    async def _page_scope_tags(self, page_id: int) -> list[dict[str, Any]]:
+        """
+        Tags on the page itself and on every block it owns.
+
+        `:block/page` reaches any depth, so nesting is covered; the page entity
+        has no `:block/page` of its own and is unioned in separately.
+        """
+        query = (
+            "[:find [(pull ?holder [:db/id :block/uuid :block/title "
+            ":block/name {:block/tags [:db/id :db/ident :block/title]}]) ...] "
+            ":in $ ?page :where "
+            "(or-join [?page ?holder] "
+            "[(identity ?page) ?holder] [?holder :block/page ?page]) "
+            "[?holder :block/tags _]]"
+        )
+        return await self._query_list(query, "Page tag lookup", page_id)
+
+    async def _page_scope_properties(self, page_id: int) -> list[dict[str, Any]]:
+        """
+        Property values on the page and its blocks.
+
+        Only properties that have a value appear; an unset property has no
+        datom at all. Use `declared` for the slots a page could fill.
+        """
+        query = (
+            "[:find (pull ?prop [:db/id :db/ident :block/title]) "
+            "(pull ?holder [:db/id :block/uuid :block/title :block/name]) "
+            "?value (pull ?value [:db/id :db/ident :block/title]) "
+            ":in $ ?page :where "
+            "(or-join [?page ?holder] "
+            "[(identity ?page) ?holder] [?holder :block/page ?page]) "
+            "[?prop :block/tags 3] [?prop :db/ident ?attr] "
+            "[?holder ?attr ?value]]"
+        )
+        rows = await self._query_list(query, "Page property lookup", page_id)
+        out = []
+        for row in rows:
+            if isinstance(row, list) and len(row) == 4:
+                prop, holder, raw, resolved = row
+                out.append({
+                    "property": prop,
+                    "holder": holder,
+                    # Both forms: reference-typed values arrive as an entity id
+                    # and resolve; scalar values sit in `raw` and do not.
+                    "value": raw,
+                    "value_entity": resolved,
+                })
+        return out
+
+    async def _declared_properties(self, page_id: int) -> list[dict[str, Any]]:
+        """
+        Property slots the page inherits from its classes.
+
+        These have no datoms on the page. They are the source of the properties
+        the UI shows as empty, and no query over the page will surface them.
+        """
+        query = (
+            "[:find (pull ?class [:db/ident :block/title]) "
+            "(pull ?prop [:db/id :db/ident :block/uuid :block/title "
+            ":logseq.property/type]) :in $ ?page :where "
+            "[?page :block/tags ?class] "
+            "[?class :logseq.property.class/properties ?prop]]"
+        )
+        rows = await self._query_list(query, "Declared property lookup", page_id)
+        return [{"class": r[0], "property": r[1]}
+                for r in rows if isinstance(r, list) and len(r) == 2]
+
+    # ----------------------------------------------------------- block reads
+
     async def get_block(self, block_uuid: str) -> dict[str, Any]:
-        """Read one exact non-page block through Datascript."""
+        """Read one exact non-page block."""
         block = await self._entity_by_uuid(block_uuid)
         if block.get("name"):
             raise ValueError("UUID identifies a page, not a block")
@@ -53,37 +231,51 @@ class VerifiedContent(VerifiedWriteHelpers):
             }
         return {"found": True, "block_uuid": block_uuid, "block": block}
 
+    async def get_block_uuid(self, page_uuid: str) -> list[dict[str, Any]]:
+        """
+        Every block on a page, at any depth.
+
+        Named for the tool it backs. `:block/page` rather than `:block/parent`
+        is deliberate: parent reaches one level, page reaches all of them.
+        """
+        page_uuid = self._validated_uuid(page_uuid)
+        page = await self._entity_by_uuid(page_uuid)
+        if not page.get("name"):
+            raise ValueError("UUID identifies a block, not a page")
+        query = (
+            "[:find [(pull ?block [:db/id :block/uuid :block/title "
+            ":block/order {:block/parent [:db/id :block/uuid]}]) ...] "
+            ":in $ ?page :where [?block :block/page ?page]]"
+        )
+        blocks = await self._query_list(query, "Page block lookup", page["id"])
+        # Fractional-index strings sort lexicographically into document order.
+        blocks.sort(key=lambda b: str(b.get("order", "")))
+        return blocks
+
     async def find_block_tree(
         self,
         block_uuid: str,
         *,
         max_depth: int = 20,
-        max_nodes: int = 1000,
+        max_nodes: int = MAX_SUBTREE_NODES,
     ) -> dict[str, Any]:
-        """Read one block subtree with one page-scoped Datascript query."""
+        """Read one block subtree with a single page-scoped query."""
         block_uuid = self._validated_uuid(block_uuid)
         if not isinstance(max_depth, int) or not 0 <= max_depth <= 100:
             raise ValueError("max_depth must be an integer between 0 and 100")
-        if not isinstance(max_nodes, int) or not 1 <= max_nodes <= 1000:
-            raise ValueError("max_nodes must be an integer between 1 and 1000")
+        if not isinstance(max_nodes, int) or not 1 <= max_nodes <= MAX_SUBTREE_NODES:
+            raise ValueError(
+                f"max_nodes must be between 1 and {MAX_SUBTREE_NODES}")
 
         root = await self._optional_entity_by_uuid(block_uuid)
-        if root is None:
+        if root is None or root.get("name"):
             return {
                 "found": False,
                 "block_uuid": block_uuid,
                 "block": None,
                 "node_count": 0,
                 "truncated": False,
-            }
-        if root.get("name"):
-            return {
-                "found": False,
-                "block_uuid": block_uuid,
-                "block": None,
-                "node_count": 0,
-                "truncated": False,
-                "reason": "target is a page, not a block",
+                **({"reason": "target is a page, not a block"} if root else {}),
             }
         page_id = self._reference_id(root.get("page"))
         if page_id is None:
@@ -93,21 +285,17 @@ class VerifiedContent(VerifiedWriteHelpers):
             "[:find [(pull ?block [*]) ...] :in $ ?page :where "
             "[?block :block/page ?page]]"
         )
-        page_blocks = await self._client.call(
-            "logseq.DB.datascriptQuery", [query, page_id]
-        )
-        if not isinstance(page_blocks, list):
-            raise RuntimeError("Page block lookup returned an unexpected response shape")
+        page_blocks = await self._query_list(query, "Page block lookup", page_id)
 
         by_parent: dict[int, list[dict[str, Any]]] = {}
         for entity in page_blocks:
-            if not isinstance(entity, dict) or not isinstance(entity.get("id"), int):
+            if not isinstance(entity.get("id"), int):
                 continue
             parent_id = self._reference_id(entity.get("parent"))
             if parent_id is not None:
                 by_parent.setdefault(parent_id, []).append(entity)
         for children in by_parent.values():
-            children.sort(key=lambda entity: str(entity.get("order", "")))
+            children.sort(key=lambda e: str(e.get("order", "")))
 
         node_count = 0
         truncated = False
@@ -144,231 +332,98 @@ class VerifiedContent(VerifiedWriteHelpers):
             "truncated": truncated,
         }
 
-    async def create_page(
-        self, title: str, *, dry_run: bool = False
+    # ---------------------------------------------------------- block writes
+
+    async def create_block(
+        self,
+        parent_uuid: str,
+        title: str,
+        *,
+        dry_run: bool = False,
     ) -> ContentResult:
-        """Create one page through the verified batch path."""
+        """
+        Create one block under a page or another block.
+
+        `parent_uuid` may be either. Passing a page UUID produces a top-level
+        block; passing a block UUID nests. The API field is called `page-id`
+        but behaves as a parent pointer.
+        """
+        return await self.create_many_blocks(
+            [{"parent_uuid": parent_uuid, "title": title}], dry_run=dry_run)
+
+    async def create_many_blocks(
+        self,
+        blocks: list[dict[str, str]],
+        *,
+        dry_run: bool = False,
+    ) -> ContentResult:
+        """
+        Create several blocks in one batched call.
+
+        Whether a batch applies atomically is untested, so verification checks
+        each block individually rather than assuming all-or-nothing.
+        """
+        if not isinstance(blocks, list) or not 1 <= len(blocks) <= MAX_BATCH_OPERATIONS:
+            raise ValueError(
+                f"blocks must contain between 1 and {MAX_BATCH_OPERATIONS} items")
+        operations = []
+        for index, block in enumerate(blocks):
+            if not isinstance(block, dict):
+                raise ValueError(f"block {index} must be an object")
+            parent = self._require_entity(
+                self._validated_uuid(block.get("parent_uuid")))
+            title = block.get("title")
+            if not isinstance(title, str) or not title.strip():
+                raise ValueError(f"block {index} requires a non-empty title")
+            self._require_title(title)
+            operations.append({
+                "operation": "add",
+                "entityType": "block",
+                # Only these two keys are permitted; `data` is a closed
+                # allowlist and rejects anything else outright.
+                "data": {"page-id": parent, "title": title},
+            })
+        return await self.upsert_nodes(operations, dry_run=dry_run)
+
+    async def update_block(
+        self,
+        block_uuid: str,
+        title: str,
+        *,
+        dry_run: bool = False,
+    ) -> ContentResult:
+        """Edit one existing block title."""
         return await self.upsert_nodes(
             [{
-                "operation": "add",
-                "entityType": "page",
+                "operation": "edit",
+                "entityType": "block",
+                "id": self._require_entity(self._validated_uuid(block_uuid)),
                 "data": {"title": title},
             }],
             dry_run=dry_run,
         )
 
-    async def create_top_level_block(
-        self,
-        page_uuid: str,
-        title: str,
-        *,
-        tag_uuids: list[str] | None = None,
-        dry_run: bool = False,
-    ) -> ContentResult:
-        """Create one top-level block through the verified batch path."""
-        data: dict[str, Any] = {"title": title, "page-id": page_uuid}
-        if tag_uuids:
-            data["tags"] = tag_uuids
-        return await self.upsert_nodes(
-            [{"operation": "add", "entityType": "block", "data": data}],
-            dry_run=dry_run,
-        )
-
     @serialized_write
-    async def insert_block(
-        self,
-        target_uuid: str,
-        title: str,
-        *,
-        placement: str = "child",
-    ) -> ContentResult:
-        """Experimentally insert a child or sibling with a predetermined UUID."""
-        target_uuid = self._validated_uuid(target_uuid)
-        self._require_entity(target_uuid)
-        self._require_title(title)
-        if not title.strip():
-            raise ValueError("Block title must not be empty")
-        if placement not in {"child", "before", "after"}:
-            raise ValueError("placement must be child, before, or after")
-        target = await self._preflight_block(
-            target_uuid,
-            role="target",
-            require_order=placement in {"before", "after"},
-        )
+    async def remove_block(self, block_uuid: str) -> ContentResult:
+        """
+        Delete one block and its subtree, then verify the whole subtree is gone.
 
-        cli_insert = getattr(self._client, "insert_block_via_cli", None)
-        if cli_insert is not None and placement in {"child", "after"}:
-            entity_id = await cli_insert(target_uuid, title, placement)
-            block_uuid = await self._uuid_by_id(entity_id)
-            response, timed_out = entity_id, False
-        else:
-            block_uuid = str(uuid4())
-            options: dict[str, Any] = {"customUUID": block_uuid}
-            if placement == "child":
-                options["sibling"] = False
-            else:
-                options.update({"sibling": True, "before": placement == "before"})
-            response, timed_out = await self._call_ambiguous(
-                "logseq.DB.insertBlock", [target_uuid, title, options]
-            )
-        block = await poll_readback(
-            self._client,
-            lambda: self._optional_entity_by_uuid(block_uuid),
-            lambda value: value is not None,
-        )
-        if block is None:
-            return ContentResult(
-                validation=None,
-                response=response,
-                verified_entities=(),
-                recovered_after_timeout=timed_out,
-                verified=False,
-                diagnostic="Insert was not observed at the predetermined UUID",
-            )
-        expected_parent_id = (
-            target["id"] if placement == "child" else self._reference_id(target.get("parent"))
-        )
-        expected_page_id = (
-            target["id"] if target.get("name") else self._reference_id(target.get("page"))
-        )
-        if (
-            block.get("title") != title
-            or self._reference_id(block.get("parent")) != expected_parent_id
-            or self._reference_id(block.get("page")) != expected_page_id
-        ):
-            return ContentResult(
-                validation=None,
-                response=response,
-                verified_entities=(block,),
-                recovered_after_timeout=timed_out,
-                verified=False,
-                diagnostic="Inserted block exists but its title, parent, or owning page is incorrect",
-            )
-        if placement in {"before", "after"}:
-            self._verify_relative_order(block, target, placement)
-        return ContentResult(
-            validation=None, response=response, verified_entities=(block,), recovered_after_timeout=timed_out
-        )
-
-    @serialized_write
-    async def move_block(
-        self,
-        block_uuid: str,
-        target_uuid: str,
-        *,
-        placement: str = "child",
-    ) -> ContentResult:
-        """Experimentally move a block beneath or before an exact target."""
-        block_uuid = self._validated_uuid(block_uuid)
-        target_uuid = self._validated_uuid(target_uuid)
-        self._require_entity(block_uuid)
-        self._require_entity(target_uuid)
-        if placement not in {"child", "before", "after"}:
-            raise ValueError("placement must be child, before, or after")
-        block = await self._preflight_block(block_uuid, role="source")
-        subtree = await self._subtree(block)
-        target = await self._preflight_block(
-            target_uuid,
-            role="target",
-            require_order=placement in {"before", "after"},
-        )
-        if block["id"] == target["id"]:
-            raise ValueError("A block cannot be moved relative to itself")
-
-        cli_move = getattr(self._client, "move_block_via_cli", None)
-        if cli_move is not None and placement in {"child", "after"}:
-            response = await cli_move(block_uuid, target_uuid, placement)
-            timed_out = False
-        else:
-            options = {"children": True} if placement == "child" else {
-                "before": placement == "before"
-            }
-            response, timed_out = await self._call_ambiguous(
-                "logseq.DB.moveBlock", [block_uuid, target_uuid, options]
-            )
-        expected_parent_id = (
-            target["id"] if placement == "child" else self._reference_id(target.get("parent"))
-        )
-        expected_page_id = (
-            target["id"] if target.get("name") else self._reference_id(target.get("page"))
-        )
-        moved = await poll_readback(
-            self._client,
-            lambda: self.get_block(block_uuid),
-            lambda value: (
-                self._reference_id(value.get("parent")) == expected_parent_id
-                and self._reference_id(value.get("page")) == expected_page_id
-            ),
-        )
-        if (
-            self._reference_id(moved.get("parent")) != expected_parent_id
-            or self._reference_id(moved.get("page")) != expected_page_id
-        ):
-            return ContentResult(
-                validation=None,
-                response=response,
-                verified_entities=(moved,),
-                recovered_after_timeout=timed_out,
-                verified=False,
-                diagnostic="Move was not observed with the requested parent and owning page",
-            )
-        if placement in {"before", "after"}:
-            self._verify_relative_order(moved, target, placement)
-        moved_subtree = await self._subtree(moved)
-        before_by_uuid = {entity["uuid"]: entity for entity in subtree}
-        after_by_uuid = {entity["uuid"]: entity for entity in moved_subtree}
-        if before_by_uuid.keys() != after_by_uuid.keys():
-            return ContentResult(
-                validation=None,
-                response=response,
-                verified_entities=tuple(moved_subtree),
-                recovered_after_timeout=timed_out,
-                verified=False,
-                diagnostic="Move changed the subtree entity set",
-            )
-        for entity_uuid, previous in before_by_uuid.items():
-            if entity_uuid == block_uuid:
-                continue
-            current = after_by_uuid[entity_uuid]
-            if (
-                self._reference_id(current.get("parent"))
-                != self._reference_id(previous.get("parent"))
-                or self._reference_id(current.get("page")) != expected_page_id
-            ):
-                return ContentResult(
-                    validation=None,
-                    response=response,
-                    verified_entities=tuple(moved_subtree),
-                    recovered_after_timeout=timed_out,
-                    verified=False,
-                    diagnostic="Move did not preserve descendant parent/page relationships",
-                )
-        return ContentResult(
-            validation=None,
-            response=response,
-            verified_entities=tuple(moved_subtree),
-            recovered_after_timeout=timed_out,
-        )
-
-    @serialized_write
-    async def delete_block(self, block_uuid: str) -> ContentResult:
-        """Experimentally delete one exact block and verify its absence."""
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
+        Routed through `logseq.DB.removeBlock` over HTTP. A previous
+        implementation used a CLI fallback because a hardcoded capability list
+        reported this method as rejected; it is not.
+        """
+        block_uuid = self._require_entity(self._validated_uuid(block_uuid))
         block = await self._preflight_block(block_uuid, role="target")
         subtree = await self._subtree(block)
-        cli_delete = getattr(self._client, "delete_block_via_cli", None)
-        if cli_delete is None:
-            response, timed_out = await self._call_ambiguous(
-                "logseq.DB.removeBlock", [block_uuid, {}]
-            )
-        else:
-            try:
-                response = await cli_delete(block_uuid)
-                timed_out = False
-            except httpx.TimeoutException:
-                response = None
-                timed_out = True
+
+        response: Any = None
+        timed_out = False
+        try:
+            response = await self._client.call(
+                "logseq.DB.removeBlock", [block_uuid])
+        except httpx.TimeoutException:
+            timed_out = True
+
         current = await poll_readback(
             self._client,
             lambda: self._optional_entity_by_uuid(block_uuid),
@@ -381,17 +436,16 @@ class VerifiedContent(VerifiedWriteHelpers):
                 verified_entities=(),
                 recovered_after_timeout=timed_out,
                 verified=False,
-                diagnostic="Deletion was not observed; the block is still visible",
+                diagnostic="Deletion was not observed; the block is still present",
                 previous_entities=tuple(subtree),
                 observed_entities=(current,),
             )
+
         remaining = []
         for entity in subtree[1:]:
             descendant = await poll_readback(
                 self._client,
-                lambda entity_uuid=entity["uuid"]: self._optional_entity_by_uuid(
-                    entity_uuid
-                ),
+                lambda u=entity["uuid"]: self._optional_entity_by_uuid(u),
                 lambda value: value is None,
             )
             if descendant is not None:
@@ -412,26 +466,88 @@ class VerifiedContent(VerifiedWriteHelpers):
             response=response,
             verified_entities=(),
             recovered_after_timeout=timed_out,
-            verified=True,
-            diagnostic="Exact UUID is absent after deletion",
+            diagnostic="Exact UUID and its subtree are absent after deletion",
             previous_entities=tuple(subtree),
         )
 
-    async def upsert_block(
+    # ------------------------------------------------------------- outlines
+
+    async def create_page_of_blocks(
         self,
-        block_uuid: str,
-        title: str,
+        page_uuid: str,
+        outline: str,
         *,
         dry_run: bool = False,
-    ) -> ContentResult:
-        """Edit one existing block title through the verified batch path."""
-        operation = {
-            "operation": "edit",
-            "entityType": "block",
-            "id": block_uuid,
-            "data": {"title": title},
+    ) -> dict[str, Any]:
+        """
+        Build an indented outline on a page.
+
+        Costs 2d-1 calls for depth d, independent of width: create a level,
+        read back the UUIDs Logseq assigned, create the next. The read-back is
+        structural, not defensive -- creation does not return UUIDs and
+        `page-id` will not resolve a title, so children have no way to name
+        their parents until the level above exists.
+        """
+        page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+        page = await self._entity_by_uuid(page_uuid)
+        if not page.get("name"):
+            raise ValueError("UUID identifies a block, not a page")
+
+        entries = _parse_outline(outline)
+        if not entries:
+            raise ValueError("Outline is empty")
+
+        depth_max = max(len(path) for path, _ in entries) - 1
+        if dry_run:
+            return {
+                "dry_run": True,
+                "levels": depth_max + 1,
+                "block_count": len(entries),
+                "estimated_calls": 2 * (depth_max + 1) - 1,
+            }
+
+        parents: dict[tuple[int, ...], str] = {(): page_uuid}
+        created: list[dict[str, Any]] = []
+
+        for depth in range(depth_max + 1):
+            level = [(p, t) for p, t in entries if len(p) == depth + 1]
+            if not level:
+                continue
+            await self.create_many_blocks([
+                {"parent_uuid": parents[path[:-1]], "title": title}
+                for path, title in level
+            ])
+            for path, title in level:
+                parent_uuid = parents[path[:-1]]
+                siblings = await self._children_of(parent_uuid)
+                match = [s for s in siblings if s.get("title") == title]
+                if not match:
+                    raise RuntimeError(
+                        f"Outline level {depth} reported success but {title!r} "
+                        f"is not present under {parent_uuid}"
+                    )
+                parents[path] = match[-1]["uuid"]
+                created.append(match[-1])
+
+        return {
+            "verified": True,
+            "page_uuid": page_uuid,
+            "levels": depth_max + 1,
+            "created": created,
         }
-        return await self.upsert_nodes([operation], dry_run=dry_run)
+
+    async def _children_of(self, parent_uuid: str) -> list[dict[str, Any]]:
+        query = (
+            "[:find [(pull ?child [:db/id :block/uuid :block/title "
+            ":block/order]) ...] :where "
+            f"[?parent :block/uuid #uuid \"{parent_uuid}\"] "
+            "[?child :block/parent ?parent]]"
+        )
+        children = await self._query_list(query, "Child lookup")
+        children.sort(key=lambda c: str(c.get("order", "")))
+        return children
+
+    # --------------------------------------------------------- batch engine
 
     @serialized_write
     async def upsert_nodes(
@@ -440,306 +556,183 @@ class VerifiedContent(VerifiedWriteHelpers):
         *,
         dry_run: bool = False,
     ) -> ContentResult:
+        """
+        Run a batch of add/edit operations and verify each one.
+
+        `upsertNodes` accepts exactly three combinations: add+page, add+block,
+        edit+block. `edit`+`page` is rejected by Logseq, and there is no
+        removal verb at all -- `operation` offers only add and edit.
+        """
         normalized = await self._validate_operations(operations)
         validation = await self._client.call(
-            "logseq.DB.upsertNodes", [normalized, {"dry-run": True}]
-        )
+            "logseq.DB.upsertNodes", [normalized, {"dry-run": True}])
         if dry_run:
-            return ContentResult(validation=validation, response=None, verified_entities=())
+            return ContentResult(
+                validation=validation, response=None, verified_entities=())
 
+        # Snapshot per add so the read-back can tell a new entity from one that
+        # already carried the same title. Titles are not unique.
         before_ids = {
-            index: {entity["id"] for entity in await self._entities_by_title(op["data"]["title"])}
+            index: {e["id"] for e in
+                    await self._entities_by_title(op["data"]["title"])}
             for index, op in enumerate(normalized)
             if op["operation"] == "add"
         }
-        duplicates = [
-            normalized[index]["data"]["title"]
-            for index, entity_ids in before_ids.items()
-            if entity_ids
-        ]
-        if duplicates:
-            raise ValueError(f"Cannot add entities with existing titles: {duplicates!r}")
 
         response: Any = None
         timed_out = False
         try:
             response = await self._client.call(
-                "logseq.DB.upsertNodes", [normalized, {"dry-run": False}]
-            )
+                "logseq.DB.upsertNodes", [normalized, {"dry-run": False}])
         except httpx.TimeoutException:
             timed_out = True
 
-        created_pages: dict[str, dict[str, Any]] = {}
         verified: list[dict[str, Any]] = []
         for index, operation in enumerate(normalized):
-            if operation["operation"] == "edit" and operation["entityType"] == "page":
-                expected_tag_ids: set[int] = set()
-                for tag_uuid in operation["data"]["tags"]:
-                    tag_entity = await self._entity_by_uuid(tag_uuid)
-                    expected_tag_ids.add(tag_entity["id"])
-                entity = await poll_readback(
-                    self._client,
-                    lambda: self._entity_by_uuid(operation["id"]),
-                    lambda value: self._reference_ids(value.get("tags", [])) == expected_tag_ids,
-                )
-                if self._reference_ids(entity.get("tags", [])) != expected_tag_ids:
-                    return ContentResult(
-                        validation=validation,
-                        response=response,
-                        verified_entities=(entity,),
-                        recovered_after_timeout=timed_out,
-                        verified=False,
-                        diagnostic="Page tag edit did not converge to the exact requested tag set",
-                    )
-                verified.append(entity)
-                continue
-
             if operation["operation"] == "edit":
-                expected_title = operation["data"]["title"]
-                entity = await poll_readback(
-                    self._client,
-                    lambda: self._entity_by_uuid(operation["id"]),
-                    lambda value: value.get("title") == expected_title,
-                )
-                if entity.get("title") != operation["data"]["title"]:
-                    raise RuntimeError("Block edit verification failed")
-                await self._verify_title_uuid_refs(entity, operation["data"]["title"])
-                verified.append(entity)
+                verified.append(await self._verify_edit(operation))
                 continue
-
-            matches = await poll_readback(
-                self._client,
-                lambda: self._entities_by_title(operation["data"]["title"]),
-                lambda values: any(
-                    entity["id"] not in before_ids[index] for entity in values
-                ),
-            )
-            created = [entity for entity in matches if entity["id"] not in before_ids[index]]
-            if len(created) != 1:
-                raise RuntimeError(
-                    f"Expected one new {operation['entityType']} named "
-                    f"{operation['data']['title']!r}, found {len(created)}"
-                )
-            entity = created[0]
-            if operation["entityType"] == "page":
-                if not entity.get("name"):
-                    raise RuntimeError("Page creation verification failed")
-                if operation.get("id"):
-                    created_pages[operation["id"]] = entity
-            else:
-                parent_ref = operation["data"]["page-id"]
-                page = created_pages.get(parent_ref)
-                if page is None:
-                    page = await self._entity_by_uuid(parent_ref)
-                parent_id = self._reference_id(entity.get("parent"))
-                page_id = self._reference_id(entity.get("page"))
-                if parent_id != page["id"] or page_id != page["id"]:
-                    raise RuntimeError("Top-level block ownership verification failed")
-                await self._verify_title_uuid_refs(entity, operation["data"]["title"])
-            verified.append(entity)
+            verified.append(
+                await self._verify_add(operation, before_ids[index]))
 
         return ContentResult(
-            validation=validation, response=response, verified_entities=tuple(verified), recovered_after_timeout=timed_out
-        )
-
-    @serialized_write
-    async def rename_page(self, page_uuid: str, new_title: str) -> ContentResult:
-        page_uuid = self._validated_uuid(page_uuid)
-        self._require_entity(page_uuid)
-        self._require_title(new_title)
-        if not new_title.strip():
-            raise ValueError("New page title must not be empty")
-        page = await self._page_by_uuid(page_uuid)
-        if await self._entities_by_title(new_title):
-            raise ValueError(f"An entity titled {new_title!r} already exists")
-        response = await self._client.call("logseq.DB.renamePage", [page_uuid, new_title])
-        current = await poll_readback(
-            self._client,
-            lambda: self._page_by_uuid(page_uuid),
-            lambda value: value.get("title") == new_title,
-        )
-        if current.get("title") != new_title:
-            return ContentResult(
-                validation=None,
-                response=response,
-                verified_entities=(),
-                verified=False,
-                diagnostic="Page rename verification failed",
-                previous_entities=(page,),
-                observed_entities=(current,),
-            )
-        return ContentResult(
-            validation=None, response=response, verified_entities=(current,), previous_entities=(page,)
-        )
-
-    @serialized_write
-    async def delete_page(
-        self,
-        page_uuid: str,
-        *,
-        acknowledge_reference_rewrite: bool = False,
-    ) -> ContentResult:
-        page_uuid = self._validated_uuid(page_uuid)
-        self._require_entity(page_uuid)
-        page = await self._page_by_uuid(page_uuid)
-        if page.get(":logseq.property/deleted-at") is not None:
-            raise ValueError("Page is already recycled")
-        page_blocks, inbound_references = await self._page_recycle_context(page["id"])
-        previous = (page, *page_blocks)
-        if inbound_references and not acknowledge_reference_rewrite:
-            return ContentResult(
-                validation=None,
-                response=None,
-                verified_entities=(),
-                recovered_after_timeout=False,
-                verified=False,
-                diagnostic="Recycling can rewrite inbound page references; set "
-                "acknowledge_reference_rewrite=true to proceed",
-                previous_entities=previous,
-                observed_entities=tuple(inbound_references),
-            )
-        response = await self._client.call("logseq.DB.deletePage", [page["title"]])
-        current = await poll_readback(
-            self._client,
-            lambda: self._page_by_uuid(page_uuid),
-            lambda value: value.get(":logseq.property/deleted-at") is not None,
-        )
-        if current.get(":logseq.property/deleted-at") is None:
-            return ContentResult(
-                validation=None,
-                response=response,
-                verified_entities=(),
-                recovered_after_timeout=False,
-                verified=False,
-                diagnostic="Page recycle verification failed",
-                previous_entities=previous,
-                observed_entities=(current, *inbound_references),
-            )
-        return ContentResult(
-            validation=None,
+            validation=validation,
             response=response,
-            verified_entities=(current,),
-            previous_entities=previous,
-            observed_entities=tuple(inbound_references),
+            verified_entities=tuple(verified),
+            recovered_after_timeout=timed_out,
         )
 
-    async def _page_recycle_context(
-        self, page_id: int
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        blocks_query = (
-            "[:find [(pull ?block [*]) ...] :in $ ?page :where "
-            "[?block :block/page ?page]]"
+    async def _verify_edit(self, operation: dict[str, Any]) -> dict[str, Any]:
+        expected = operation["data"]["title"]
+        entity = await poll_readback(
+            self._client,
+            lambda: self._entity_by_uuid(operation["id"]),
+            lambda value: value.get("title") == expected,
         )
-        references_query = (
-            "[:find [(pull ?entity [*]) ...] :in $ ?page :where "
-            "[?entity :block/refs ?page]]"
+        if entity.get("title") != expected:
+            raise RuntimeError(
+                f"Block edit did not take effect for {operation['id']}; the "
+                "call returned without error but the title is unchanged"
+            )
+        await self._verify_title_uuid_refs(entity, expected)
+        return entity
+
+    async def _verify_add(
+        self, operation: dict[str, Any], before: set[int]
+    ) -> dict[str, Any]:
+        title = operation["data"]["title"]
+        matches = await poll_readback(
+            self._client,
+            lambda: self._entities_by_title(title),
+            lambda values: any(e["id"] not in before for e in values),
         )
-        blocks = await self._client.call(
-            "logseq.DB.datascriptQuery", [blocks_query, page_id]
+        created = [e for e in matches if e["id"] not in before]
+        if len(created) != 1:
+            raise RuntimeError(
+                f"Expected one new {operation['entityType']} titled {title!r}, "
+                f"found {len(created)}. This API reports success for writes "
+                "that do nothing; check the parent UUID."
+            )
+        entity = created[0]
+
+        if operation["entityType"] == "page":
+            if not entity.get("name"):
+                raise RuntimeError("Created entity is not a page")
+            return entity
+
+        # A block's parent is whatever `page-id` named -- a page or a block.
+        parent = await self._entity_by_uuid(operation["data"]["page-id"])
+        if self._reference_id(entity.get("parent")) != parent["id"]:
+            raise RuntimeError(
+                "Created block is not parented to the requested target")
+        expected_page = (
+            parent["id"] if parent.get("name")
+            else self._reference_id(parent.get("page"))
         )
-        references = await self._client.call(
-            "logseq.DB.datascriptQuery", [references_query, page_id]
-        )
-        if not isinstance(blocks, list) or not all(
-            isinstance(entity, dict) for entity in blocks
-        ):
-            raise RuntimeError("Page block snapshot returned an unexpected shape")
-        if not isinstance(references, list) or not all(
-            isinstance(entity, dict) for entity in references
-        ):
-            raise RuntimeError("Page reference lookup returned an unexpected shape")
-        return blocks, references
+        if self._reference_id(entity.get("page")) != expected_page:
+            raise RuntimeError("Created block has the wrong owning page")
+        await self._verify_title_uuid_refs(entity, title)
+        return entity
 
     async def _validate_operations(
         self, operations: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        if not isinstance(operations, list) or not 1 <= len(operations) <= 100:
-            raise ValueError("operations must contain between 1 and 100 items")
-        temporary_pages: set[str] = set()
+        if not isinstance(operations, list) or not 1 <= len(operations) <= MAX_BATCH_OPERATIONS:
+            raise ValueError(
+                f"operations must contain 1 to {MAX_BATCH_OPERATIONS} items")
         add_titles: set[str] = set()
         normalized: list[dict[str, Any]] = []
 
         for index, operation in enumerate(operations):
-            if not isinstance(operation, dict) or not isinstance(operation.get("data"), dict):
+            if not isinstance(operation, dict) or not isinstance(
+                    operation.get("data"), dict):
                 raise ValueError(f"operation {index} must contain a data object")
-            operation_type = operation.get("operation")
+            op_type = operation.get("operation")
             entity_type = operation.get("entityType")
             data = dict(operation["data"])
-
-            if operation_type == "edit" and entity_type == "page":
-                if set(data) != {"tags"}:
-                    raise ValueError("Page edit supports only data.tags")
-                tags = data.get("tags")
-                if not isinstance(tags, list) or not all(isinstance(item, str) for item in tags):
-                    raise ValueError("Page edit requires data.tags as a list of tag UUIDs")
-                normalized_tags = [self._validated_uuid(tag_uuid) for tag_uuid in tags]
-                if len(set(normalized_tags)) != len(normalized_tags):
-                    raise ValueError("Page edit data.tags must not repeat a tag UUID")
-                for tag_uuid in normalized_tags:
-                    self._require_entity(tag_uuid)
-                page_uuid = self._validated_uuid(operation.get("id"))
-                self._require_entity(page_uuid)
-                page = await self._entity_by_uuid(page_uuid)
-                if not page.get("name"):
-                    raise ValueError("Page edit id must identify a page")
-                data["tags"] = normalized_tags
-                normalized.append(dict(operation, data=data, id=page_uuid))
-                continue
 
             title = data.get("title")
             if not isinstance(title, str) or not title.strip():
                 raise ValueError(f"operation {index} requires a non-empty title")
             self._require_title(title)
 
-            if operation_type == "add" and entity_type == "page":
+            if op_type == "add" and entity_type == "page":
                 if set(data) != {"title"}:
                     raise ValueError("Page add supports only data.title")
-                temporary_id = operation.get("id")
-                if temporary_id is not None:
-                    if not isinstance(temporary_id, str) or not temporary_id.strip():
-                        raise ValueError("Temporary page id must be a non-empty string")
-                    temporary_pages.add(temporary_id)
-            elif operation_type == "add" and entity_type == "block":
-                if not set(data) <= {"title", "page-id", "tags"}:
-                    raise ValueError("Block add supports only title, page-id, and tags")
-                parent = data.get("page-id")
-                if not isinstance(parent, str) or not parent.strip():
-                    raise ValueError("Top-level block add requires data.page-id")
-                if parent not in temporary_pages:
-                    self._require_entity(self._validated_uuid(parent))
-                    page = await self._entity_by_uuid(parent)
-                    if not page.get("name"):
-                        raise ValueError("data.page-id must identify a page, not a block")
-                for tag_uuid in data.get("tags", []):
-                    self._require_entity(self._validated_uuid(tag_uuid))
-            elif operation_type == "edit" and entity_type == "block":
+
+            elif op_type == "add" and entity_type == "block":
+                # Closed allowlist. `tags`, `order` and `parent-id` are all
+                # rejected by the API as disallowed keys.
+                if set(data) != {"title", "page-id"}:
+                    raise ValueError(
+                        "Block add supports only data.title and data.page-id")
+                parent_uuid = self._validated_uuid(data.get("page-id"))
+                # Parent may be a page OR a block -- this is how nesting works.
+                await self._entity_by_uuid(parent_uuid)
+                data["page-id"] = parent_uuid
+
+            elif op_type == "edit" and entity_type == "block":
                 if set(data) != {"title"}:
                     raise ValueError("Block edit supports only data.title")
                 block_uuid = self._validated_uuid(operation.get("id"))
-                self._require_entity(block_uuid)
                 block = await self._entity_by_uuid(block_uuid)
                 if block.get("name"):
                     raise ValueError("Block edit id identifies a page")
+                normalized.append(dict(operation, data=data, id=block_uuid))
+                continue
+
             else:
                 raise ValueError(
-                    "Supported operations are add page, add top-level block, edit block, "
-                    "and edit page tags"
+                    "Supported operations are add page, add block, and edit "
+                    "block. Editing a page, tag or property is not supported "
+                    "by Logseq, and there is no removal operation."
                 )
 
-            if operation_type == "add":
-                if title in add_titles:
-                    raise ValueError("Added entity titles must be unique within a batch")
-                add_titles.add(title)
+            if title in add_titles:
+                raise ValueError(
+                    "Added titles must be unique within a batch; verification "
+                    "cannot otherwise tell the new entities apart"
+                )
+            add_titles.add(title)
             normalized.append(dict(operation, data=data))
         return normalized
 
-    async def _page_by_uuid(self, page_uuid: str) -> dict[str, Any]:
-        page = await self._entity_by_uuid(page_uuid)
-        if not page.get("name"):
-            raise LookupError(f"No page exists with exact UUID {page_uuid}")
-        return page
+    # --------------------------------------------------------------- shared
 
-    async def _optional_entity_by_uuid(self, entity_uuid: str) -> dict[str, Any] | None:
+    async def _query_list(
+        self, query: str, description: str, *params: Any
+    ) -> list[Any]:
+        result = await self._client.call(
+            "logseq.DB.datascriptQuery", [query, *params])
+        if result is None:
+            return []
+        if not isinstance(result, list):
+            raise RuntimeError(f"{description} returned an unexpected shape")
+        return [r for r in result if r is not None]
+
+    async def _optional_entity_by_uuid(
+        self, entity_uuid: str
+    ) -> dict[str, Any] | None:
         entity_uuid = self._validated_uuid(entity_uuid)
         query = (
             "[:find (pull ?entity [*]) . :where "
@@ -753,65 +746,50 @@ class VerifiedContent(VerifiedWriteHelpers):
         return entity
 
     async def _entity_by_uuid(self, entity_uuid: str) -> dict[str, Any]:
-        entity_uuid = self._validated_uuid(entity_uuid)
         entity = await self._optional_entity_by_uuid(entity_uuid)
         if entity is None:
-            raise LookupError(f"No entity exists with exact UUID {entity_uuid}")
-        return entity
-
-    async def _uuid_by_id(self, entity_id: int) -> str:
-        query = f"[:find ?uuid . :where [{entity_id} :block/uuid ?uuid]]"
-        value = await self._client.call("logseq.DB.datascriptQuery", [query])
-        return self._validated_uuid(value)
-
-    async def _preflight_block(
-        self,
-        block_uuid: str,
-        *,
-        role: str,
-        require_order: bool = False,
-    ) -> dict[str, Any]:
-        try:
-            block = await self.get_block(block_uuid)
-        except LookupError as error:
             raise LookupError(
-                f"{role.capitalize()} block does not exist for exact UUID {block_uuid}"
-            ) from error
-        except ValueError as error:
-            if "page, not a block" in str(error):
-                raise ValueError(
-                    f"{role.capitalize()} UUID identifies a page, not a block; "
-                    "use a block UUID"
-                ) from error
-            raise
-
-        missing = []
-        if not isinstance(block.get("id"), int):
-            missing.append("id")
-        if block.get("uuid") != block_uuid:
-            missing.append("uuid")
-        if self._reference_id(block.get("parent")) is None:
-            missing.append("parent")
-        if self._reference_id(block.get("page")) is None:
-            missing.append("page")
-        if require_order and not isinstance(block.get("order"), str):
-            missing.append("order")
-        if missing:
-            raise RuntimeError(
-                f"{role.capitalize()} block is missing required information: "
-                f"{', '.join(missing)}"
-            )
-        return block
+                f"No entity exists with exact UUID {entity_uuid}")
+        return entity
 
     async def _entities_by_title(self, title: str) -> list[dict[str, Any]]:
         query = (
             "[:find [(pull ?entity [*]) ...] :where "
             f"[?entity :block/title {json.dumps(title)}]]"
         )
-        entities = await self._client.call("logseq.DB.datascriptQuery", [query])
-        if not isinstance(entities, list):
-            raise RuntimeError("Title lookup returned an unexpected response shape")
-        return [entity for entity in entities if isinstance(entity, dict)]
+        entities = await self._query_list(query, "Title lookup")
+        return [e for e in entities if isinstance(e, dict)]
+
+    async def _preflight_block(
+        self, block_uuid: str, *, role: str
+    ) -> dict[str, Any]:
+        try:
+            block = await self.get_block(block_uuid)
+        except LookupError as error:
+            raise LookupError(
+                f"{role.capitalize()} block does not exist for UUID {block_uuid}"
+            ) from error
+        except ValueError as error:
+            if "page, not a block" in str(error):
+                raise ValueError(
+                    f"{role.capitalize()} UUID identifies a page, not a block"
+                ) from error
+            raise
+
+        missing = [
+            name for name, ok in (
+                ("id", isinstance(block.get("id"), int)),
+                ("uuid", block.get("uuid") == block_uuid),
+                ("parent", self._reference_id(block.get("parent")) is not None),
+                ("page", self._reference_id(block.get("page")) is not None),
+            ) if not ok
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{role.capitalize()} block is missing required information: "
+                f"{', '.join(missing)}"
+            )
+        return block
 
     async def _subtree(self, root: dict[str, Any]) -> list[dict[str, Any]]:
         """Read a bounded subtree using immediate-parent relationships."""
@@ -823,16 +801,16 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "[:find [(pull ?child [*]) ...] :in $ ?parent :where "
                 "[?child :block/parent ?parent]]"
             )
-            children = await self._client.call(
-                "logseq.DB.datascriptQuery", [query, parent["id"]]
-            )
-            if not isinstance(children, list):
-                raise RuntimeError("Child lookup returned an unexpected response shape")
-            children = [child for child in children if isinstance(child, dict)]
+            children = [
+                c for c in await self._query_list(
+                    query, "Child lookup", parent["id"])
+                if isinstance(c, dict)
+            ]
             result.extend(children)
             queue.extend(children)
-            if len(result) > 1000:
-                raise RuntimeError("Subtree exceeds the 1000-node verification limit")
+            if len(result) > MAX_SUBTREE_NODES:
+                raise RuntimeError(
+                    f"Subtree exceeds the {MAX_SUBTREE_NODES}-node limit")
         return result
 
     @staticmethod
@@ -844,53 +822,72 @@ class VerifiedContent(VerifiedWriteHelpers):
         if not isinstance(references, list):
             return set()
         return {
-            reference["id"]
-            for reference in references
-            if isinstance(reference, dict) and isinstance(reference.get("id"), int)
+            r["id"] for r in references
+            if isinstance(r, dict) and isinstance(r.get("id"), int)
         }
-
-    @staticmethod
-    def _verify_relative_order(
-        block: dict[str, Any], target: dict[str, Any], placement: str
-    ) -> None:
-        block_order = block.get("order")
-        target_order = target.get("order")
-        if not isinstance(block_order, str) or not isinstance(target_order, str):
-            raise RuntimeError("Block order verification failed")
-        if placement == "before" and not block_order < target_order:
-            raise RuntimeError("Block was not ordered before target")
-        if placement == "after" and not block_order > target_order:
-            raise RuntimeError("Block was not ordered after target")
 
     async def _verify_title_uuid_refs(
         self, entity: dict[str, Any], title: str
     ) -> None:
-        referenced_uuids = {
-            match.group(1).lower()
-            for match in re.finditer(
-                r"\[\[([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
-                r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\]\]",
-                title,
-            )
+        referenced = {
+            m.group(1).lower()
+            for m in re.finditer(r"\[\[(" + UUID_PATTERN.pattern[2:-2] + r")\]\]",
+                                 title)
         }
-        if not referenced_uuids:
+        if not referenced:
             return
-        reference_uuids = {
-            reference.get("uuid", "").lower()
-            for reference in entity.get("refs", [])
-            if isinstance(reference, dict) and reference.get("uuid")
-        }
-        reference_ids = {
-            reference["id"]
-            for reference in entity.get("refs", [])
-            if isinstance(reference, dict) and isinstance(reference.get("id"), int)
+        known = {
+            r.get("uuid", "").lower()
+            for r in entity.get("refs", [])
+            if isinstance(r, dict) and r.get("uuid")
         }
         query = "[:find ?uuid . :in $ ?entity :where [?entity :block/uuid ?uuid]]"
-        for reference_id in reference_ids:
+        for reference_id in self._reference_ids(entity.get("refs", [])):
             value = await self._client.call(
-                "logseq.DB.datascriptQuery", [query, reference_id]
-            )
+                "logseq.DB.datascriptQuery", [query, reference_id])
             if isinstance(value, str):
-                reference_uuids.add(value.lower())
-        if not referenced_uuids <= reference_uuids:
+                known.add(value.lower())
+        if not referenced <= known:
             raise RuntimeError("Block title UUID reference verification failed")
+
+
+def _parse_outline(text: str) -> list[tuple[tuple[int, ...], str]]:
+    """
+    Parse an indented outline into (path, title) pairs.
+
+    Indent width is taken from the first indented line, so 2-space and 4-space
+    outlines both work provided they are internally consistent.
+    """
+    lines = []
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        if not raw.strip():
+            continue
+        expanded = raw.replace("\t", "    ")
+        lines.append((lineno,
+                      len(expanded) - len(expanded.lstrip(" ")),
+                      raw.strip()))
+    if not lines:
+        return []
+
+    unit = next((i for _, i, _ in lines if i > 0), 0) or 1
+    entries: list[tuple[tuple[int, ...], str]] = []
+    counts: dict[tuple[int, ...], int] = {}
+    last_at_depth: dict[int, tuple[int, ...]] = {}
+
+    for lineno, indent, title in lines:
+        if indent % unit:
+            raise ValueError(
+                f"Line {lineno} indent ({indent}) is not a multiple of {unit}")
+        depth = indent // unit
+        if depth and depth - 1 not in last_at_depth:
+            raise ValueError(
+                f"Line {lineno} indents more than one level at once")
+        parent = last_at_depth[depth - 1] if depth else ()
+        index = counts.get(parent, 0)
+        counts[parent] = index + 1
+        path = parent + (index,)
+        last_at_depth[depth] = path
+        for deeper in [d for d in last_at_depth if d > depth]:
+            del last_at_depth[deeper]
+        entries.append((path, title))
+    return entries

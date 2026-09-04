@@ -1,12 +1,60 @@
-"""DB property mutations with exact resolution and mandatory read-back."""
+"""Tag and property mutations with exact resolution and mandatory read-back.
+
+WHAT CHANGED, AND WHY
+---------------------
+The page/block method pairs are gone. `add_page_tag`/`add_block_tag` and
+`upsert_page_property`/`upsert_block_property` did the same thing through the
+same API method -- a page IS a block in the DB, so the target is uniform.
+Exposing both forced a caller to choose between identical operations. There is
+now one `add_tag` and one `set_property`, each taking a target UUID that may be
+either.
+
+The graph-worker CLI tag paths are gone. `addBlockTag` and `removeBlockTag`
+work over HTTP; the CLI fallback existed on the strength of a capability list
+that turned out to be wrong.
+
+Dropped entirely, having no tool in the current surface: `rename_tag`
+(routed through `renamePage`), `add_tag_property`, `remove_tag_property`,
+`set_tag_parent`, `remove_tag_extends`, `set_block_icon`, `remove_block_icon`.
+None of their API methods are in the client allowlist any more.
+
+`getTag` and `getProperty` are likewise gone as routes -- entities are resolved
+through Datascript, which is the only read this surface relies on beyond a
+handful of dedicated methods.
+
+IDENTIFIER DISCIPLINE
+---------------------
+Tags are keyed by UUID for relation operations. Properties are keyed by
+`:db/ident` -- a UUID passed to `removeProperty` returns success and does
+nothing. Targets are always UUIDs. Passing the wrong type is the single most
+common failure here and it is silent, so every write reads back.
+
+NAMESPACE SANDBOX
+-----------------
+Property writes reach only `plugin.property.<caller>/*`. Properties created in
+the Logseq UI live under `user.property/*` and are readable but not writable.
+This is checked before the call so the failure is a clear error rather than a
+silent no-op.
+"""
+
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import re
 from typing import Any
-from uuid import UUID
 
 from ._shared import VerifiedWriteHelpers
 from .client import LogseqDBClient, poll_readback, serialized_write
+
+# Fallback when the client carries no configured prefix. This is the namespace
+# FAMILY, not this caller's own namespace -- it admits another plugin's
+# properties, which pass the guard and then fail at the API. Setting
+# LOGSEQ_PLUGIN_ID replaces it with the exact prefix.
+DEFAULT_WRITABLE_PROPERTY_PREFIX = "plugin.property."
+
+# Class markers. Resolved by ident rather than hardcoded :db/id so the code
+# survives a rebuilt graph, where integer ids are renumbered.
+TAG_CLASS_IDENT = ":logseq.class/Tag"
+PROPERTY_CLASS_IDENT = ":logseq.class/Property"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -33,77 +81,365 @@ class VerifiedMutations(VerifiedWriteHelpers):
     def __init__(self, client: LogseqDBClient) -> None:
         self._client = client
 
+    # ------------------------------------------------------------ tag reads
+
+    async def get_tag_uuid(self, title: str) -> dict[str, Any]:
+        """
+        Resolve a tag title to exactly one UUID.
+
+        Refuses an ambiguous match. Tag titles are not unique -- the random
+        suffix lives in the ident, not the title -- so two tags can share one.
+        """
+        self._require_title(title)
+        tags = await self._client.call("logseq.DB.getTagsByName", [title])
+        tags = [t for t in (tags or []) if isinstance(t, dict)]
+        if not tags:
+            return {"found": False, "title": title, "tag_uuid": None}
+        if len(tags) > 1:
+            return {
+                "found": False,
+                "title": title,
+                "tag_uuid": None,
+                "reason": f"{len(tags)} tags share this title; use a UUID",
+                "candidates": [t.get("uuid") for t in tags],
+            }
+        return {"found": True, "title": title, "tag_uuid": tags[0].get("uuid")}
+
+    async def get_tag(self, tag_uuid: str) -> dict[str, Any]:
+        """Read one exact tag entity."""
+        return await self._tag(tag_uuid)
+
+    async def get_tag_users(self, tag_uuid: str) -> list[dict[str, Any]]:
+        """
+        Everything carrying the tag -- pages and blocks together.
+
+        `:block/name` distinguishes them: present means page, absent means
+        block. `:block/page` locates a block. This is the work list for
+        removing a tag everywhere, and the check to run before deleting it.
+        """
+        tag_uuid = self._validated_uuid(tag_uuid)
+        tag = await self._tag(tag_uuid)
+        query = (
+            "[:find [(pull ?holder [:db/id :block/uuid :block/title "
+            ":block/name {:block/page [:db/id :block/uuid :block/title]}]) "
+            "...] :in $ ?tag :where [?holder :block/tags ?tag]]"
+        )
+        return await self._query_list(query, "Tag usage lookup", tag["id"])
+
+    # ----------------------------------------------------------- tag writes
+
     @serialized_write
-    async def upsert_property(
+    async def create_tag(
+        self, title: str, options: dict[str, Any] | None = None
+    ) -> MutationResult:
+        """
+        Create a tag and verify it through the identity Logseq assigns.
+
+        Tag idents carry a random suffix (`:user.class/xzy-bc0auNqC`), so the
+        ident cannot be constructed from the title and must be read back.
+        """
+        self._require_title(title)
+        if not title.strip():
+            raise ValueError("Tag title must not be empty")
+
+        response, timed_out = await self._call_ambiguous(
+            "logseq.DB.createTag", [title, options or {}])
+        if timed_out:
+            raise RuntimeError(
+                "Tag creation timed out before returning its identity; resolve "
+                "the outcome with get_tag_uuid before retrying, or a duplicate "
+                "tag may be created"
+            )
+        if not isinstance(response, dict) or not response.get("uuid"):
+            raise RuntimeError(
+                "Tag creation did not return an entity with a UUID; the call "
+                "may have done nothing"
+            )
+        tag_uuid = self._validated_uuid(str(response["uuid"]))
+
+        current = await poll_readback(
+            self._client,
+            lambda: self._optional_entity(tag_uuid),
+            lambda e: e is not None,
+        )
+        if current is None:
+            self._raise_verification(
+                "Tag creation reported success but the tag is not present",
+                response=response, previous_state=None, observed_state=None,
+                timed_out=timed_out)
+        return MutationResult(response=response, verified_state=current)
+
+    @serialized_write
+    async def delete_tag(
+        self, tag_uuid: str, *, acknowledge_child_reparent: bool = False
+    ) -> MutationResult:
+        """
+        Delete one tag entity.
+
+        UNVERIFIED ROUTE. This goes through `deletePage`, which has never been
+        run against a tag and whose identifier type is unconfirmed -- a wrong
+        identifier here returns success and does nothing. The read-back below
+        is the only thing standing between that and a false success.
+        """
+        tag_uuid = self._require_entity(self._validated_uuid(tag_uuid))
+        previous = await self._tag(tag_uuid)
+
+        children = await self._child_tags(previous["id"])
+        if children and not acknowledge_child_reparent:
+            raise ValueError(
+                "Deleting this tag will reparent its child tags; set "
+                "acknowledge_child_reparent=true to proceed"
+            )
+        holders = await self.get_tag_users(tag_uuid)
+
+        response, timed_out = await self._call_ambiguous(
+            "logseq.DB.deletePage", [tag_uuid])
+        current = await poll_readback(
+            self._client,
+            lambda: self._optional_entity(tag_uuid),
+            lambda e: e is None,
+        )
+        if current is not None:
+            self._raise_verification(
+                "Tag deletion was not observed; the tag is still present. This "
+                "route is unverified and may require a name rather than a UUID.",
+                response=response,
+                previous_state={"tag": previous, "holders": holders,
+                                "child_tags": children},
+                observed_state=current,
+                timed_out=timed_out)
+
+        dangling = await poll_readback(
+            self._client,
+            lambda: self._referencing_ids(previous["id"]),
+            lambda ids: not ids,
+        )
+        if dangling:
+            self._raise_verification(
+                f"Tag deletion left dangling references on entities "
+                f"{sorted(dangling)!r}",
+                response=response,
+                previous_state={"tag": previous, "holders": holders},
+                observed_state={"referencing_entity_ids": sorted(dangling)},
+                timed_out=timed_out)
+
+        return MutationResult(
+            response=response,
+            verified_state=None,
+            recovered_after_timeout=timed_out,
+            previous_state={"tag": previous, "holders": holders,
+                            "child_tags": children},
+        )
+
+    @serialized_write
+    async def add_tag(self, target_uuid: str, tag_uuid: str) -> MutationResult:
+        """Attach a tag to a page or a block. The target may be either."""
+        return await self._update_tag(target_uuid, tag_uuid, remove=False)
+
+    @serialized_write
+    async def remove_tag(self, target_uuid: str, tag_uuid: str) -> MutationResult:
+        """
+        Detach one tag from a page or a block.
+
+        Removes that relation only. Other tags on the target are untouched and
+        the tag entity survives. There is no `upsertNodes` route for this --
+        `operation` offers only `add` and `edit`, with no retraction verb, so a
+        removal expressed as an upsert would mean overwriting the whole tag set
+        and risking the loss of `:logseq.class/Page`.
+        """
+        return await self._update_tag(target_uuid, tag_uuid, remove=True)
+
+    async def _update_tag(
+        self, target_uuid: str, tag_uuid: str, *, remove: bool
+    ) -> MutationResult:
+        # The scope applies to the entity being changed. The tag is a
+        # reference, not a write target, so it is validated but not scoped.
+        target_uuid = self._require_entity(self._validated_uuid(target_uuid))
+        tag_uuid = self._validated_uuid(tag_uuid)
+        previous = await self._entity(target_uuid)
+        tag = await self._tag(tag_uuid)
+
+        method = ("logseq.DB.removeBlockTag" if remove
+                  else "logseq.DB.addBlockTag")
+        response, timed_out = await self._call_ambiguous(
+            method, [target_uuid, tag_uuid])
+
+        current = await poll_readback(
+            self._client,
+            lambda: self._entity(target_uuid),
+            lambda e: (tag["id"] in self._reference_ids(e.get("tags", []))) != remove,
+        )
+        present = tag["id"] in self._reference_ids(current.get("tags", []))
+        if present == remove:
+            action = "removal" if remove else "addition"
+            self._raise_verification(
+                f"Tag {action} was not observed on the target",
+                response=response, previous_state=previous,
+                observed_state=current, timed_out=timed_out)
+
+        # A page that lost :logseq.class/Page is no longer a page. Nothing here
+        # should cause that, but it is cheap to notice and expensive to miss.
+        if previous.get("name") and not current.get("name"):
+            self._raise_verification(
+                "Target lost its page identity during the tag change",
+                response=response, previous_state=previous,
+                observed_state=current, timed_out=timed_out)
+
+        return MutationResult(
+            response=response, verified_state=current,
+            recovered_after_timeout=timed_out, previous_state=previous)
+
+    # ------------------------------------------------------- property reads
+
+    async def get_property_ident(self, title: str) -> dict[str, Any]:
+        """
+        Resolve a property title to exactly one `:db/ident`.
+
+        Filters on the Property class rather than merely on the presence of an
+        ident -- tags carry idents too and would otherwise match.
+        """
+        self._require_title(title)
+        property_class = await self._class_id(PROPERTY_CLASS_IDENT)
+        query = (
+            "[:find [(pull ?prop [:db/id :db/ident :block/uuid :block/title "
+            ":logseq.property/type]) ...] :in $ ?class ?title :where "
+            "[?prop :block/tags ?class] [?prop :block/title ?title]]"
+        )
+        found = await self._query_list(
+            query, "Property title lookup", property_class, title)
+        if not found:
+            return {"found": False, "title": title, "ident": None}
+        if len(found) > 1:
+            return {
+                "found": False,
+                "title": title,
+                "ident": None,
+                "reason": f"{len(found)} properties share this title",
+                "candidates": [p.get("ident") for p in found],
+            }
+        return {"found": True, "title": title,
+                "ident": found[0].get("ident"),
+                "type": found[0].get(":logseq.property/type")}
+
+    async def get_property_users(self, property_ident: str) -> list[dict[str, Any]]:
+        """
+        Everything holding a value for this property, with the value.
+
+        Values come back in both raw and resolved form: reference-typed
+        properties store an entity id, scalar types store a literal, and one
+        query has to serve both.
+        """
+        ident = self._validated_ident(property_ident)
+        query = (
+            "[:find (pull ?holder [:db/id :block/uuid :block/title "
+            ":block/name {:block/page [:db/id :block/uuid :block/title]}]) "
+            "?value (pull ?value [:db/id :db/ident :block/title]) "
+            f":where [?holder {ident} ?value]]"
+        )
+        rows = await self._query_list(query, "Property usage lookup")
+        return [
+            {"holder": r[0], "value": r[1], "value_entity": r[2]}
+            for r in rows if isinstance(r, list) and len(r) == 3
+        ]
+
+    # ------------------------------------------------------ property writes
+
+    @serialized_write
+    async def create_property(
         self,
         title: str,
         schema: dict[str, Any],
         options: dict[str, Any] | None = None,
     ) -> MutationResult:
+        """
+        Create a property definition.
+
+        Takes a plain title. A namespaced string is rejected by Logseq as a
+        page name, and an explicit ident in the schema is silently discarded --
+        the namespace comes from caller identity and cannot be chosen.
+        """
+        self._require_title(title)
         if not title.strip():
             raise ValueError("Property title must not be empty")
-        self._require_title(title)
+        if "/" in title:
+            raise ValueError(
+                "Property title must be a plain title, not a namespaced ident; "
+                "Logseq rejects a '/' as an invalid page name"
+            )
+
         response, timed_out = await self._call_ambiguous(
-            "logseq.DB.upsertProperty", [title, schema, options or {}]
-        )
+            "logseq.DB.upsertProperty", [title, schema, options or {}])
         if timed_out:
             raise RuntimeError(
-                "Property upsert timed out before Logseq returned the generated ident; "
-                "the result is ambiguous and must be resolved from getAllProperties"
+                "Property creation timed out before returning its ident; "
+                "resolve the outcome with get_property_ident before retrying"
             )
         if not isinstance(response, dict) or not response.get("ident"):
-            raise RuntimeError("Property upsert did not return an exact ident")
+            raise RuntimeError("Property creation did not return an ident")
         ident = self._validated_ident(str(response["ident"]))
+
         current = await poll_readback(
             self._client,
-            lambda: self._client.call("logseq.DB.getProperty", [ident]),
-            lambda entity: self._has_ident(entity, ident),
+            lambda: self._optional_property(ident),
+            lambda e: e is not None,
         )
-        if not self._has_ident(current, ident):
-            raise RuntimeError(f"Write verification failed for property {ident}")
-        actual_title = current.get("title") if isinstance(current, dict) else None
+        if current is None:
+            self._raise_verification(
+                "Property creation reported success but the property is absent",
+                response=response, previous_state=None, observed_state=None,
+                timed_out=timed_out)
+
         diagnostic = None
+        actual_title = current.get("title")
         if isinstance(actual_title, str) and actual_title != title:
             diagnostic = (
-                f"Logseq normalized property title {title!r} to {actual_title!r}; "
-                f"use exact ident {ident!r} for later operations"
+                f"Logseq normalized the title {title!r} to {actual_title!r}; "
+                f"use the exact ident {ident!r} for later operations"
             )
         return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, diagnostic=diagnostic
-        )
+            response=response, verified_state=current, diagnostic=diagnostic)
 
     @serialized_write
-    async def remove_property(self, property_ident: str) -> MutationResult:
-        ident = self._validated_ident(property_ident)
-        self._require_property(ident)
-        existing = await self._client.call("logseq.DB.getProperty", [ident])
-        if not self._has_ident(existing, ident):
-            raise LookupError(f"No property exists with exact ident {ident}")
-        usage_before = await self._property_usage(ident, existing["id"])
+    async def delete_property(self, property_ident: str) -> MutationResult:
+        """
+        Delete a property definition graph-wide.
 
-        response, timed_out = await self._call_ambiguous("logseq.DB.removeProperty", [ident])
-        current, usage_after = await poll_readback(
+        UNVERIFIED ROUTE and destructive: every value goes with the definition,
+        and recreating the property mints a new entity rather than restoring
+        the old values. A UUID passed here returns success and does nothing,
+        which is why the ident is required and the removal is read back.
+        """
+        ident = self._validated_ident(property_ident)
+        self._require_writable_property(ident)
+        existing = await self._property(ident)
+        usage_before = await self.get_property_users(ident)
+
+        response, timed_out = await self._call_ambiguous(
+            "logseq.DB.removeProperty", [ident])
+        current = await poll_readback(
             self._client,
-            lambda: self._property_removal_state(ident, existing["id"]),
-            lambda state: state[0] is None and not state[1][0] and not state[1][1],
+            lambda: self._optional_property(ident),
+            lambda e: e is None,
         )
         if current is not None:
-            detail = " after a timeout" if timed_out else ""
             self._raise_verification(
-                f"Property {ident} is still visible{detail}",
+                f"Property {ident} is still present after removal. This route "
+                "is unverified; a wrong identifier type returns success and "
+                "does nothing.",
                 response=response,
                 previous_state={"property": existing, "usage": usage_before},
-                observed_state={"property": current, "usage": usage_after},
-                timed_out=timed_out,
-            )
-        if usage_after[0] or usage_after[1]:
+                observed_state=current,
+                timed_out=timed_out)
+
+        remaining = await self.get_property_users(ident)
+        if remaining:
             self._raise_verification(
-                "Property removal left attributes or value entities behind",
+                "Property definition is gone but values remain attached",
                 response=response,
                 previous_state={"property": existing, "usage": usage_before},
-                observed_state={"property": current, "usage": usage_after},
-                timed_out=timed_out,
-            )
+                observed_state=remaining,
+                timed_out=timed_out)
+
         return MutationResult(
             response=response,
             verified_state=None,
@@ -112,683 +448,186 @@ class VerifiedMutations(VerifiedWriteHelpers):
         )
 
     @serialized_write
-    async def create_tag(
-        self, title: str, options: dict[str, Any] | None = None
-    ) -> MutationResult:
-        if not title.strip():
-            raise ValueError("Tag title must not be empty")
-        self._require_title(title)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.createTag", [title, options or {}]
-        )
-        if timed_out:
-            raise RuntimeError("Tag creation timed out before returning its identity")
-        if not isinstance(response, dict) or not response.get("ident"):
-            raise RuntimeError("Tag creation did not return an exact ident")
-        current = await poll_readback(
-            self._client,
-            lambda: self._client.call("logseq.DB.getTag", [response["ident"]]),
-            lambda entity: (
-                isinstance(entity, dict) and entity.get("uuid") == response.get("uuid")
-            ),
-        )
-        if not isinstance(current, dict) or current.get("uuid") != response.get("uuid"):
-            raise RuntimeError("Tag creation verification failed")
-        return MutationResult(response=response, verified_state=current)
-
-    @serialized_write
-    async def rename_tag(self, tag_uuid: str, new_title: str) -> MutationResult:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        self._require_title(new_title)
-        if not new_title.strip():
-            raise ValueError("New tag title must not be empty")
-        previous = await self._tag(tag_uuid)
-        response = await self._client.call(
-            "logseq.DB.renamePage", [tag_uuid, new_title]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._client.call("logseq.DB.getTag", [tag_uuid]),
-            lambda entity: isinstance(entity, dict) and entity.get("title") == new_title,
-        )
-        if not isinstance(current, dict) or current.get("title") != new_title:
-            self._raise_verification(
-                "Tag rename verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-            )
-        return MutationResult(response=response, verified_state=current, previous_state=previous)
-
-    @serialized_write
-    async def delete_tag(
-        self, tag_uuid: str, *, acknowledge_child_reparent: bool = False
-    ) -> MutationResult:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        previous = await self._tag(tag_uuid)
-        child_tags = await self._child_tags(previous["id"])
-        if child_tags and not acknowledge_child_reparent:
-            raise ValueError(
-                "Deleting this tag will reparent child tags; set "
-                "acknowledge_child_reparent=true to proceed"
-            )
-        response = await self._client.call("logseq.DB.deletePage", [tag_uuid])
-        current = await poll_readback(
-            self._client,
-            lambda: self._client.call("logseq.DB.getTag", [tag_uuid]),
-            lambda entity: entity is None,
-        )
-        if current is not None:
-            self._raise_verification(
-                "Tag deletion verification failed; tag is still visible",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-            )
-        dangling = await poll_readback(
-            self._client,
-            lambda: self._tag_reference_ids(previous["id"]),
-            lambda entity_ids: not entity_ids,
-        )
-        if dangling:
-            self._raise_verification(
-                f"Tag deletion left dangling references on entities {sorted(dangling)!r}",
-                response=response,
-                previous_state=previous,
-                observed_state={"referencing_entity_ids": sorted(dangling)},
-            )
-        return MutationResult(
-            response=response,
-            verified_state=None,
-            previous_state={"tag": previous, "child_tags": child_tags},
-        )
-
-    @serialized_write
-    async def add_tag_property(
-        self, tag_uuid: str, property_ident: str
-    ) -> MutationResult:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        self._require_property(property_ident)
-        property_entity = await self._property(property_ident)
-        previous = await self._tag(tag_uuid)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.addTagProperty", [tag_uuid, property_ident]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._tag(tag_uuid),
-            lambda entity: property_entity["id"]
-            in entity.get(":logseq.property.class/properties", []),
-        )
-        if property_entity["id"] not in current.get(":logseq.property.class/properties", []):
-            self._raise_verification(
-                "Tag property addition verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def remove_tag_property(
-        self, tag_uuid: str, property_ident: str
-    ) -> MutationResult:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        self._require_property(property_ident)
-        property_entity = await self._property(property_ident)
-        previous = await self._tag(tag_uuid)
-        property_uuid = self._validated_uuid(str(property_entity.get("uuid")))
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.removeTagProperty", [tag_uuid, property_uuid]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._tag(tag_uuid),
-            lambda entity: property_entity["id"]
-            not in entity.get(":logseq.property.class/properties", []),
-        )
-        if property_entity["id"] in current.get(":logseq.property.class/properties", []):
-            self._raise_verification(
-                "Tag property removal verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def set_tag_parent(
+    async def set_property(
         self,
-        tag_uuid: str,
-        parent_tag_uuid: str,
-        *,
-        acknowledge_replacement: bool = False,
-    ) -> MutationResult:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        self._require_entity(self._validated_uuid(parent_tag_uuid))
-        parent = await self._tag(parent_tag_uuid)
-        previous = await self._tag(tag_uuid)
-        previous_parent_ids = set(
-            previous.get(":logseq.property.class/extends", [])
-        )
-        replaced_parent_ids = previous_parent_ids - {parent["id"]}
-        if replaced_parent_ids and not acknowledge_replacement:
-            raise ValueError(
-                "Tag already has a different parent; set acknowledge_replacement=true "
-                "to replace it"
-            )
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.addTagExtends", [tag_uuid, self._validated_uuid(parent_tag_uuid)]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._tag(tag_uuid),
-            lambda entity: parent["id"] in entity.get(":logseq.property.class/extends", [])
-            and not replaced_parent_ids.intersection(
-                entity.get(":logseq.property.class/extends", [])
-            ),
-        )
-        current_parent_ids = set(current.get(":logseq.property.class/extends", []))
-        if parent["id"] not in current_parent_ids or replaced_parent_ids.intersection(
-            current_parent_ids
-        ):
-            self._raise_verification(
-                "Tag parent verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def remove_tag_extends(
-        self, tag_uuid: str, parent_tag_uuid: str
-    ) -> MutationResult:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        self._require_entity(self._validated_uuid(parent_tag_uuid))
-        parent = await self._tag(parent_tag_uuid)
-        previous = await self._tag(tag_uuid)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.removeTagExtends", [tag_uuid, self._validated_uuid(parent_tag_uuid)]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._tag(tag_uuid),
-            lambda entity: parent["id"]
-            not in entity.get(":logseq.property.class/extends", []),
-        )
-        if parent["id"] in current.get(":logseq.property.class/extends", []):
-            self._raise_verification(
-                "Tag inheritance removal verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def upsert_block_property(
-        self,
-        block_uuid: str,
+        target_uuid: str,
         property_ident: str,
         value: Any,
         options: dict[str, Any] | None = None,
     ) -> MutationResult:
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
-        self._require_property(property_ident)
-        property_entity = await self._property(property_ident)
-        previous = await self._block(block_uuid)
+        """
+        Set a property value on a page or a block. The target may be either.
+
+        Reference-typed properties (node, page, class, property) take an entity
+        id, not a literal. Closed enums such as Status and Priority take one of
+        the entities listed in `:property/closed-values`.
+        """
+        target_uuid = self._require_entity(self._validated_uuid(target_uuid))
+        ident = self._validated_ident(property_ident)
+        self._require_writable_property(ident)
+        await self._property(ident)
+        previous = await self._entity(target_uuid)
+
         response, timed_out = await self._call_ambiguous(
             "logseq.DB.upsertBlockProperty",
-            [block_uuid, property_ident, value, options or {}],
-        )
-        current, matches = await poll_readback(
+            [target_uuid, ident, value, options or {}])
+
+        current = await poll_readback(
             self._client,
-            lambda: self._block_property_state(
-                block_uuid, property_ident, property_entity, value
-            ),
-            lambda state: state[1],
+            lambda: self._entity(target_uuid),
+            lambda e: ident in e,
         )
-        if not matches:
+        if ident not in current:
             self._raise_verification(
-                "Block property value verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
+                f"Property {ident} was not set on the target",
+                response=response, previous_state=previous,
+                observed_state=current, timed_out=timed_out)
         return MutationResult(
-            response=response,
-            verified_state=current,
-            recovered_after_timeout=timed_out,
-            previous_state=previous,
-            observed_state=current,
-        )
+            response=response, verified_state=current,
+            recovered_after_timeout=timed_out, previous_state=previous,
+            observed_state=current)
 
     @serialized_write
-    async def upsert_page_property(
-        self,
-        page_uuid: str,
-        property_ident: str,
-        value: Any,
-        options: dict[str, Any] | None = None,
+    async def clear_property(
+        self, target_uuid: str, property_ident: str
     ) -> MutationResult:
-        page_uuid = self._validated_uuid(page_uuid)
-        self._require_entity(page_uuid)
-        self._require_property(property_ident)
-        property_entity = await self._property(property_ident)
-        previous = await self._page(page_uuid)
+        """
+        Clear a property value from a page or a block.
+
+        Removes the value only; the property definition survives and other
+        targets keep theirs. Use `delete_property` to remove the definition.
+        """
+        target_uuid = self._require_entity(self._validated_uuid(target_uuid))
+        ident = self._validated_ident(property_ident)
+        self._require_writable_property(ident)
+        await self._property(ident)
+        previous = await self._entity(target_uuid)
+
         response, timed_out = await self._call_ambiguous(
-            "logseq.DB.upsertBlockProperty",
-            [page_uuid, property_ident, value, options or {}],
-        )
-        current, matches = await poll_readback(
-            self._client,
-            lambda: self._block_property_state(
-                page_uuid, property_ident, property_entity, value
-            ),
-            lambda state: state[1],
-        )
-        if not matches:
-            self._raise_verification(
-                "Page property value verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response,
-            verified_state=current,
-            recovered_after_timeout=timed_out,
-            previous_state=previous,
-            observed_state=current,
-        )
+            "logseq.DB.removeBlockProperty", [target_uuid, ident])
 
-    @serialized_write
-    async def remove_block_property(
-        self, block_uuid: str, property_ident: str
-    ) -> MutationResult:
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
-        self._require_property(property_ident)
-        await self._property(property_ident)
-        previous = await self._block(block_uuid)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.removeBlockProperty", [block_uuid, property_ident]
-        )
         current = await poll_readback(
             self._client,
-            lambda: self._entity(block_uuid),
-            lambda entity: property_ident not in entity,
+            lambda: self._entity(target_uuid),
+            lambda e: ident not in e,
         )
-        if property_ident in current:
+        if ident in current:
             self._raise_verification(
-                "Block property removal verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
+                f"Property {ident} is still set on the target",
+                response=response, previous_state=previous,
+                observed_state=current, timed_out=timed_out)
         return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
+            response=response, verified_state=current,
+            recovered_after_timeout=timed_out, previous_state=previous)
 
-    @serialized_write
-    async def remove_page_property(
-        self, page_uuid: str, property_ident: str
-    ) -> MutationResult:
-        page_uuid = self._validated_uuid(page_uuid)
-        self._require_entity(page_uuid)
-        self._require_property(property_ident)
-        await self._property(property_ident)
-        previous = await self._page(page_uuid)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.removeBlockProperty", [page_uuid, property_ident]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._entity(page_uuid),
-            lambda entity: property_ident not in entity,
-        )
-        if property_ident in current:
-            self._raise_verification(
-                "Page property removal verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
+    # --------------------------------------------------------------- shared
 
-    @serialized_write
-    async def add_block_tag(self, block_uuid: str, tag_uuid: str) -> MutationResult:
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
-        self._require_entity(self._validated_uuid(tag_uuid))
-        previous = await self._block(block_uuid)
-        tag = await self._tag(tag_uuid)
-        cli_update = getattr(self._client, "update_block_tag_via_cli", None)
-        if cli_update is None:
-            response, timed_out = await self._call_ambiguous(
-                "logseq.DB.addBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
-            )
-        else:
-            response = await cli_update(block_uuid, tag["ident"], remove=False)
-            timed_out = False
-        current = await poll_readback(
-            self._client,
-            lambda: self._entity(block_uuid),
-            lambda entity: tag["id"] in self._reference_ids(entity.get("tags", [])),
-        )
-        if tag["id"] not in self._reference_ids(current.get("tags", [])):
-            self._raise_verification(
-                "Block tag addition verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def remove_block_tag(self, block_uuid: str, tag_uuid: str) -> MutationResult:
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
-        self._require_entity(self._validated_uuid(tag_uuid))
-        previous = await self._block(block_uuid)
-        tag = await self._tag(tag_uuid)
-        cli_update = getattr(self._client, "update_block_tag_via_cli", None)
-        if cli_update is None:
-            response, timed_out = await self._call_ambiguous(
-                "logseq.DB.removeBlockTag", [block_uuid, self._validated_uuid(tag_uuid)]
-            )
-        else:
-            response = await cli_update(block_uuid, tag["ident"], remove=True)
-            timed_out = False
-        current = await poll_readback(
-            self._client,
-            lambda: self._entity(block_uuid),
-            lambda entity: tag["id"] not in self._reference_ids(entity.get("tags", [])),
-        )
-        if tag["id"] in self._reference_ids(current.get("tags", [])):
-            self._raise_verification(
-                "Block tag removal verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def add_page_tag(self, page_uuid: str, tag_uuid: str) -> MutationResult:
-        return await self._update_page_tag(page_uuid, tag_uuid, remove=False)
-
-    @serialized_write
-    async def remove_page_tag(self, page_uuid: str, tag_uuid: str) -> MutationResult:
-        return await self._update_page_tag(page_uuid, tag_uuid, remove=True)
-
-    @serialized_write
-    async def set_block_icon(
-        self, block_uuid: str, icon_type: str, icon_name: str
-    ) -> MutationResult:
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
-        if icon_type not in {"tabler-icon", "emoji"}:
-            raise ValueError("icon_type must be 'tabler-icon' or 'emoji'")
-        previous = await self._block(block_uuid)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.setBlockIcon", [block_uuid, icon_type, icon_name]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._entity(block_uuid),
-            lambda entity: isinstance(entity.get(":logseq.property/icon"), dict),
-        )
-        icon = current.get(":logseq.property/icon")
-        if not isinstance(icon, dict) or icon.get("type") != icon_type:
-            self._raise_verification(
-                "Block icon verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        if icon_type == "tabler-icon" and icon.get("id") != icon_name:
-            self._raise_verification(
-                "Block icon verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        if icon_type == "emoji" and icon.get("id") != self._normalized_emoji_id(icon_name):
-            self._raise_verification(
-                "Block emoji verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    @serialized_write
-    async def remove_block_icon(self, block_uuid: str) -> MutationResult:
-        block_uuid = self._validated_uuid(block_uuid)
-        self._require_entity(block_uuid)
-        previous = await self._block(block_uuid)
-        response, timed_out = await self._call_ambiguous(
-            "logseq.DB.removeBlockIcon", [block_uuid]
-        )
-        current = await poll_readback(
-            self._client,
-            lambda: self._entity(block_uuid),
-            lambda entity: ":logseq.property/icon" not in entity,
-        )
-        if ":logseq.property/icon" in current:
-            self._raise_verification(
-                "Block icon removal verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    async def _update_page_tag(
-        self, page_uuid: str, tag_uuid: str, *, remove: bool
-    ) -> MutationResult:
-        page_uuid = self._validated_uuid(page_uuid)
-        self._require_entity(page_uuid)
-        tag_uuid = self._validated_uuid(tag_uuid)
-        self._require_entity(tag_uuid)
-        previous = await self._page(page_uuid)
-        tag = await self._tag(tag_uuid)
-        method = "logseq.DB.removeBlockTag" if remove else "logseq.DB.addBlockTag"
-        response, timed_out = await self._call_ambiguous(method, [page_uuid, tag_uuid])
-        current = await poll_readback(
-            self._client,
-            lambda: self._page(page_uuid),
-            lambda entity: (
-                tag["id"] not in self._reference_ids(entity.get("tags", []))
-                if remove
-                else tag["id"] in self._reference_ids(entity.get("tags", []))
-            ),
-        )
-        present = tag["id"] in self._reference_ids(current.get("tags", []))
-        if present == remove:
-            action = "removal" if remove else "addition"
-            self._raise_verification(
-                f"Page tag {action} verification failed",
-                response=response,
-                previous_state=previous,
-                observed_state=current,
-                timed_out=timed_out,
-            )
-        return MutationResult(
-            response=response, verified_state=current, recovered_after_timeout=timed_out, previous_state=previous
-        )
-
-    async def _block_property_state(
-        self,
-        block_uuid: str,
-        property_ident: str,
-        property_entity: dict[str, Any],
-        expected: Any,
-    ) -> tuple[dict[str, Any], bool]:
-        block = await self._entity(block_uuid)
-        query = (
-            "[:find [?value ...] :where "
-            f"[{block['id']} {property_ident} ?value]]"
-        )
-        raw_values = await self._client.call("logseq.DB.datascriptQuery", [query])
-        if not isinstance(raw_values, list):
-            return block, False
-        actual = [
-            await self._resolve_property_value(value, property_entity)
-            for value in raw_values
-        ]
-        expected_values = list(expected) if isinstance(expected, (list, tuple, set)) else [expected]
-        return block, actual == expected_values
-
-    async def _tag_reference_ids(self, tag_id: int) -> set[int]:
-        references: set[int] = set()
-        for attribute in (":block/tags", ":block/refs"):
-            query = (
-                "[:find [?entity ...] :in $ ?tag :where "
-                f"[?entity {attribute} ?tag]]"
-            )
-            result = await self._client.call(
-                "logseq.DB.datascriptQuery", [query, tag_id]
-            )
-            if not isinstance(result, list):
-                raise RuntimeError("Tag reference lookup returned an unexpected shape")
-            references.update(value for value in result if isinstance(value, int))
-        return references
-
-    async def _child_tags(self, parent_tag_id: int) -> list[dict[str, Any]]:
-        query = (
-            "[:find [(pull ?child [*]) ...] :in $ ?parent :where "
-            "[?child :logseq.property.class/extends ?parent]]"
-        )
+    async def _query_list(
+        self, query: str, description: str, *params: Any
+    ) -> list[Any]:
         result = await self._client.call(
-            "logseq.DB.datascriptQuery", [query, parent_tag_id]
-        )
-        if not isinstance(result, list) or not all(
-            isinstance(entity, dict) for entity in result
-        ):
-            raise RuntimeError("Child tag lookup returned an unexpected shape")
-        return result
+            "logseq.DB.datascriptQuery", [query, *params])
+        if result is None:
+            return []
+        if not isinstance(result, list):
+            raise RuntimeError(f"{description} returned an unexpected shape")
+        return [r for r in result if r is not None]
 
-    async def _property_removal_state(
-        self, ident: str, property_id: int
-    ) -> tuple[Any, tuple[list[Any], list[Any]]]:
-        entity = await self._client.call("logseq.DB.getProperty", [ident])
-        usage = await self._property_usage(ident, property_id)
-        return entity, usage
-
-    async def _property_usage(
-        self, ident: str, property_id: int
-    ) -> tuple[list[Any], list[Any]]:
-        direct_query = f"[:find ?entity ?value :where [?entity {ident} ?value]]"
-        value_query = (
-            "[:find ?value :in $ ?property :where "
-            "[?value :logseq.property/created-from-property ?property]]"
-        )
-        direct = await self._client.call("logseq.DB.datascriptQuery", [direct_query])
-        values = await self._client.call(
-            "logseq.DB.datascriptQuery", [value_query, property_id]
-        )
-        if not isinstance(direct, list) or not isinstance(values, list):
-            raise RuntimeError("Property usage lookup returned an unexpected shape")
-        return direct, values
-
-    async def _resolve_property_value(
-        self, value: Any, property_entity: dict[str, Any]
-    ) -> Any:
-        property_type = property_entity.get(":logseq.property/type", property_entity.get("type"))
-        if isinstance(value, bool):
-            return value
-        if not isinstance(value, int) or property_type == "node":
-            return value
-        query = "[:find (pull ?entity [*]) . :in $ ?entity :where]"
-        entity = await self._client.call("logseq.DB.datascriptQuery", [query, value])
-        if not isinstance(entity, dict):
-            return value
-        for key in (":logseq.property/value", "value", "title", "content"):
-            if key in entity:
-                return entity[key]
+    async def _class_id(self, ident: str) -> int:
+        query = f"[:find ?class . :where [?class :db/ident {ident}]]"
+        value = await self._client.call("logseq.DB.datascriptQuery", [query])
+        if not isinstance(value, int):
+            raise RuntimeError(f"Could not resolve the class {ident}")
         return value
 
-    async def _property(self, ident: str) -> dict[str, Any]:
-        ident = self._validated_ident(ident)
-        entity = await self._client.call("logseq.DB.getProperty", [ident])
-        if not self._has_ident(entity, ident):
-            raise LookupError(f"No property exists with exact ident {ident}")
-        return entity
-
-    async def _tag(self, tag_uuid: str) -> dict[str, Any]:
-        tag_uuid = self._validated_uuid(tag_uuid)
-        entity = await self._client.call("logseq.DB.getTag", [tag_uuid])
-        if not isinstance(entity, dict) or entity.get("uuid") != tag_uuid:
-            raise LookupError(f"No tag exists with exact UUID {tag_uuid}")
-        return entity
-
-    async def _entity(self, entity_uuid: str) -> dict[str, Any]:
+    async def _optional_entity(self, entity_uuid: str) -> dict[str, Any] | None:
+        entity_uuid = self._validated_uuid(entity_uuid)
         query = (
             "[:find (pull ?entity [*]) . :where "
             f"[?entity :block/uuid #uuid \"{entity_uuid}\"]]"
         )
         entity = await self._client.call("logseq.DB.datascriptQuery", [query])
+        if entity is None:
+            return None
         if not isinstance(entity, dict) or entity.get("uuid") != entity_uuid:
-            raise LookupError(f"No entity exists with exact UUID {entity_uuid}")
+            raise RuntimeError("Entity lookup returned an unexpected result")
         return entity
 
-    async def _block(self, block_uuid: str) -> dict[str, Any]:
-        entity = await self._entity(block_uuid)
-        if entity.get("name"):
-            raise ValueError("UUID identifies a page, not a block")
+    async def _entity(self, entity_uuid: str) -> dict[str, Any]:
+        entity = await self._optional_entity(entity_uuid)
+        if entity is None:
+            raise LookupError(
+                f"No entity exists with exact UUID {entity_uuid}")
         return entity
 
-    async def _page(self, page_uuid: str) -> dict[str, Any]:
-        entity = await self._entity(page_uuid)
-        if not entity.get("name"):
-            raise ValueError("UUID identifies a block, not a page")
+    async def _tag(self, tag_uuid: str) -> dict[str, Any]:
+        entity = await self._entity(tag_uuid)
+        tag_class = await self._class_id(TAG_CLASS_IDENT)
+        if tag_class not in self._reference_ids(entity.get("tags", [])):
+            raise ValueError(
+                f"UUID {tag_uuid} identifies an entity that is not a tag")
         return entity
 
-    @staticmethod
-    def _normalized_emoji_id(icon_name: str) -> str:
-        return re.sub(r"[\s-]+", "_", icon_name.strip().lower())
+    async def _optional_property(self, ident: str) -> dict[str, Any] | None:
+        query = f"[:find (pull ?prop [*]) . :where [?prop :db/ident {ident}]]"
+        entity = await self._client.call("logseq.DB.datascriptQuery", [query])
+        if entity is None:
+            return None
+        if not isinstance(entity, dict):
+            raise RuntimeError("Property lookup returned an unexpected result")
+        return entity
+
+    async def _property(self, ident: str) -> dict[str, Any]:
+        entity = await self._optional_property(ident)
+        if entity is None:
+            raise LookupError(f"No property exists with exact ident {ident}")
+        return entity
+
+    async def _child_tags(self, parent_tag_id: int) -> list[dict[str, Any]]:
+        query = (
+            "[:find [(pull ?child [:db/id :db/ident :block/uuid "
+            ":block/title]) ...] :in $ ?parent :where "
+            "[?child :logseq.property.class/extends ?parent]]"
+        )
+        return await self._query_list(query, "Child tag lookup", parent_tag_id)
+
+    async def _referencing_ids(self, entity_id: int) -> set[int]:
+        found: set[int] = set()
+        for attribute in (":block/tags", ":block/refs"):
+            query = (
+                "[:find [?entity ...] :in $ ?target :where "
+                f"[?entity {attribute} ?target]]"
+            )
+            result = await self._query_list(
+                query, "Reference lookup", entity_id)
+            found.update(v for v in result if isinstance(v, int))
+        return found
+
+    def _require_writable_property(self, ident: str) -> None:
+        """
+        Reject a property this caller cannot write before the call is made.
+
+        Without this the write reaches Logseq and either errors obscurely or
+        returns success having done nothing, depending on the operation.
+
+        The prefix comes from the client so that the namespace limit and the
+        configured write policy are one mechanism. Two independent guards on
+        the same thing drift apart.
+        """
+        prefix = getattr(
+            self._client, "writable_property_prefix",
+            DEFAULT_WRITABLE_PROPERTY_PREFIX)
+        bare = ident[1:] if ident.startswith(":") else ident
+        if not bare.startswith(prefix):
+            raise ValueError(
+                f"Property {ident} is outside this caller's namespace and is "
+                f"read-only over the HTTP API. Only :{prefix}* properties can "
+                "be written; properties created in the Logseq UI live under "
+                "user.property/* and cannot."
+            )
+        policy = getattr(self._client, "write_policy", None)
+        if policy is not None:
+            policy.require_property(ident)
 
     @staticmethod
     def _raise_verification(
@@ -813,29 +652,26 @@ class VerifiedMutations(VerifiedWriteHelpers):
 
     @staticmethod
     def _validated_ident(value: str) -> str:
-        if not isinstance(value, str) or not value.startswith(":") or "/" not in value:
+        """
+        Require a namespaced keyword.
+
+        Built-ins such as `alias` and `tags` carry bare idents with no
+        namespace, but nothing in this surface writes them, so the stricter
+        form is correct here and catches a UUID passed by mistake.
+        """
+        if (not isinstance(value, str) or not value.startswith(":")
+                or "/" not in value):
             raise ValueError(
-                "Expected an exact namespaced property ident such as :user.property/status"
+                "Expected an exact namespaced property ident such as "
+                ":plugin.property.my_plugin/Effort, not a title or a UUID"
             )
         return value
-
-    @staticmethod
-    def _has_ident(entity: Any, expected_ident: str) -> bool:
-        if not isinstance(entity, dict):
-            return False
-        return str(entity.get("db/ident", entity.get("ident"))) == expected_ident
 
     @staticmethod
     def _reference_ids(references: Any) -> set[int]:
         if not isinstance(references, list):
             return set()
         return {
-            reference["id"]
-            for reference in references
-            if isinstance(reference, dict) and isinstance(reference.get("id"), int)
+            r["id"] for r in references
+            if isinstance(r, dict) and isinstance(r.get("id"), int)
         }
-
-    def _require_property(self, ident: str) -> None:
-        policy = getattr(self._client, "write_policy", None)
-        if policy is not None:
-            policy.require_property(ident)

@@ -1,8 +1,33 @@
-"""Runnable MCP server exposing only live-verified Logseq DB reads."""
+"""Runnable MCP server exposing the verified Logseq DB tool surface.
+
+WHAT CHANGED, AND WHY
+---------------------
+Page/block tool pairs are collapsed. `add_page_tag`/`add_block_tag` and
+`upsert_page_property`/`upsert_block_property` did the same thing through the
+same API method -- a page IS a block in the DB -- so exposing both asked a
+caller to choose between identical operations. There is one `addTag` and one
+`addProperty`, each taking a target that may be either.
+
+Removed, having no verified route: `insert_block` and `move_block` (both
+routed through methods reached only by a graph-worker CLI fallback that
+existed because a hardcoded capability list was wrong), `rename_tag`,
+`add_tag_property`, `remove_tag_property`, `set_tag_parent`,
+`remove_tag_extends`, `set_block_icon`, `remove_block_icon`.
+
+`delete_page`/`recycle_page` are gone too: one was documented as an alias of
+the other, which invites a caller to reason about a distinction that may not
+exist. Whether recycling is reversible is an open question; until it is
+settled, exposing one honest tool beats two ambiguous ones.
+
+Nesting no longer needs its own tool. `createBlock` takes a parent that may be
+a page or a block, because the API's `page-id` field is a parent pointer.
+"""
+
+from __future__ import annotations
 
 import asyncio
-from functools import wraps
 import json
+from functools import wraps
 from typing import Any, Literal
 
 import httpx
@@ -18,19 +43,29 @@ from .client import (
     WriteCircuitOpenError,
 )
 from .content import VerifiedContent
+from .identifiers import require_uuid
 from .mutations import MutationVerificationError, VerifiedMutations
 from .settings import Settings
 
+# Class idents, resolved to :db/id at call time. Integer ids are not stable
+# across a rebuilt graph, so nothing here hardcodes 2, 3 or 4.
+PAGE_CLASS = ":logseq.class/Page"
+TAG_CLASS = ":logseq.class/Tag"
+PROPERTY_CLASS = ":logseq.class/Property"
 
-def create_server(client: LogseqDBClient) -> MCPServer:
+
+def create_server(
+    client: LogseqDBClient, *, probe_writes: bool = True
+) -> MCPServer:
     server = MCPServer(
         "mcp-logseq-db",
-        description="Narrow DB-native MCP server for Logseq 2.x",
+        description="DB-native MCP server for Logseq 2.x",
         instructions=(
-            "Use exact DB identifiers. Prefer promoted DB reads and writes. "
-            "Treat verified_state as evidence, never a raw null response. "
-            "Structural writes may time out and are successful only when "
-            "their result reports verified=true."
+            "Use exact UUIDs for pages and blocks, and exact :db/idents for "
+            "properties. This API returns success for calls that do nothing, "
+            "so treat verified_state as the only evidence a write happened -- "
+            "never the response. A result with verified=false means the write "
+            "did not take effect, even though no error was raised."
         ),
     )
 
@@ -49,7 +84,8 @@ def create_server(client: LogseqDBClient) -> MCPServer:
                         "verified": False,
                         "failure_stage": _failure_stage(error),
                         "diagnostic": str(error),
-                        "suggestion": _failure_suggestion(method.__name__, error),
+                        "suggestion": _failure_suggestion(
+                            method.__name__, error),
                         "error_type": type(error).__name__,
                         "response": None,
                         "verified_state": None,
@@ -68,390 +104,296 @@ def create_server(client: LogseqDBClient) -> MCPServer:
 
     server.tool = safe_tool  # type: ignore[method-assign]
 
+    content = lambda: VerifiedContent(client)          # noqa: E731
+    mutations = lambda: VerifiedMutations(client)      # noqa: E731
+
+    async def query(q: str, *params: Any) -> Any:
+        return await client.call("logseq.DB.datascriptQuery", [q, *params])
+
+    async def class_id(ident: str) -> int:
+        value = await query(
+            f"[:find ?class . :where [?class :db/ident {ident}]]")
+        if not isinstance(value, int):
+            raise RuntimeError(f"Could not resolve the class {ident}")
+        return value
+
+    # ------------------------------------------------------------ meta
+
     @server.tool(name="capabilities", structured_output=True)
-    async def capabilities() -> dict[str, Any]:
-        """Probe and report DB methods supported by the connected instance."""
-        capabilities = await CapabilityDiscovery(client).discover()
-        return capabilities.to_dict()
+    async def capabilities(include_diagnostics: bool = False) -> dict[str, Any]:
+        """Report which tools are available on the connected graph, with the constraints that apply to each. Set include_diagnostics for the underlying probe results."""
+        result = await CapabilityDiscovery(client).discover(
+            probe_writes=probe_writes)
+        return result.to_dict(include_diagnostics=include_diagnostics)
 
-    @server.tool(name="check_current_is_db_graph")
-    async def check_current_is_db_graph() -> bool:
-        """Return whether the current Logseq graph is a DB graph."""
-        try:
-            async with asyncio.timeout(20):
-                return bool(
-                    await client.call("logseq.DB.checkCurrentIsDbGraph", [])
-                )
-        except TimeoutError as error:
-            raise RuntimeError(
-                "Logseq DB health check exceeded 20 seconds; restart Logseq "
-                "itself if its DB worker is wedged"
-            ) from error
+    # ------------------------------------------------------------ pages
 
-    @server.tool(name="get_app_info")
-    async def get_app_info() -> Any:
-        """Return connected Logseq version and DB support metadata."""
-        return await client.call("logseq.DB.getAppInfo", [])
+    @server.tool(name="getPageUUID", structured_output=True)
+    async def get_page_uuid(title: str) -> dict[str, Any]:
+        """Resolve a page title to exactly one UUID. Returns found=false with candidates when the title is ambiguous, rather than guessing a write target."""
+        return await content().get_page_uuid(title)
 
-    @server.tool(name="get_current_graph")
-    async def get_current_graph() -> Any:
-        """Return the current graph identity and path metadata."""
-        return await client.call("logseq.DB.getCurrentGraph", [])
-
-    @server.tool(name="list_pages")
-    async def list_pages(expand: bool = False) -> Any:
-        """List DB pages with UUIDs and optional expanded metadata."""
-        return await client.call("logseq.DB.listPages", [{"expand": expand}])
-
-    @server.tool(name="get_page_data")
-    async def get_page_data(page_name_or_uuid: str) -> Any:
-        """Read a page and only blocks directly parented by it. Nested descendants require get_block_tree or a Datascript parent/page query."""
-        return await client.call("logseq.DB.getPageData", [page_name_or_uuid])
-
-    @server.tool(name="search")
-    async def search(query: str) -> Any:
-        """Search the DB graph through the verified DB namespace alias."""
-        return await client.call("logseq.DB.search", [query])
-
-    @server.tool(name="list_properties")
-    async def list_properties(expand: bool = False) -> Any:
-        """List DB properties with optional expanded metadata."""
-        return await client.call("logseq.DB.listProperties", [{"expand": expand}])
-
-    @server.tool(name="list_tags")
-    async def list_tags(expand: bool = False) -> Any:
-        """List DB tags with optional expanded metadata."""
-        return await client.call("logseq.DB.listTags", [{"expand": expand}])
-
-    @server.tool(name="upsert_nodes", structured_output=True)
-    async def upsert_nodes(
-        operations: list[dict[str, Any]], dry_run: bool = False
-    ) -> dict[str, Any]:
-        """Create pages/top-level blocks or edit block titles. Always validates first; nested block targets are rejected because they corrupt ownership."""
-        return (
-            await VerifiedContent(client).upsert_nodes(operations, dry_run=dry_run)
-        ).to_dict()
-
-    @server.tool(name="get_block", structured_output=True)
-    async def get_block(block_uuid: str) -> dict[str, Any]:
-        """Read one exact block UUID through Datascript. Missing UUIDs return found=false rather than a tool error."""
-        return await VerifiedContent(client).find_block(block_uuid)
-
-    @server.tool(name="get_block_tree", structured_output=True)
-    async def get_block_tree(
-        block_uuid: str,
-        max_depth: int = 20,
-        max_nodes: int = 1000,
-    ) -> dict[str, Any]:
-        """Read a recursive block subtree through two bounded Datascript calls. Returns truncated=true when a limit stops traversal."""
-        return await VerifiedContent(client).find_block_tree(
-            block_uuid,
-            max_depth=max_depth,
-            max_nodes=max_nodes,
-        )
-
-    @server.tool(name="create_page", structured_output=True)
-    async def create_page(title: str, dry_run: bool = False) -> dict[str, Any]:
-        """Create one page through DB.upsertNodes with validation and read-back."""
-        return (
-            await VerifiedContent(client).create_page(title, dry_run=dry_run)
-        ).to_dict()
-
-    @server.tool(name="create_top_level_block", structured_output=True)
-    async def create_top_level_block(
+    @server.tool(name="getPage", structured_output=True)
+    async def get_page(
         page_uuid: str,
-        title: str,
-        tag_uuids: list[str] | None = None,
-        dry_run: bool = False,
+        detail: Literal[
+            "page", "blocks", "tags", "properties", "declared", "all"
+        ] = "page",
     ) -> dict[str, Any]:
-        """Create one top-level block on an exact page UUID. This cannot create a nested child or control sibling position."""
-        return (
-            await VerifiedContent(client).create_top_level_block(
-                page_uuid,
-                title,
-                tag_uuids=tag_uuids,
-                dry_run=dry_run,
-            )
-        ).to_dict()
+        """Read one page. detail=page is the page entity alone; blocks lists every block at any depth; tags covers the page and its blocks; properties returns values that are set; declared returns property slots inherited from the page's classes that have no value yet; all combines them."""
+        return await content().get_page(page_uuid, detail)
 
-    @server.tool(name="delete_block", structured_output=True)
-    async def delete_block(block_uuid: str) -> dict[str, Any]:
-        """Delete the subtree rooted at an exact block UUID through Logseq's supported DB worker path and verify every UUID is absent."""
-        return (await VerifiedContent(client).delete_block(block_uuid)).to_dict()
+    # ------------------------------------------------------------ blocks
 
-    @server.tool(name="insert_block", structured_output=True)
-    async def insert_block(
-        target_uuid: str,
-        title: str,
-        placement: Literal["child", "after"] = "child",
+    @server.tool(name="getBlockUUID", structured_output=True)
+    async def get_block_uuid(page_uuid: str) -> list[dict[str, Any]]:
+        """List every block on a page, at any depth, ordered by position. Returns a list, not a single UUID."""
+        return await content().get_block_uuid(page_uuid)
+
+    @server.tool(name="getBlock", structured_output=True)
+    async def get_block(block_uuid: str) -> dict[str, Any]:
+        """Read one exact block. A missing UUID returns found=false rather than raising."""
+        return await content().find_block(block_uuid)
+
+    @server.tool(name="getBlockTree", structured_output=True)
+    async def get_block_tree(
+        block_uuid: str, max_depth: int = 20, max_nodes: int = 1000
     ) -> dict[str, Any]:
-        """Insert a titled block as the last child of or sibling after an exact block UUID, then verify its structure."""
-        return (
-            await VerifiedContent(client).insert_block(
-                target_uuid, title, placement=placement
-            )
-        ).to_dict()
+        """Read a block and its descendants as a nested tree. Returns truncated=true when a limit stops traversal."""
+        return await content().find_block_tree(
+            block_uuid, max_depth=max_depth, max_nodes=max_nodes)
 
-    @server.tool(name="move_block", structured_output=True)
-    async def move_block(
-        block_uuid: str,
-        target_uuid: str,
-        placement: Literal["child", "after"] = "child",
+    @server.tool(name="createBlock", structured_output=True)
+    async def create_block(
+        parent_uuid: str, title: str, dry_run: bool = False
     ) -> dict[str, Any]:
-        """Move an exact block subtree as the last child of or sibling after an exact target UUID, then verify its structure."""
-        return (
-            await VerifiedContent(client).move_block(
-                block_uuid, target_uuid, placement=placement
-            )
-        ).to_dict()
+        """Create one block. parent_uuid may be a page UUID (top-level block) or a block UUID (nested child). Only the title can be set at creation; tags and position are follow-up calls, and the new UUID is assigned by Logseq rather than returned."""
+        return (await content().create_block(
+            parent_uuid, title, dry_run=dry_run)).to_dict()
 
-    @server.tool(name="upsert_block", structured_output=True)
-    async def upsert_block(
+    @server.tool(name="createManyBlocks", structured_output=True)
+    async def create_many_blocks(
+        blocks: list[dict[str, str]], dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Create several blocks in one batched call. Each item takes parent_uuid and title. Titles must be unique within the batch, since verification identifies new blocks by title."""
+        return (await content().create_many_blocks(
+            blocks, dry_run=dry_run)).to_dict()
+
+    @server.tool(name="createPageofBlocks", structured_output=True)
+    async def create_page_of_blocks(
+        page_uuid: str, outline: str, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Build an indented outline on a page. Each level is created, read back to learn the UUIDs Logseq assigned, then used as the parent for the next -- creation does not return UUIDs and parents cannot be named by title."""
+        return await content().create_page_of_blocks(
+            page_uuid, outline, dry_run=dry_run)
+
+    @server.tool(name="updateBlock", structured_output=True)
+    async def update_block(
         block_uuid: str, title: str, dry_run: bool = False
     ) -> dict[str, Any]:
-        """Edit one existing block title through DB.upsertNodes. This does not create, move, nest, or delete blocks."""
-        return (
-            await VerifiedContent(client).upsert_block(
-                block_uuid, title, dry_run=dry_run
-            )
-        ).to_dict()
+        """Edit one block's title. Does not create, move, nest, or delete."""
+        return (await content().update_block(
+            block_uuid, title, dry_run=dry_run)).to_dict()
 
-    @server.tool(name="rename_page", structured_output=True)
-    async def rename_page(page_uuid: str, new_title: str) -> dict[str, Any]:
-        """Rename an exact page UUID and verify its new title."""
-        return (await VerifiedContent(client).rename_page(page_uuid, new_title)).to_dict()
+    @server.tool(name="removeBlock", structured_output=True)
+    async def remove_block(block_uuid: str) -> dict[str, Any]:
+        """Delete a block and its entire subtree, then verify every UUID in that subtree is absent."""
+        return (await content().remove_block(block_uuid)).to_dict()
 
-    @server.tool(name="delete_page", structured_output=True)
-    async def delete_page(
-        page_uuid: str, acknowledge_reference_rewrite: bool = False
+    # ------------------------------------------------------------- tags
+
+    @server.tool(name="getTagUUID", structured_output=True)
+    async def get_tag_uuid(title: str) -> dict[str, Any]:
+        """Resolve a tag title to exactly one UUID. Returns found=false with candidates when several tags share the title."""
+        return await mutations().get_tag_uuid(title)
+
+    @server.tool(name="getTag", structured_output=True)
+    async def get_tag(tag_uuid: str) -> dict[str, Any]:
+        """Read one exact tag entity. Takes a UUID, not a title or ident -- use getTagUUID to resolve a title."""
+        tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
+        return await mutations().get_tag(tag_uuid)
+
+    @server.tool(name="getTagUsers", structured_output=True)
+    async def get_tag_users(tag_uuid: str) -> list[dict[str, Any]]:
+        """List every page and block carrying the tag. Holders with block/name are pages. This is the work list for removing a tag everywhere, and the check to run before deleting it."""
+        tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
+        return await mutations().get_tag_users(tag_uuid)
+
+    @server.tool(name="creatTag", structured_output=True)
+    async def creat_tag(
+        title: str, options: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Compatibility alias for recycle_page."""
-        return (
-            await VerifiedContent(client).delete_page(
-                page_uuid,
-                acknowledge_reference_rewrite=acknowledge_reference_rewrite,
-            )
-        ).to_dict()
+        """Create a tag. Its ident carries a random suffix assigned by Logseq, so it cannot be predicted from the title and is read back."""
+        return (await mutations().create_tag(title, options)).to_dict()
 
-    @server.tool(name="recycle_page", structured_output=True)
-    async def recycle_page(
-        page_uuid: str, acknowledge_reference_rewrite: bool = False
+    @server.tool(name="deleteTag", structured_output=True)
+    async def delete_tag(
+        tag_uuid: str, acknowledge_child_reparent: bool = False
     ) -> dict[str, Any]:
-        """Recycle a page after checking for reference-rewrite side effects."""
-        return (
-            await VerifiedContent(client).delete_page(
-                page_uuid,
-                acknowledge_reference_rewrite=acknowledge_reference_rewrite,
-            )
-        ).to_dict()
+        """Delete one tag entity. UNVERIFIED ROUTE: this has never been run successfully and its identifier type is unconfirmed, so check verified in the result. Requires acknowledgement when child tags would be reparented."""
+        tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
+        return (await mutations().delete_tag(
+            tag_uuid,
+            acknowledge_child_reparent=acknowledge_child_reparent)).to_dict()
 
-    @server.tool(name="datascript_query")
-    async def datascript_query(query: str) -> Any:
-        """Run a read-only Datascript query through logseq.DB.datascriptQuery."""
-        return await client.call("logseq.DB.datascriptQuery", [query])
+    @server.tool(name="addTag", structured_output=True)
+    async def add_tag(target_uuid: str, tag_uuid: str) -> dict[str, Any]:
+        """Attach an existing tag to a page or a block. target_uuid may be either. Both arguments are UUIDs; the target comes first."""
+        # Validate both before either lookup, so a call with the arguments
+        # swapped or a title in one slot names the offending argument rather
+        # than failing halfway through.
+        target_uuid = require_uuid(
+            target_uuid, role="target_uuid",
+            hint="getPageUUID or getBlockUUID")
+        tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
+        return (await mutations().add_tag(target_uuid, tag_uuid)).to_dict()
 
-    @server.tool(name="get_all_properties")
-    async def get_all_properties() -> Any:
-        """Return all DB property definitions."""
-        return await client.call("logseq.DB.getAllProperties", [])
+    @server.tool(name="removeTag", structured_output=True)
+    async def remove_tag(target_uuid: str, tag_uuid: str) -> dict[str, Any]:
+        """Detach one tag from a page or a block. Other tags on the target are untouched and the tag entity survives. Both arguments are UUIDs; the target comes first."""
+        target_uuid = require_uuid(
+            target_uuid, role="target_uuid",
+            hint="getPageUUID or getBlockUUID")
+        tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
+        return (await mutations().remove_tag(target_uuid, tag_uuid)).to_dict()
 
-    @server.tool(name="get_property")
-    async def get_property(property_ident: str) -> Any:
-        """Get a property by its exact namespaced ident."""
-        if not property_ident.startswith(":") or "/" not in property_ident:
-            raise ValueError("property_ident must be an exact namespaced ident")
-        return await client.call("logseq.DB.getProperty", [property_ident])
+    # -------------------------------------------------------- properties
 
-    @server.tool(name="get_all_tags")
-    async def get_all_tags() -> Any:
-        """Return all DB tags/classes."""
-        return await client.call("logseq.DB.getAllTags", [])
+    @server.tool(name="getPropertyIndent", structured_output=True)
+    async def get_property_indent(title: str) -> dict[str, Any]:
+        """Resolve a property title to exactly one :db/ident. Returns the ident, which is what every other property tool takes -- a UUID will not work."""
+        return await mutations().get_property_ident(title)
 
-    @server.tool(name="get_tag")
-    async def get_tag(identifier: str) -> Any:
-        """Get a tag by exact ident, UUID, or title."""
-        return await client.call("logseq.DB.getTag", [identifier])
+    @server.tool(name="getProperyUsers", structured_output=True)
+    async def get_propery_users(property_ident: str) -> list[dict[str, Any]]:
+        """List every page and block holding a value for this property, with the value in both raw and resolved form. Run this before deleteProperty."""
+        return await mutations().get_property_users(property_ident)
 
-    @server.tool(name="get_tags_by_name")
-    async def get_tags_by_name(title: str) -> Any:
-        """Get tags matching an exact title."""
-        return await client.call("logseq.DB.getTagsByName", [title])
-
-    @server.tool(name="get_tag_objects")
-    async def get_tag_objects(identifier: str) -> Any:
-        """Return a mixed list of pages and blocks associated with a tag ident, UUID, or title."""
-        return await client.call("logseq.DB.getTagObjects", [identifier])
-
-    @server.tool(name="upsert_property", structured_output=True)
-    async def upsert_property(
+    @server.tool(name="createProperty", structured_output=True)
+    async def create_property(
         title: str,
         schema: dict[str, Any],
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create or update a property and verify it by its returned exact ident."""
-        result = await VerifiedMutations(client).upsert_property(
-            title, schema, options
-        )
-        return result.to_dict()
+        """Create a property definition. Pass a plain title, never a namespaced ident. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen."""
+        return (await mutations().create_property(
+            title, schema, options)).to_dict()
 
-    @server.tool(name="remove_property", structured_output=True)
-    async def remove_property(property_ident: str) -> dict[str, Any]:
-        """Remove an exact property ident and verify that it is absent."""
-        result = await VerifiedMutations(client).remove_property(property_ident)
-        return result.to_dict()
+    @server.tool(name="deleteProperty", structured_output=True)
+    async def delete_property(property_ident: str) -> dict[str, Any]:
+        """Delete a property definition graph-wide, taking every value with it. Not reversible -- recreating mints a new entity. UNVERIFIED ROUTE: check verified in the result."""
+        return (await mutations().delete_property(property_ident)).to_dict()
 
-    @server.tool(name="create_tag", structured_output=True)
-    async def create_tag(
-        title: str, options: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Create a tag and verify it through its returned exact identity."""
-        return (await VerifiedMutations(client).create_tag(title, options)).to_dict()
-
-    @server.tool(name="rename_tag", structured_output=True)
-    async def rename_tag(tag_uuid: str, new_title: str) -> dict[str, Any]:
-        """Rename one exact tag UUID and verify its new title."""
-        return (await VerifiedMutations(client).rename_tag(tag_uuid, new_title)).to_dict()
-
-    @server.tool(name="delete_tag", structured_output=True)
-    async def delete_tag(
-        tag_uuid: str, acknowledge_child_reparent: bool = False
-    ) -> dict[str, Any]:
-        """Permanently delete one tag, requiring acknowledgement before child tags are reparented."""
-        return (
-            await VerifiedMutations(client).delete_tag(
-                tag_uuid, acknowledge_child_reparent=acknowledge_child_reparent
-            )
-        ).to_dict()
-
-    @server.tool(name="add_tag_property", structured_output=True)
-    async def add_tag_property(tag_uuid: str, property_ident: str) -> dict[str, Any]:
-        """Add an exact property to an exact tag UUID and verify the relation."""
-        return (
-            await VerifiedMutations(client).add_tag_property(tag_uuid, property_ident)
-        ).to_dict()
-
-    @server.tool(name="remove_tag_property", structured_output=True)
-    async def remove_tag_property(tag_uuid: str, property_ident: str) -> dict[str, Any]:
-        """Remove an exact property from an exact tag UUID and verify removal."""
-        return (
-            await VerifiedMutations(client).remove_tag_property(tag_uuid, property_ident)
-        ).to_dict()
-
-    @server.tool(name="set_tag_parent", structured_output=True)
-    async def set_tag_parent(
-        tag_uuid: str,
-        parent_tag_uuid: str,
-        acknowledge_replacement: bool = False,
-    ) -> dict[str, Any]:
-        """Set one tag parent, requiring acknowledgement before replacement."""
-        return (
-            await VerifiedMutations(client).set_tag_parent(
-                tag_uuid,
-                parent_tag_uuid,
-                acknowledge_replacement=acknowledge_replacement,
-            )
-        ).to_dict()
-
-    @server.tool(name="remove_tag_extends", structured_output=True)
-    async def remove_tag_extends(tag_uuid: str, parent_tag_uuid: str) -> dict[str, Any]:
-        """Remove and verify inheritance between two exact tag UUIDs."""
-        return (
-            await VerifiedMutations(client).remove_tag_extends(tag_uuid, parent_tag_uuid)
-        ).to_dict()
-
-    @server.tool(name="upsert_block_property", structured_output=True)
-    async def upsert_block_property(
-        block_uuid: str,
+    @server.tool(name="addProperty", structured_output=True)
+    async def add_property(
+        target_uuid: str,
         property_ident: str,
         value: Any,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Set an exact property on an exact block UUID and verify its value."""
-        return (
-            await VerifiedMutations(client).upsert_block_property(
-                block_uuid, property_ident, value, options
-            )
-        ).to_dict()
+        """Set a property value on a page or a block. target_uuid may be either. Reference-typed properties take an entity id, not a literal; closed enums such as Status take one of the entities from listClosedValues. Only properties in this plugin's own namespace can be written."""
+        return (await mutations().set_property(
+            target_uuid, property_ident, value, options)).to_dict()
 
-    @server.tool(name="remove_block_property", structured_output=True)
-    async def remove_block_property(
-        block_uuid: str, property_ident: str
+    @server.tool(name="removeProperty", structured_output=True)
+    async def remove_property(
+        target_uuid: str, property_ident: str
     ) -> dict[str, Any]:
-        """Remove an exact property from a block UUID and verify its absence."""
-        return (
-            await VerifiedMutations(client).remove_block_property(
-                block_uuid, property_ident
-            )
-        ).to_dict()
+        """Clear a property value from a page or a block. The property definition survives and other targets keep their values -- use deleteProperty to remove the definition itself."""
+        return (await mutations().clear_property(
+            target_uuid, property_ident)).to_dict()
 
-    @server.tool(name="upsert_page_property", structured_output=True)
-    async def upsert_page_property(
-        page_uuid: str,
-        property_ident: str,
-        value: Any,
-        options: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Set an exact property on an exact page UUID and verify its value."""
-        return (
-            await VerifiedMutations(client).upsert_page_property(
-                page_uuid, property_ident, value, options
-            )
-        ).to_dict()
+    # ------------------------------------------------------------ lists
+    # Each takes no arguments and returns the whole of one kind.
 
-    @server.tool(name="remove_page_property", structured_output=True)
-    async def remove_page_property(
-        page_uuid: str, property_ident: str
-    ) -> dict[str, Any]:
-        """Remove an exact property from a page UUID and verify its absence."""
-        return (
-            await VerifiedMutations(client).remove_page_property(
-                page_uuid, property_ident
-            )
-        ).to_dict()
+    @server.tool(name="listPages")
+    async def list_pages() -> Any:
+        """List all live pages. Recycled pages are excluded -- they keep the Page class and would otherwise appear live."""
+        return await query(
+            "[:find [(pull ?page [:db/id :block/uuid :block/name "
+            ":block/title]) ...] :in $ ?class :where "
+            "[?page :block/name] [?page :block/tags ?class] "
+            "[(missing? $ ?page :logseq.property/deleted-at)]]",
+            await class_id(PAGE_CLASS))
 
-    @server.tool(name="add_block_tag", structured_output=True)
-    async def add_block_tag(block_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Add an exact tag UUID to an exact block UUID and verify it."""
-        return (
-            await VerifiedMutations(client).add_block_tag(block_uuid, tag_uuid)
-        ).to_dict()
+    @server.tool(name="listJournals")
+    async def list_journals() -> Any:
+        """List all journal pages, with their journal day as an integer date."""
+        return await query(
+            "[:find [(pull ?page [:db/id :block/uuid :block/name "
+            ":block/title :block/journal-day]) ...] "
+            ":where [?page :block/journal-day _]]")
 
-    @server.tool(name="remove_block_tag", structured_output=True)
-    async def remove_block_tag(block_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Remove an exact tag UUID from an exact block UUID and verify absence."""
-        return (
-            await VerifiedMutations(client).remove_block_tag(block_uuid, tag_uuid)
-        ).to_dict()
+    @server.tool(name="listTags")
+    async def list_tags() -> Any:
+        """List all tags and classes, including Logseq built-ins."""
+        return await client.call("logseq.DB.getAllTags", [])
 
-    @server.tool(name="add_page_tag", structured_output=True)
-    async def add_page_tag(page_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Add an exact tag UUID to an exact page UUID through the native DB API."""
-        return (
-            await VerifiedMutations(client).add_page_tag(page_uuid, tag_uuid)
-        ).to_dict()
+    @server.tool(name="listProperties")
+    async def list_properties() -> Any:
+        """List all property definitions with their idents and types, including built-ins."""
+        return await client.call("logseq.DB.getAllProperties", [])
 
-    @server.tool(name="remove_page_tag", structured_output=True)
-    async def remove_page_tag(page_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Remove an exact tag UUID from an exact page UUID through the native DB API."""
-        return (
-            await VerifiedMutations(client).remove_page_tag(page_uuid, tag_uuid)
-        ).to_dict()
+    @server.tool(name="listClosedValues")
+    async def list_closed_values() -> Any:
+        """List every enum property with its permitted values. Required before setting Status, Priority, or any closed property -- the value must be one of these entities."""
+        return await query(
+            "[:find (pull ?prop [:db/ident :block/title]) "
+            "(pull ?value [:db/id :db/ident :block/title]) "
+            ":where [?prop :property/closed-values ?value]]")
 
-    @server.tool(name="set_block_icon", structured_output=True)
-    async def set_block_icon(
-        block_uuid: str, icon_type: str, icon_name: str
-    ) -> dict[str, Any]:
-        """Set and verify a Tabler or emoji icon on an exact block UUID."""
-        return (
-            await VerifiedMutations(client).set_block_icon(
-                block_uuid, icon_type, icon_name
-            )
-        ).to_dict()
+    @server.tool(name="listOrphanTags")
+    async def list_orphan_tags() -> Any:
+        """List tags that nothing carries. Run before deleting tags in bulk."""
+        return await query(
+            "[:find [(pull ?tag [:db/id :db/ident :block/uuid "
+            ":block/title]) ...] :in $ ?class :where "
+            "[?tag :block/tags ?class] "
+            "[(missing? $ ?tag :block/_tags)]]",
+            await class_id(TAG_CLASS))
 
-    @server.tool(name="remove_block_icon", structured_output=True)
-    async def remove_block_icon(block_uuid: str) -> dict[str, Any]:
-        """Remove an icon from an exact block UUID and verify its absence."""
-        return (await VerifiedMutations(client).remove_block_icon(block_uuid)).to_dict()
+    @server.tool(name="listOrphanProperties")
+    async def list_orphan_properties() -> Any:
+        """List properties with no values anywhere. Each property is its own DB attribute, so this checks them one at a time and is slower than the other lists."""
+        properties = await client.call("logseq.DB.getAllProperties", [])
+        orphans = []
+        for entry in properties or []:
+            ident = entry.get("ident") if isinstance(entry, dict) else None
+            if not isinstance(ident, str) or not ident.startswith(":"):
+                continue
+            holders = await query(
+                f"[:find [?holder ...] :where [?holder {ident} _]]")
+            if not holders:
+                orphans.append({
+                    "ident": ident,
+                    "title": entry.get("title"),
+                    "type": entry.get(":logseq.property/type"),
+                })
+        return orphans
+
+    @server.tool(name="listAssets")
+    async def list_assets() -> Any:
+        """List asset-related attributes in use. UNVERIFIED: asset modelling was never established, so this is a discovery probe rather than a reliable list."""
+        return await query(
+            '[:find [?attr ...] :where [_ ?attr _] [(str ?attr) ?s] '
+            '[(clojure.string/includes? ?s "asset")]]')
+
+    @server.tool(name="listStatus")
+    async def list_status() -> Any:
+        """List everything with a Status value, paired with the status it holds."""
+        return await query(
+            "[:find (pull ?entity [:db/id :block/uuid :block/title "
+            ":block/name {:block/page [:block/title]}]) "
+            "(pull ?value [:db/ident :block/title]) "
+            ":where [?entity :logseq.property/status ?value]]")
+
+    @server.tool(name="listRecycled")
+    async def list_recycled() -> Any:
+        """List recycled pages. These keep their UUID, tags and references; inbound links to them are not rewritten."""
+        return await query(
+            "[:find [(pull ?page [:db/id :block/uuid :block/name "
+            ":block/title :logseq.property/deleted-at]) ...] "
+            ":where [?page :logseq.property/deleted-at _]]")
 
     return server
 
@@ -470,41 +412,67 @@ def _failure_stage(error: Exception) -> str:
 
 def _failure_suggestion(tool_name: str, error: Exception) -> str:
     contracts = {
-        "insert_block": (
-            "Use an exact target block UUID, a non-empty title, and placement "
-            "child or after."
+        "get_page_uuid": (
+            "Pass the page's display title. If several pages share it, use "
+            "getPage with a UUID instead."
         ),
-        "move_block": (
-            "Use distinct exact block and target UUIDs, with placement child or after."
+        "get_page": (
+            "Pass an exact page UUID and one of: page, blocks, tags, "
+            "properties, declared, all."
         ),
-        "delete_block": (
-            "Use block_uuid as the exact UUID of a block, not a page UUID."
-        ),
-        "get_block": "Use block_uuid as the exact UUID of a block.",
+        "get_block_uuid": "Pass an exact page UUID, not a block UUID.",
+        "get_block": "Pass an exact block UUID.",
         "get_block_tree": (
-            "Use block_uuid as an exact block UUID, max_depth from 0 to 100, "
-            "and max_nodes from 1 to 1000."
+            "Pass an exact block UUID, max_depth 0-100, max_nodes 1-1000."
         ),
-        "upsert_block_property": (
-            "Use an exact block UUID, a full namespaced property ident, "
-            "the schema-compatible value, and an optional options object."
+        "create_block": (
+            "Pass an exact parent UUID -- a page UUID for a top-level block or "
+            "a block UUID to nest -- and a non-empty title. A page title will "
+            "not resolve."
         ),
-        "upsert_page_property": (
-            "Use an exact page UUID, a full namespaced property ident, "
-            "the schema-compatible value, and an optional options object."
+        "create_many_blocks": (
+            "Pass a list of objects with parent_uuid and title. Titles must be "
+            "unique within the batch."
         ),
-        "add_block_tag": "Use exact block and tag UUIDs.",
-        "remove_block_tag": "Use exact block and tag UUIDs.",
-        "add_page_tag": "Use exact page and tag UUIDs.",
-        "remove_page_tag": "Use exact page and tag UUIDs.",
-        "set_tag_parent": (
-            "Use exact child and parent tag UUIDs and acknowledge replacement "
-            "when the child already has a different parent."
+        "create_page_of_blocks": (
+            "Pass an exact page UUID and an outline whose indentation is "
+            "consistent and never jumps more than one level."
         ),
-        "remove_tag_extends": "Use exact child-tag and parent-tag UUIDs.",
-        "set_block_icon": (
-            "Use an exact block UUID, icon_type tabler-icon or emoji, and a "
-            "valid icon name."
+        "update_block": "Pass an exact block UUID and a non-empty title.",
+        "remove_block": "Pass an exact block UUID, not a page UUID.",
+        "get_tag_uuid": "Pass the tag's display title.",
+        "get_tag": "Pass an exact tag UUID.",
+        "get_tag_users": "Pass an exact tag UUID.",
+        "creat_tag": "Pass a non-empty tag title.",
+        "delete_tag": (
+            "Pass an exact tag UUID. This route is unverified; if the result "
+            "reports verified=false the tag was not deleted."
+        ),
+        "add_tag": (
+            "Pass the target UUID first and the tag UUID second. The target "
+            "may be a page or a block."
+        ),
+        "remove_tag": (
+            "Pass the target UUID first and the tag UUID second."
+        ),
+        "get_property_indent": "Pass the property's display title.",
+        "get_propery_users": (
+            "Pass a full namespaced ident such as "
+            ":plugin.property.my_plugin/Effort, not a title or UUID."
+        ),
+        "create_property": (
+            "Pass a plain title with no '/', and a schema with a valid type."
+        ),
+        "delete_property": (
+            "Pass a full namespaced ident. A UUID returns success and does "
+            "nothing. Only this plugin's own properties can be deleted."
+        ),
+        "add_property": (
+            "Pass the target UUID, a full namespaced ident, and a value "
+            "matching the property's type. Reference types take an entity id."
+        ),
+        "remove_property": (
+            "Pass the target UUID and a full namespaced ident."
         ),
     }
     if tool_name in contracts:
@@ -527,12 +495,14 @@ def main() -> None:
         read_attempts=settings.read_attempts,
         write_policy=WriteAccessPolicy(
             title_prefixes=settings.write_title_prefixes,
-            property_prefixes=settings.write_property_prefixes,
+            property_prefixes=settings.property_prefixes,
             entity_uuids=settings.write_entity_uuids,
         ),
+        writable_property_prefix=settings.writable_property_prefix,
         max_response_bytes=settings.max_response_bytes,
     )
-    create_server(client).run(transport="stdio")
+    create_server(client, probe_writes=settings.probe_writes).run(
+        transport="stdio")
 
 
 if __name__ == "__main__":

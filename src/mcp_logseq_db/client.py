@@ -1,11 +1,36 @@
-"""Failure-isolated client for the Logseq DB HTTP API."""
+"""Failure-isolated client for the Logseq DB HTTP API.
+
+SCOPE
+-----
+`ALLOWED_METHODS` is derived from what the tool surface actually routes
+through -- nothing more. A method that no tool uses is not reachable, so the
+allowlist doubles as documentation of the real dependency set.
+
+WHAT CHANGED, AND WHY
+---------------------
+The graph-worker CLI paths are gone. They existed because a hardcoded
+capability list reported `removeBlock`, `getBlock` and `updateBlock` as
+rejected. All three work over HTTP; `delete_block_via_cli` was routing around
+a method that was never broken. Nested block creation likewise works over HTTP
+via `upsertNodes` (`page-id` accepts a block UUID), so `insert_block_via_cli`
+had no reason to exist either. `move_block_via_cli` supported a tool that the
+current surface does not expose; if block movement returns, it needs a route
+established by testing rather than inherited from the same wrong list.
+
+`write_and_verify` is new and is the point of this module. This API returns
+success for calls that do nothing -- a wrong identifier type, an unresolvable
+name, or an unsupported combination all produce `null` or a stock
+acknowledgement. A write that is not read back is a write whose outcome is
+unknown, so verification is built into the write path rather than left to each
+caller.
+"""
+
+from __future__ import annotations
 
 import asyncio
 import json
-import shutil
-import subprocess
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
-from collections.abc import Callable
 from functools import wraps
 from typing import Any
 
@@ -13,105 +38,54 @@ import httpx
 
 from .access import WriteAccessPolicy
 
+# --------------------------------------------------------------------------
+# Method allowlist. Every entry is reachable from at least one tool; grouped by
+# the tools that depend on it so an unused method is visible as unused.
+# --------------------------------------------------------------------------
 
-ALLOWED_METHODS = frozenset({
-    "logseq.DB.checkCurrentIsDbGraph",
-    "logseq.DB.getAppInfo",
-    "logseq.DB.getCurrentGraph",
-    "logseq.DB.datascriptQuery",
-    "logseq.DB.search",
-    "logseq.DB.listPages",
-    "logseq.DB.listTags",
-    "logseq.DB.listProperties",
-    "logseq.DB.getAllPages",
-    "logseq.DB.getPageData",
-    "logseq.DB.getProperty",
-    "logseq.DB.getAllProperties",
-    "logseq.DB.getAllTags",
-    "logseq.DB.getTagObjects",
-    "logseq.DB.getTag",
-    "logseq.DB.getTagsByName",
-    "logseq.DB.upsertProperty",
-    "logseq.DB.removeProperty",
-    "logseq.DB.upsertBlockProperty",
-    "logseq.DB.removeBlockProperty",
-    "logseq.DB.createTag",
-    "logseq.DB.addTagProperty",
-    "logseq.DB.removeTagProperty",
-    "logseq.DB.addTagExtends",
-    "logseq.DB.removeTagExtends",
-    "logseq.DB.addBlockTag",
-    "logseq.DB.removeBlockTag",
-    "logseq.DB.setBlockIcon",
-    "logseq.DB.removeBlockIcon",
-    "logseq.DB.addPropertyValueChoices",
-    "logseq.DB.getFileContent",
-    "logseq.DB.setFileContent",
-    "logseq.DB.upsertNodes",
-    "logseq.DB.renamePage",
-    "logseq.DB.deletePage",
-    "logseq.DB.insertBlock",
-    "logseq.DB.moveBlock",
-    "logseq.DB.removeBlock",
+_CONNECTION_METHODS = frozenset({
+    "logseq.DB.getAppInfo",             # capabilities
+    "logseq.DB.checkCurrentIsDbGraph",  # capabilities
+    "logseq.DB.getCurrentGraph",        # capabilities
 })
 
+_READ_METHODS = frozenset({
+    # Every getPage/getBlockUUID/list*/find* tool routes here.
+    "logseq.DB.datascriptQuery",
+    # Dedicated reads with no query equivalent worth preferring.
+    "logseq.DB.getBlock",               # getBlock
+    "logseq.DB.getTagsByName",          # getTagUUID
+    "logseq.DB.getAllTags",             # listTags
+    "logseq.DB.getAllProperties",       # listProperties
+})
+
+WRITE_METHODS = frozenset({
+    "logseq.DB.upsertNodes",            # createBlock, createManyBlocks,
+                                        # createPageofBlocks
+    "logseq.DB.updateBlock",            # updateBlock
+    "logseq.DB.removeBlock",            # removeBlock
+    "logseq.DB.createTag",              # creatTag
+    "logseq.DB.deletePage",             # deleteTag
+    "logseq.DB.addBlockTag",            # addTag
+    "logseq.DB.removeBlockTag",         # removeTag
+    "logseq.DB.upsertProperty",         # createProperty
+    "logseq.DB.removeProperty",         # deleteProperty
+    "logseq.DB.upsertBlockProperty",    # addProperty
+    "logseq.DB.removeBlockProperty",    # removeProperty
+})
+
+ALLOWED_METHODS = _CONNECTION_METHODS | _READ_METHODS | WRITE_METHODS
+
+# Some responses come back as text/plain rather than JSON.
 PLAIN_TEXT_METHODS = frozenset({
     "logseq.DB.datascriptQuery",
     "logseq.DB.upsertNodes",
 })
 
+# Queries can be expensive; a retry doubles the load without improving the
+# odds, since a query that timed out once will time out again.
 NO_RETRY_READ_METHODS = frozenset({
     "logseq.DB.datascriptQuery",
-    "logseq.DB.search",
-})
-
-WRITE_METHODS = frozenset({
-    "logseq.DB.upsertProperty",
-    "logseq.DB.removeProperty",
-    "logseq.DB.upsertBlockProperty",
-    "logseq.DB.removeBlockProperty",
-    "logseq.DB.createTag",
-    "logseq.DB.addTagProperty",
-    "logseq.DB.removeTagProperty",
-    "logseq.DB.addTagExtends",
-    "logseq.DB.removeTagExtends",
-    "logseq.DB.addBlockTag",
-    "logseq.DB.removeBlockTag",
-    "logseq.DB.setBlockIcon",
-    "logseq.DB.removeBlockIcon",
-    "logseq.DB.addPropertyValueChoices",
-    "logseq.DB.setFileContent",
-    "logseq.DB.upsertNodes",
-    "logseq.DB.renamePage",
-    "logseq.DB.deletePage",
-})
-
-# Used only as the ambiguous-timeout fallback when a CLI-backed write path is unavailable.
-RAW_FALLBACK_WRITE_METHODS = frozenset({
-    "logseq.DB.insertBlock",
-    "logseq.DB.moveBlock",
-    "logseq.DB.removeBlock",
-})
-
-# Promoted only after live response-shape, read-back, cleanup, and MCP testing
-# against Logseq 2.0.1 on 2026-09-01.
-VERIFIED_WRITE_METHODS = frozenset({
-    "logseq.DB.upsertProperty",
-    "logseq.DB.removeProperty",
-    "logseq.DB.upsertBlockProperty",
-    "logseq.DB.removeBlockProperty",
-    "logseq.DB.createTag",
-    "logseq.DB.addTagProperty",
-    "logseq.DB.removeTagProperty",
-    "logseq.DB.addTagExtends",
-    "logseq.DB.removeTagExtends",
-    "logseq.DB.addBlockTag",
-    "logseq.DB.removeBlockTag",
-    "logseq.DB.setBlockIcon",
-    "logseq.DB.removeBlockIcon",
-    "logseq.DB.upsertNodes",
-    "logseq.DB.renamePage",
-    "logseq.DB.deletePage",
 })
 
 
@@ -127,12 +101,28 @@ class WriteCircuitOpenError(RuntimeError):
     """Raised when an earlier ambiguous timeout has blocked later writes."""
 
 
+class UnverifiedWriteError(RuntimeError):
+    """
+    Raised when a write returned successfully but the read-back did not show
+    the expected state.
+
+    This is the characteristic failure of this API, not an edge case: a wrong
+    identifier type produces exactly this shape. Both the observed state and
+    the state before the write are attached so a caller can tell "nothing
+    happened" from "something else happened".
+    """
+
+    def __init__(self, message: str, *, before: Any = None, after: Any = None):
+        super().__init__(message)
+        self.before = before
+        self.after = after
+
+
 ClientFactory = Callable[..., httpx.AsyncClient]
-CLIRunner = Callable[..., subprocess.CompletedProcess[str]]
 
 
 def serialized_write(method):
-    """Hold the real client's write lock across mutation and verification."""
+    """Hold the write lock across a mutation and its verification."""
     @wraps(method)
     async def wrapper(self, *args, **kwargs):
         scope = getattr(self._client, "write_scope", None)
@@ -166,10 +156,9 @@ class LogseqDBClient:
         readback_delay: float = 0.15,
         read_attempts: int = 1,
         write_policy: WriteAccessPolicy | None = None,
+        writable_property_prefix: str = "plugin.property.",
         max_response_bytes: int = 5_000_000,
         client_factory: ClientFactory = httpx.AsyncClient,
-        cli_command: str = "logseq",
-        cli_runner: CLIRunner = subprocess.run,
     ) -> None:
         self._url = _api_endpoint(base_url)
         self._api_token = api_token
@@ -182,15 +171,18 @@ class LogseqDBClient:
         self._request_deadline = connect_timeout + read_timeout
         self._verify_ssl = verify_ssl
         self._client_factory = client_factory
-        self._cli_command = cli_command
-        self._cli_runner = cli_runner
         self._write_lock = asyncio.Lock()
         self._write_circuit_reason: str | None = None
         self.readback_attempts = max(1, readback_attempts)
         self.readback_delay = max(0.0, readback_delay)
         self.read_attempts = max(1, read_attempts)
         self.write_policy = write_policy or WriteAccessPolicy()
+        # Property idents outside this prefix are read-only over HTTP. Held
+        # here so callers of any module can consult one source.
+        self.writable_property_prefix = writable_property_prefix
         self.max_response_bytes = max(1, max_response_bytes)
+
+    # ---------------------------------------------------------------- state
 
     @property
     def write_circuit_open(self) -> bool:
@@ -216,7 +208,7 @@ class LogseqDBClient:
                 last_error = None
                 if predicate(last_value):
                     return last_value
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 -- retried below
                 last_error = error
             if attempt + 1 < self.readback_attempts and self.readback_delay:
                 await asyncio.sleep(self.readback_delay)
@@ -224,123 +216,49 @@ class LogseqDBClient:
             raise last_error
         return last_value
 
-    async def delete_block_via_cli(self, block_uuid: str) -> Any:
-        """Delete a block through Logseq's graph-worker outliner operation."""
-        result = await self._run_graph_cli(["remove", "block", "--uuid", block_uuid])
-        return result
+    # ---------------------------------------------------------------- write
 
-    async def insert_block_via_cli(
-        self, target_uuid: str, title: str, placement: str
-    ) -> int:
-        """Insert a block through Logseq's graph-worker outliner operation."""
-        position = {"child": "last-child", "after": "sibling"}.get(placement)
-        if position is None:
-            raise ValueError("Stable block insertion supports child or after placement")
-        result = await self._run_graph_cli([
-            "upsert",
-            "block",
-            "--target-uuid",
-            target_uuid,
-            "--pos",
-            position,
-            "--content",
-            title,
-        ])
-        if not isinstance(result, list) or len(result) != 1 or not isinstance(result[0], int):
-            raise LogseqProtocolError("Logseq CLI insertion did not return one entity id")
-        return result[0]
-
-    async def move_block_via_cli(
-        self, block_uuid: str, target_uuid: str, placement: str
+    async def write_and_verify(
+        self,
+        method: str,
+        args: list[Any],
+        *,
+        reader: Callable[[], Awaitable[Any]],
+        predicate: Callable[[Any], bool],
+        description: str,
     ) -> Any:
-        """Move a block through Logseq's graph-worker outliner operation."""
-        position = {"child": "last-child", "after": "sibling"}.get(placement)
-        if position is None:
-            raise ValueError("Stable block movement supports child or after placement")
-        return await self._run_graph_cli([
-            "upsert",
-            "block",
-            "--uuid",
-            block_uuid,
-            "--target-uuid",
-            target_uuid,
-            "--pos",
-            position,
-        ])
+        """
+        Perform a write and prove it happened.
 
-    async def update_block_tag_via_cli(
-        self, block_uuid: str, tag_ident: str, *, remove: bool
-    ) -> Any:
-        """Add or remove one exact tag through the graph-worker outliner path."""
-        if not tag_ident.startswith(":") or "/" not in tag_ident:
-            raise ValueError("Tag ident must be an exact namespaced keyword")
-        option = "--remove-tags" if remove else "--update-tags"
-        return await self._run_graph_cli([
-            "upsert",
-            "block",
-            "--uuid",
-            block_uuid,
-            option,
-            f"[{tag_ident}]",
-        ])
+        The response is deliberately ignored as evidence. `null` is returned by
+        writes that succeeded and by writes that silently did nothing, so it
+        carries no information; only the read-back does.
 
-    async def _run_graph_cli(self, arguments: list[str]) -> Any:
-        """Run one fixed Logseq CLI operation against the connected graph."""
-        if self._write_circuit_reason is not None:
-            raise WriteCircuitOpenError(
-                "Writes are blocked because an earlier write timed out with an "
-                f"ambiguous result: {self._write_circuit_reason}. Read the target "
-                "state, restart Logseq, then reconnect the MCP before another write."
-            )
+        `reader` is snapshotted before the write so the failure message can
+        distinguish "unchanged" from "changed unexpectedly". It must be
+        idempotent -- it is retried, the write never is.
+        """
+        async with self.write_scope():
+            try:
+                before = await reader()
+            except Exception:  # noqa: BLE001 -- a missing target is a valid before
+                before = None
 
-        graph_info = await self.call("logseq.DB.getCurrentGraph", [])
-        if not isinstance(graph_info, dict) or not isinstance(graph_info.get("path"), str):
-            raise LogseqProtocolError("Current graph did not provide an absolute path")
-        normalized_path = graph_info["path"].replace("\\", "/").rstrip("/")
-        if "/graphs/" not in normalized_path:
-            raise LogseqProtocolError("Current graph path is not under a graphs directory")
-        root_dir, graph_name = normalized_path.rsplit("/graphs/", 1)
-        if not root_dir or not graph_name or "/" in graph_name:
-            raise LogseqProtocolError("Current graph path cannot identify one graph")
+            await self.call(method, args)
 
-        executable = shutil.which(self._cli_command)
-        if executable is None:
-            raise RuntimeError(
-                "Logseq CLI is required for supported DB block deletion but was not found"
-            )
-        command = [
-            executable,
-            "--root-dir",
-            root_dir,
-            "--graph",
-            graph_name,
-            "--output",
-            "json",
-            *arguments,
-        ]
-        try:
-            completed = await asyncio.to_thread(
-                self._cli_runner,
-                command,
-                capture_output=True,
-                text=True,
-                timeout=self._request_deadline,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            self._write_circuit_reason = "Logseq CLI write timed out"
-            raise httpx.ReadTimeout(self._write_circuit_reason) from error
+            after = await self.poll_readback(reader, predicate)
+            if not predicate(after):
+                raise UnverifiedWriteError(
+                    f"{description}: the call returned without error but the "
+                    "read-back does not show the expected state. This usually "
+                    "means an identifier of the wrong type was supplied -- "
+                    "this API reports success for writes that do nothing.",
+                    before=before,
+                    after=after,
+                )
+            return after
 
-        try:
-            result = json.loads(completed.stdout)
-        except ValueError as error:
-            raise LogseqProtocolError(
-                "Logseq CLI write returned malformed JSON"
-            ) from error
-        if completed.returncode != 0 or not isinstance(result, dict) or result.get("status") != "ok":
-            detail = completed.stderr.strip() or json.dumps(result)
-            raise LogseqAPIError(f"Logseq CLI write failed: {detail[:2000]}")
-        return result.get("data", {}).get("result")
+    # ----------------------------------------------------------------- call
 
     async def call(self, method: str, args: list[Any]) -> Any:
         if method not in ALLOWED_METHODS:
@@ -348,12 +266,13 @@ class LogseqDBClient:
         if not isinstance(args, list):
             raise TypeError("Logseq API args must be a list")
 
-        is_write = method in WRITE_METHODS or method in RAW_FALLBACK_WRITE_METHODS
+        is_write = method in WRITE_METHODS
         if is_write and self._write_circuit_reason is not None:
             raise WriteCircuitOpenError(
                 "Writes are blocked because an earlier write timed out with an "
-                f"ambiguous result: {self._write_circuit_reason}. Read the target "
-                "state, restart Logseq, then reconnect the MCP before another write."
+                f"ambiguous result: {self._write_circuit_reason}. Read the "
+                "target state, restart Logseq, then reconnect the MCP before "
+                "another write."
             )
 
         attempts = (
@@ -376,13 +295,13 @@ class LogseqDBClient:
                     raise timeout from error
             except httpx.TransportError as error:
                 if is_write and isinstance(error, httpx.TimeoutException):
-                    self._write_circuit_reason = f"{method}: {error or 'request timed out'}"
+                    self._write_circuit_reason = (
+                        f"{method}: {error or 'request timed out'}")
                 if attempt + 1 == attempts:
                     raise
         raise RuntimeError("unreachable")
 
     async def _call_once(self, method: str, args: list[Any]) -> Any:
-
         headers = {
             "Authorization": f"Bearer {self._api_token}",
             "Connection": "close",
@@ -411,8 +330,10 @@ class LogseqDBClient:
                 try:
                     result = json.loads(content)
                 except (UnicodeDecodeError, ValueError) as error:
-                    content_type = response.headers.get("content-type", "").lower()
-                    if method in PLAIN_TEXT_METHODS and content_type.startswith("text/plain"):
+                    content_type = response.headers.get(
+                        "content-type", "").lower()
+                    if (method in PLAIN_TEXT_METHODS
+                            and content_type.startswith("text/plain")):
                         result = text
                     else:
                         raise LogseqProtocolError(
@@ -426,7 +347,8 @@ class LogseqDBClient:
             try:
                 if int(content_length) > self.max_response_bytes:
                     raise LogseqProtocolError(
-                        f"{method} response exceeds {self.max_response_bytes} bytes"
+                        f"{method} response exceeds "
+                        f"{self.max_response_bytes} bytes"
                     )
             except ValueError:
                 pass
