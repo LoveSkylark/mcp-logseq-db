@@ -11,6 +11,7 @@ from mcp_logseq_db.content import VerifiedContent
 
 PAGE_UUID = "12345678-1234-5678-1234-567812345678"
 BLOCK_UUID = "87654321-4321-8765-4321-876543218765"
+TAG_UUID = "11111111-2222-3333-4444-555555555555"
 
 
 class RecordingClient:
@@ -95,6 +96,102 @@ async def test_upsert_block_delegates_to_one_edit_operation() -> None:
             "data": {"title": "Updated"},
         }], {"dry-run": True}],
     )
+
+
+@pytest.mark.asyncio
+async def test_upsert_edit_page_tags_dry_run() -> None:
+    client = RecordingClient([
+        {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"},
+        "validated",
+    ])
+
+    result = await VerifiedContent(client).upsert_nodes(  # type: ignore[arg-type]
+        [{
+            "operation": "edit",
+            "entityType": "page",
+            "id": PAGE_UUID,
+            "data": {"tags": [TAG_UUID]},
+        }],
+        dry_run=True,
+    )
+
+    assert result.validation == "validated"
+    assert client.calls[-1] == (
+        "logseq.DB.upsertNodes",
+        [[{
+            "operation": "edit",
+            "entityType": "page",
+            "id": PAGE_UUID,
+            "data": {"tags": [TAG_UUID]},
+        }], {"dry-run": True}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_upsert_edit_page_tags_commits_and_verifies_exact_tag_set() -> None:
+    client = RecordingClient([
+        {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page"},
+        "validated",
+        "committed",
+        {"id": 20, "uuid": TAG_UUID, "title": "Tag"},
+        {"id": 10, "uuid": PAGE_UUID, "title": "Page", "name": "page", "tags": [{"id": 20}]},
+    ])
+
+    result = await VerifiedContent(client).upsert_nodes(  # type: ignore[arg-type]
+        [{
+            "operation": "edit",
+            "entityType": "page",
+            "id": PAGE_UUID,
+            "data": {"tags": [TAG_UUID]},
+        }]
+    )
+
+    assert result.response == "committed"
+    assert result.verified is True
+    assert result.verified_entities[0]["tags"] == [{"id": 20}]
+    assert client.calls[2] == (
+        "logseq.DB.upsertNodes",
+        [[{
+            "operation": "edit",
+            "entityType": "page",
+            "id": PAGE_UUID,
+            "data": {"tags": [TAG_UUID]},
+        }], {"dry-run": False}],
+    )
+
+
+@pytest.mark.asyncio
+async def test_upsert_edit_page_tags_rejects_extra_data_keys() -> None:
+    client = RecordingClient([])
+
+    with pytest.raises(ValueError, match="data.tags"):
+        await VerifiedContent(client).upsert_nodes(  # type: ignore[arg-type]
+            [{
+                "operation": "edit",
+                "entityType": "page",
+                "id": PAGE_UUID,
+                "data": {"tags": [TAG_UUID], "title": "New title"},
+            }]
+        )
+
+    assert client.calls == []
+
+
+@pytest.mark.asyncio
+async def test_upsert_edit_page_tags_rejects_block_id() -> None:
+    client = RecordingClient([
+        {"id": 11, "uuid": BLOCK_UUID, "title": "Block"},
+    ])
+
+    with pytest.raises(ValueError, match="must identify a page"):
+        await VerifiedContent(client).upsert_nodes(  # type: ignore[arg-type]
+            [{
+                "operation": "edit",
+                "entityType": "page",
+                "id": BLOCK_UUID,
+                "data": {"tags": [TAG_UUID]},
+            }]
+        )
 
 
 @pytest.mark.asyncio

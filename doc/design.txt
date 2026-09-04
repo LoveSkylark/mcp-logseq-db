@@ -1,0 +1,475 @@
+Agreed. **First define the MCP architecture and rules; only after that do we test which Logseq operations fit those rules.**
+
+I would make the guideline centered around one core principle:
+
+# Logseq DB MCP Architecture
+
+## 1. Core principle
+
+**`upsertNodes()` is the primary DB mutation primitive.**
+
+The MCP should attempt to express DB changes through `upsertNodes()` before using any dedicated Logseq mutation API — but only where that path is also **empirically reliable**. A route that is semantically capable but times out or produces inconsistent results in live testing is disqualified regardless of fit; reliability is judged per operation via the capability matrix, not assumed from capability alone.
+
+```text
+MCP intent
+    ↓
+Determine DB entity + mutation
+    ↓
+Can this be expressed with upsertNodes(), AND is that path empirically reliable?
+    │
+    ├── YES → upsertNodes()
+    │
+    └── NO  → dedicated Logseq API, or graph-worker CLI outliner operation,
+              whichever the capability matrix records as reliable
+```
+
+The MCP tool should therefore describe **what the user wants to do**, not which Logseq API happens to implement it.
+
+---
+
+# 2. Separate "intent" from "implementation"
+
+The MCP interface should be semantic.
+
+For example, expose:
+
+```text
+add_page_tag
+```
+
+rather than exposing:
+
+```text
+logseq.DB.addBlockTag
+logseq.DB.addTagExtends
+logseq.DB.upsertNodes
+```
+
+The MCP layer decides how to implement the operation.
+
+```text
+                  MCP
+                   │
+            add_page_tag
+                   │
+                   ▼
+          implementation layer
+                   │
+          ┌────────┴────────┐
+          │                 │
+     upsertNodes()      dedicated API
+          │                 │
+          └────────┬────────┘
+                   ▼
+                Logseq
+```
+
+This gives us freedom to change the implementation later without changing the MCP contract.
+
+---
+
+# 3. `upsertNodes()` is not itself the MCP architecture
+
+I would **not** make every MCP tool simply expose `upsertNodes()`.
+
+Instead:
+
+### Low-level
+
+```text
+upsert_nodes
+```
+
+Optional advanced/raw tool.
+
+### High-level
+
+```text
+create_page
+rename_page
+create_block
+update_block
+add_page_tag
+remove_page_tag
+set_page_property
+...
+```
+
+The high-level tools translate their intent into the lowest-level DB operation available.
+
+This is important because an MCP client should not have to understand Logseq's internal EDN/entity model just to perform normal operations.
+
+---
+
+# 4. Entity-first design
+
+Every mutation should first identify the **DB entity being changed**.
+
+Our architecture should distinguish:
+
+```text
+Page
+Block
+Tag
+Property
+```
+
+and then distinguish what is being changed on that entity.
+
+For example:
+
+```text
+PAGE
+ ├── identity
+ ├── attributes
+ │    ├── name
+ │    └── properties
+ └── relationships
+      └── tags
+```
+
+and:
+
+```text
+TAG
+ ├── identity
+ ├── attributes
+ │    └── name
+ └── relationships
+      ├── parent tags
+      └── properties
+```
+
+This distinction is critical because **a relationship is not automatically excluded from `upsertNodes()` just because it is a relationship**.
+
+We will verify that experimentally later.
+
+---
+
+# 5. Capability classification
+
+Every MCP operation should ultimately receive one of three classifications.
+
+### A. Native `upsertNodes()` operation
+
+```text
+MCP
+ ↓
+upsertNodes()
+ ↓
+DB
+```
+
+Use this whenever possible.
+
+---
+
+### B. Dedicated DB API
+
+```text
+MCP
+ ↓
+dedicated Logseq DB API
+ ↓
+DB
+```
+
+Use this only when `upsertNodes()` cannot perform the operation, or is capable but empirically unreliable for it.
+
+Examples might eventually include:
+
+```text
+move_block
+delete_block
+```
+
+but **we don't decide that yet**.
+
+---
+
+### C. Graph-worker CLI outliner operation
+
+```text
+MCP
+ ↓
+graph-worker CLI outliner operation
+ ↓
+DB
+```
+
+Use this when `upsertNodes()` and the dedicated HTTP API are either unavailable or empirically unreliable (timeouts, inconsistent results) for the operation — as already verified for structural block insert/move/delete and existing-block tag changes.
+
+---
+
+### D. Non-DB / special operation
+
+Some Logseq APIs are not really DB mutations.
+
+For example:
+
+```text
+UI operations
+editor positioning
+graph switching
+application state
+```
+
+Those should remain separate from the DB mutation architecture.
+
+---
+
+# 6. Do not duplicate functionality unnecessarily
+
+If:
+
+```text
+rename_page
+```
+
+can be implemented as:
+
+```text
+upsertNodes()
+```
+
+we should **not** have the MCP call:
+
+```text
+logseq.DB.renamePage()
+```
+
+just because that API exists.
+
+The existence of a dedicated Logseq API does not automatically make it the preferred MCP implementation.
+
+Our priority is:
+
+```text
+upsertNodes() (if empirically reliable)
+    ↓
+dedicated DB API (if empirically reliable)
+    ↓
+graph-worker CLI outliner operation
+    ↓
+other API
+```
+
+The capability matrix, not this ordering alone, decides which rung an operation lands on — a route only qualifies if it is both semantically correct and proven reliable in live testing.
+
+---
+
+# 7. Dedicated APIs become fallback mechanisms
+
+This is probably the most important architectural rule.
+
+A lower-priority route (dedicated DB API or graph-worker CLI outliner operation) should be used when:
+
+1. `upsertNodes()` cannot represent the operation, or
+2. `upsertNodes()` represents it but cannot perform the required semantics safely/correctly, or
+3. `upsertNodes()` (or the dedicated HTTP API) is empirically unreliable for the operation — times out or produces inconsistent results in live testing, regardless of semantic fit, or
+4. the operation is fundamentally outside the upsert model.
+
+So:
+
+```text
+                    Operation
+                        │
+                        ▼
+              Can upsertNodes express it?
+                   /           \
+                 YES            NO
+                  │              │
+                  ▼              ▼
+            upsertNodes()    Dedicated API
+```
+
+Not:
+
+```text
+Operation → find matching Logseq API
+```
+
+---
+
+# 8. MCP tools should hide implementation details
+
+For example, the MCP user should not need to know whether adding a tag means:
+
+```text
+:block/tags
+```
+
+or:
+
+```text
+some Logseq handler
+```
+
+or:
+
+```text
+upsertNodes()
+```
+
+They simply call:
+
+```text
+add_block_tag
+```
+
+The MCP implementation handles the translation.
+
+That gives us a stable abstraction even if Logseq changes its internal implementation.
+
+---
+
+# 9. Read operations are different
+
+For reads, we shouldn't force everything through `upsertNodes()` obviously.
+
+The architecture becomes:
+
+```text
+                 Logseq DB MCP
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+        READ                    WRITE
+          │                       │
+     DB/query APIs          upsertNodes()
+                                  │
+                           ┌──────┴──────┐
+                           │             │
+                       dedicated      special
+                          API           API
+```
+
+So:
+
+### Reads
+
+Use the most appropriate DB read API:
+
+```text
+list_pages
+get_page_data
+get_block
+get_block_tree
+search
+datascript_query
+get_property
+get_tag
+...
+```
+
+### Writes
+
+Prefer:
+
+```text
+upsertNodes()
+```
+
+then fall back when necessary.
+
+---
+
+# 10. Don't expose redundant MCP tools
+
+If two tools ultimately do exactly the same thing, we should generally expose only the semantic one.
+
+For example, if:
+
+```text
+rename_page
+```
+
+is implemented by:
+
+```text
+upsertNodes()
+```
+
+there is little reason to expose both:
+
+```text
+rename_page
+upsert_page_name
+```
+
+unless they have genuinely different semantics.
+
+Likewise, we shouldn't expose a huge list of low-level Logseq API names simply because those APIs exist.
+
+---
+
+# 11. Raw `upsert_nodes` should be treated differently
+
+I would keep:
+
+```text
+upsert_nodes
+```
+
+as an **advanced primitive**, while the normal MCP tools use it internally.
+
+That gives us:
+
+```text
+Normal agent:
+
+create_page(...)
+      ↓
+upsertNodes(...)
+
+
+Advanced agent:
+
+upsert_nodes(...)
+      ↓
+upsertNodes(...)
+```
+
+This is useful because it lets us test capabilities directly and gives an advanced client access to functionality that hasn't yet received a dedicated semantic MCP wrapper.
+
+---
+
+# 12. The architecture we should build around
+
+So the final design should look like this:
+
+```text
+                         LOGSEQ DB MCP
+                              │
+             ┌────────────────┴────────────────┐
+             │                                 │
+           READ                              WRITE
+             │                                 │
+      DB read/query APIs                Mutation resolver
+                                               │
+                        ┌──────────────────────┼──────────────────────┐
+                        │                      │                      │
+              upsertNodes()            Dedicated DB API      Graph-worker CLI
+            (capable + reliable)     (capable + reliable)  outliner operation
+                        │                      │                      │
+                        └──────────────────────┴──────────────────────┘
+                                               │
+                                               ▼
+                                          Logseq DB
+```
+
+Non-DB/special operations (category D) bypass the mutation resolver entirely.
+
+And **the capability table is a separate artifact** that tells the mutation resolver which route to take, based on both semantic fit and proven live reliability.
+
+---
+
+## 13. Our guiding rule
+
+I would put this at the top of the eventual MCP design document:
+
+> **The MCP exposes semantic operations. `upsertNodes()` is the preferred primitive for DB mutations, but only where it is both expressible and empirically reliable. Dedicated Logseq HTTP APIs and graph-worker CLI outliner operations are used where `upsertNodes()` cannot express the operation, cannot perform it safely, or is unreliable in live testing — the graph-worker CLI outliner path is the proven fallback for structural block mutations and existing-block tag changes. The MCP interface must not mirror the Logseq API surface unnecessarily.**
+
+Then we can build the capability matrix underneath it.
+
+**Only after this structure is locked down should we test `upsertNodes()` against tags, properties, relationships, deletion, moving, etc.** That way the tests answer a very specific architectural question rather than us designing the architecture around whatever happens to work in the first few experiments.

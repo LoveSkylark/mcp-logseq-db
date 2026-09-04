@@ -193,7 +193,10 @@ result envelope. A completed MCP call is not proof of mutation:
   in mixed write sequences.
 - `add_page_tag` and `remove_page_tag` require an exact page UUID and exact tag
   UUID. They use the native DB tag route because the graph-worker block path is
-  intentionally block-only.
+  block-only: a live probe on 2026-09-03 against Logseq 2.0.1 confirmed the CLI
+  rejects a page UUID with `invalid-source: source must be a non-page block`.
+  Page tags therefore have no CLI fallback and remain exposed to the ambiguous
+  HTTP write-circuit-breaker risk that block tags no longer have.
 - Do not insert `#tag` text as a substitute for changing `:block/tags`.
 
 ## Block icons

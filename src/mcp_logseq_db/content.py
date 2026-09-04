@@ -472,6 +472,28 @@ class VerifiedContent(VerifiedWriteHelpers):
         created_pages: dict[str, dict[str, Any]] = {}
         verified: list[dict[str, Any]] = []
         for index, operation in enumerate(normalized):
+            if operation["operation"] == "edit" and operation["entityType"] == "page":
+                expected_tag_ids: set[int] = set()
+                for tag_uuid in operation["data"]["tags"]:
+                    tag_entity = await self._entity_by_uuid(tag_uuid)
+                    expected_tag_ids.add(tag_entity["id"])
+                entity = await poll_readback(
+                    self._client,
+                    lambda: self._entity_by_uuid(operation["id"]),
+                    lambda value: self._reference_ids(value.get("tags", [])) == expected_tag_ids,
+                )
+                if self._reference_ids(entity.get("tags", [])) != expected_tag_ids:
+                    return ContentResult(
+                        validation=validation,
+                        response=response,
+                        verified_entities=(entity,),
+                        recovered_after_timeout=timed_out,
+                        verified=False,
+                        diagnostic="Page tag edit did not converge to the exact requested tag set",
+                    )
+                verified.append(entity)
+                continue
+
             if operation["operation"] == "edit":
                 expected_title = operation["data"]["title"]
                 entity = await poll_readback(
@@ -643,6 +665,27 @@ class VerifiedContent(VerifiedWriteHelpers):
             operation_type = operation.get("operation")
             entity_type = operation.get("entityType")
             data = dict(operation["data"])
+
+            if operation_type == "edit" and entity_type == "page":
+                if set(data) != {"tags"}:
+                    raise ValueError("Page edit supports only data.tags")
+                tags = data.get("tags")
+                if not isinstance(tags, list) or not all(isinstance(item, str) for item in tags):
+                    raise ValueError("Page edit requires data.tags as a list of tag UUIDs")
+                normalized_tags = [self._validated_uuid(tag_uuid) for tag_uuid in tags]
+                if len(set(normalized_tags)) != len(normalized_tags):
+                    raise ValueError("Page edit data.tags must not repeat a tag UUID")
+                for tag_uuid in normalized_tags:
+                    self._require_entity(tag_uuid)
+                page_uuid = self._validated_uuid(operation.get("id"))
+                self._require_entity(page_uuid)
+                page = await self._entity_by_uuid(page_uuid)
+                if not page.get("name"):
+                    raise ValueError("Page edit id must identify a page")
+                data["tags"] = normalized_tags
+                normalized.append(dict(operation, data=data, id=page_uuid))
+                continue
+
             title = data.get("title")
             if not isinstance(title, str) or not title.strip():
                 raise ValueError(f"operation {index} requires a non-empty title")
@@ -679,7 +722,8 @@ class VerifiedContent(VerifiedWriteHelpers):
                     raise ValueError("Block edit id identifies a page")
             else:
                 raise ValueError(
-                    "Supported operations are add page, add top-level block, and edit block"
+                    "Supported operations are add page, add top-level block, edit block, "
+                    "and edit page tags"
                 )
 
             if operation_type == "add":
@@ -794,6 +838,16 @@ class VerifiedContent(VerifiedWriteHelpers):
     @staticmethod
     def _reference_id(value: Any) -> int | None:
         return value.get("id") if isinstance(value, dict) else None
+
+    @staticmethod
+    def _reference_ids(references: Any) -> set[int]:
+        if not isinstance(references, list):
+            return set()
+        return {
+            reference["id"]
+            for reference in references
+            if isinstance(reference, dict) and isinstance(reference.get("id"), int)
+        }
 
     @staticmethod
     def _verify_relative_order(
