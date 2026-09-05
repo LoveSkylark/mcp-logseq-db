@@ -26,22 +26,40 @@ properties.
 
 Before designing anything, know the shape of the hole:
 
-**No page creation tool.** The route exists and is not exposed. An import that
-needs new pages cannot be done here — say so before planning it.
+**Pages: create, rename, delete, clear.** All four exist. Deleting recycles
+rather than destroys, and does not rewrite inbound references, so a model that
+churns pages leaves dangling links behind.
 
 **Blocks: title only at creation.** Tags, properties, and position are all
 follow-up calls. A block with a tag and two properties is four calls, not one.
 
 **Properties: your namespace only.** You can create and set
-`plugin.property.<caller>/*`. Properties the user made in the UI live under
-`user.property/*` and are readable but not writable. If a model depends on
-writing an existing user property, it will not work.
+`plugin.property.<caller>/*`, where `<caller>` is assigned by Logseq from the
+API server's identity rather than chosen — on the graph this was developed
+against it is `_test_plugin`. Properties the user made in the UI live under
+`user.property/*` and are readable but not writable, as are the
+`:logseq.property/*` built-ins.
 
-**Tags: creatable, deletion unverified.** `creatTag` works; `deleteTag` has
-never been confirmed. Do not design something that depends on cleaning up tags.
+Whether any namespace is shared between callers is **untested**, and it
+matters: if there is none, two integrations cannot see each other's properties,
+and a property the user can edit in the UI can never be written by an API
+client. `scripts/live_reliability.py --explore` reports the caller id and the
+namespaces actually present in the graph.
 
-**No block movement.** Structure has to be right at creation. There is no
-reordering, and no route for one.
+**Tags: creation works; the delete ROUTE has never succeeded.** Every write in
+this server reads back and reports `verified`, `deleteTag` included — the
+uncertainty is not in the checking but in whether `deletePage` (the route
+underneath it) does anything when handed a tag. Until a live run says
+otherwise, treat tag deletion as likely to come back `verified: false`, and do
+not design something that depends on cleaning up tags.
+
+**No block movement — yet.** Structure has to be right at creation. The pieces
+look present: `:block/parent` is a plain reference and `:block/order` is a
+fractional index string, so a move is in principle a change to two attributes.
+What is missing is a way to write them. `upsertNodes` `edit`+`block` accepts
+only `title`, and `data` is a closed allowlist. `scripts/live_reliability.py
+--explore` probes the plausible routes; until one is found, plan structure
+up front.
 
 That last point shapes import order more than anything else.
 
@@ -51,8 +69,9 @@ Because nothing can be moved afterwards, build outward from identity:
 
 1. **Properties and tags first.** Definitions must exist before values can be
    assigned. Retain every returned ident.
-2. **Pages next** — except this server cannot create them, so they must already
-   exist. Resolve each to a UUID and keep it.
+2. **Pages next.** `createPage` returns the entity; keep the UUID. Titles must
+   be unique, so plan for collisions with existing pages *and* with tags,
+   which are pages too.
 3. **Structure before content.** Use `createPageofBlocks` for anything nested;
    it handles the create/read-back/create cycle that block creation requires.
 4. **Tags and properties last**, once targets have UUIDs.

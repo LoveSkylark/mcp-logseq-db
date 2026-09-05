@@ -9,6 +9,68 @@ nothing, so the read-back is the only evidence.
 
 ---
 
+## Pages
+
+### Creating
+
+```
+createPage(title)
+```
+
+A title already used by any page or block is rejected rather than duplicated:
+verification identifies a new entity by title, so a duplicate could not be
+told from the original.
+
+### Renaming
+
+```
+renamePage(page_uuid, new_title)
+```
+
+Verified by UUID. Reading back by the new title would not distinguish a rename
+from Logseq creating a second page and leaving the original untouched, so the
+original UUID is re-read and its title compared. The check also confirms
+`:block/name` survived — a rename that stripped page identity would otherwise
+look like success.
+
+A title another entity already holds is rejected, for the same reason as
+`createPage`.
+
+### Deleting
+
+```
+deletePage(page_uuid, acknowledge_reference_rewrite=false)
+```
+
+**This recycles rather than destroys.** The page keeps its UUID, tags, refs and
+blocks, gains `:logseq.property/deleted-at`, and drops out of `listPages`. It
+remains visible through `listRecycled`.
+
+**Inbound references are not rewritten.** Any block linking to the page keeps
+pointing at it. The tool lists the referring entities and refuses until
+`acknowledge_reference_rewrite=true`, so the user can decide — do not set the
+flag without telling them what it means.
+
+The identifier this route accepts is unconfirmed. The UUID is tried first and
+the page name second, and the result reports which worked. If the envelope says
+`via its name`, record that: it also settles which form `deleteTag` needs.
+
+### Clearing
+
+```
+clearPage(page_uuid)
+```
+
+Deletes every block, keeps the page. One call per top-level block since there
+is no batch delete, each taking its subtree with it — so cost scales with the
+number of top-level blocks, not total blocks.
+
+The page entity, its tags and its property values are untouched. Use this
+rather than `deletePage` followed by `createPage`: the latter changes the UUID
+and breaks every reference.
+
+---
+
 ## Blocks
 
 ### Creating
@@ -37,6 +99,10 @@ among its parent's children.
 
 Whether a batch applies atomically is untested. On failure, read back rather
 than assuming all-or-nothing.
+
+`dry_run` on any of these validates locally and does not call the API. It
+confirms the arguments are well formed and the targets exist; it cannot
+confirm the write will succeed.
 
 ### Outlines
 

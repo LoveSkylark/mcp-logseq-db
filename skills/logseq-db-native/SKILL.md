@@ -5,7 +5,7 @@ description: "Use when reading or modifying a Logseq 2.x DB graph through the mc
 
 # Logseq DB-Native MCP
 
-For `mcp-logseq-db` against a Logseq 2.x **DB** graph. Do not load any other
+For `mcp-logseq-db` against a Logseq 2.x **DB** graph. Do not load a
 file-graph or legacy Logseq skill in the same conversation.
 
 ## The governing fact
@@ -27,9 +27,16 @@ Observed:
 
 Every rule below follows from this. In particular:
 
-**Never report a write as done on the strength of the response.** Every tool
-returns `verified` and `verified_state`. `verified=false` means the write did
-not take effect even though no error was raised. Report that as a failure.
+**Every write tool already performs the second call.** A tool does not just
+send the mutation — it reads the target back afterwards and compares. So
+`verified: true` means the change was observed in the graph, not that the API
+said so.
+
+What follows from that is a rule about the RESPONSE, not the tool: a raw
+Logseq response of `null` or `{:block 1}` is returned by writes that landed and
+by writes that did nothing, so it is never evidence. Read `verified`.
+`verified: false` means the write did not take effect even though no error was
+raised — report it as a failure, not a success with a caveat.
 
 ## Identifiers
 
@@ -126,6 +133,26 @@ After writing, check `verified`. On `verified=false`, read `previous_state` and
 `observed_state`: they distinguish "nothing happened" from "something else
 happened", and the usual cause is an identifier of the wrong type.
 
+`dry_run` validates arguments and target existence **locally**. It does not
+call the API, so it cannot tell you a write will land. Do not report a
+successful dry run as though the change were made.
+
+### Pages
+
+`createPage(title)` rejects a title that already exists rather than creating a
+second page, because the read-back could not then tell them apart.
+
+`renamePage(page_uuid, new_title)` verifies by UUID, not by the new title —
+reading back by title cannot distinguish a rename from Logseq having created a
+second page and left the original alone.
+
+`deletePage(page_uuid)` recycles. Run it knowing the page survives and its
+inbound references do not move.
+
+`clearPage(page_uuid)` empties a page but keeps it, along with its tags and
+property values. It is one call per top-level block, since the API has no batch
+delete, so it is slow on a large page.
+
 ### Blocks
 
 `createBlock(parent_uuid, title)` — the parent may be a **page** UUID for a
@@ -171,8 +198,11 @@ ident carries a random suffix, so it cannot be predicted from the title.
 `addTag(target, tag)` and `removeTag(target, tag)` take two UUIDs, **target
 first**. Removal affects that one relation only.
 
-`deleteTag` is an **unverified route**. It has never been run successfully and
-its identifier type is unconfirmed. Check `verified` and do not assume.
+`deleteTag` reads back like every other write. What is unconfirmed is the
+route beneath it: it goes through `deletePage`, which has never been observed
+deleting a tag, and whose identifier type is unknown. Expect `verified: false`
+until a live run proves otherwise — and treat that as the tool working
+correctly, not failing silently.
 
 ## Constraints worth stating to the user
 
@@ -185,8 +215,12 @@ not rewritten.
 sorts lexicographically. Sort by it — pull does not guarantee order. There is
 no reindex operation and none is needed.
 
-**No tool creates, renames, or deletes a page.** Those routes exist and are not
-exposed. Say so rather than improvising.
+**Deleting a page recycles it.** `deletePage` does not destroy the entity: the
+page keeps its UUID, tags, refs and blocks, and stops appearing in
+`listPages`. Inbound references are **not** rewritten, so anything linking to
+it keeps pointing at a page the user can no longer find. `deletePage` refuses
+until `acknowledge_reference_rewrite` is set when references exist — surface
+that to the user rather than setting it reflexively.
 
 **Moving a block has no route at all.** Not unavailable in this server —
 unavailable, full stop.
@@ -201,8 +235,9 @@ unavailable, full stop.
 `listProperties`, `listClosedValues`, `listOrphanTags`,
 `listOrphanProperties`, `listAssets`, `listStatus`, `listRecycled`
 
-**Writes** — `createBlock`, `createManyBlocks`, `createPageofBlocks`,
-`updateBlock`, `removeBlock`, `creatTag`, `deleteTag`, `addTag`, `removeTag`,
+**Writes** — `createPage`, `renamePage`, `deletePage`, `clearPage`,
+`createBlock`, `createManyBlocks`, `createPageofBlocks`, `updateBlock`,
+`removeBlock`, `creatTag`, `deleteTag`, `addTag`, `removeTag`,
 `createProperty`, `deleteProperty`, `addProperty`, `removeProperty`
 
 Call only these names. Never emit a raw `logseq.*` method. If tools such as

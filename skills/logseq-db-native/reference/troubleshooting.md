@@ -17,6 +17,9 @@ being accepted.
 | A read is fine but every write is refused | Same circuit. | See below. |
 | `PermissionError` on a write | An operator scope (`LOGSEQ_WRITE_*`) excludes the target. | Configuration, not a bug. Tell the user which scope. |
 | `"outside this caller's namespace"` | A `user.property/*` or built-in property write. | Not possible over HTTP. Do not look for a workaround. |
+| `deletePage` refuses with a reference count | Entities link to the page and those links are not rewritten. | Report the count to the user; only set `acknowledge_reference_rewrite` once they have decided. |
+| A page "deleted" but still readable by UUID | Expected. Deleting recycles: the entity survives with `:logseq.property/deleted-at`. | Check `listPages` excludes it. Use `listRecycled` to see it. |
+| A dry run succeeded but the real call failed | Expected. `dry_run` validates locally and never calls the API. | Never report a dry run as a completed change. |
 
 ## The write circuit
 

@@ -303,12 +303,127 @@ async def writes(client: LogseqDBClient, settings: Settings) -> None:
     info("recycling preserves the entity, so it remains queryable")
 
 
+# --------------------------------------------------------------- explore
+
+async def explore(client: LogseqDBClient, settings: Settings,
+                  *, allow_writes: bool) -> None:
+    """
+    Probe the questions that are open rather than settled.
+
+    Nothing here is a pass/fail check -- these report what the API does so a
+    decision can be made. Findings that turn out to be stable belong in
+    `contract` afterwards, where a regression would be caught.
+    """
+    print("\n=== explore: block movement ===")
+
+    # A move is conceptually two attribute writes: :block/parent and
+    # :block/order. The question is only whether any route accepts them.
+    for label, data in (
+        ("edit+block with page-id",
+         {"title": "x", "page-id": NIL_UUID}),
+        ("edit+block with order",
+         {"title": "x", "order": "a0"}),
+        ("edit+block with parent-id",
+         {"title": "x", "parent-id": NIL_UUID}),
+        ("edit+block with block/parent",
+         {"title": "x", "block/parent": NIL_UUID}),
+    ):
+        response = await raw_call(settings, "logseq.DB.upsertNodes", [[{
+            "operation": "edit", "entityType": "block",
+            "id": NIL_UUID, "data": data}]], 10)
+        body = response.text.strip()[:150]
+        if "disallowed" in body.lower():
+            info(f"{label}: rejected as a disallowed key")
+        elif "invalid" in body.lower() or "missing" in body.lower():
+            ok(f"{label}: key ACCEPTED by the schema", body)
+        else:
+            info(f"{label}: {body}")
+
+    # Methods that might move a block directly. None is in the client
+    # allowlist, so these go through raw_call.
+    for method, probe_args in (
+        ("logseq.DB.moveBlock", [NIL_UUID, NIL_UUID, {}]),
+        ("logseq.DB.insertBatchBlock", [NIL_UUID, [], {}]),
+        ("logseq.DB.prependBlockInPage", [NIL_UUID, BAD_ARG]),
+    ):
+        verdict = await probe(settings, method, probe_args)
+        if verdict == "unsupported":
+            info(f"{method}: not available")
+        elif verdict == "exists":
+            ok(f"{method}: EXISTS -- a move route may be possible", verdict)
+        else:
+            info(f"{method}: {verdict}")
+
+    print("\n=== explore: property namespaces ===")
+
+    properties = await client.call("logseq.DB.getAllProperties", []) or []
+    namespaces: dict[str, int] = {}
+    for entry in properties:
+        ident = entry.get("ident") if isinstance(entry, dict) else None
+        if not isinstance(ident, str):
+            continue
+        bare = ident[1:] if ident.startswith(":") else ident
+        namespace = bare.split("/", 1)[0] if "/" in bare else "(no namespace)"
+        namespaces[namespace] = namespaces.get(namespace, 0) + 1
+
+    for namespace, count in sorted(namespaces.items(),
+                                   key=lambda pair: -pair[1]):
+        info(f"{count:3d}  {namespace}")
+
+    plugin_namespaces = [n for n in namespaces if n.startswith("plugin.property.")]
+    if plugin_namespaces:
+        callers = sorted({n.split(".", 2)[2] for n in plugin_namespaces
+                          if n.count(".") >= 2})
+        info(f"plugin caller ids present: {', '.join(callers)}")
+        if len(callers) > 1:
+            ok("more than one caller id exists",
+               "so namespaces are per-caller, not global")
+    else:
+        info("no plugin.property.* namespace exists yet; create one to find "
+             "out this caller's id")
+
+    if not allow_writes:
+        info("pass --write to discover this caller's id by creating a property")
+        return
+
+    # The caller id is assigned, not chosen. Creating a property and reading
+    # the ident back is the only way to learn it.
+    marker = uuid.uuid4().hex[:6]
+    created = await client.call(
+        "logseq.DB.upsertProperty", [f"MCPProbe{marker}", {"type": "default"}])
+    ident = created.get("ident") if isinstance(created, dict) else None
+    if not ident:
+        fail("caller id discovery", "upsertProperty returned no ident")
+        return
+    ok("this caller writes to", ident.rsplit("/", 1)[0])
+
+    # Can a property in someone else's namespace be written? If not, there is
+    # no shared space and integrations are mutually invisible.
+    for target, why in (
+        (":user.property/__mcp_probe__", "UI-created namespace"),
+        (":plugin.property.__other__/__mcp_probe__", "another plugin"),
+    ):
+        response = await raw_call(settings, "logseq.DB.upsertBlockProperty",
+                                  [NIL_UUID, target, "x"], 10)
+        body = response.text.strip()[:120]
+        if "own properties" in body or "denied" in body.lower():
+            info(f"{why}: refused ({body})")
+        else:
+            ok(f"{why}: NOT refused -- investigate", body)
+
+    info(f"probe property {ident} was created and left in place; "
+         "remove it manually if unwanted")
+
+
 # ------------------------------------------------------------------ main
 
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--write", action="store_true",
                         help="also exercise write paths on a scratch page")
+    parser.add_argument("--explore", action="store_true",
+                        help="probe open questions: block movement, property "
+                             "namespaces. Read-only unless --write is also set.")
     parser.add_argument("--skip-reliability", action="store_true")
     args = parser.parse_args()
 
@@ -337,6 +452,8 @@ async def main() -> int:
     await contract(client, settings)
     if args.write:
         await writes(client, settings)
+    if args.explore:
+        await explore(client, settings, allow_writes=args.write)
 
     print()
     if _failures:
