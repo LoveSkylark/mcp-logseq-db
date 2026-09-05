@@ -1,0 +1,36 @@
+# Test-only image. Runs the suite against `src` in a clean interpreter, so a
+# result here does not depend on a developer's installed copy, stale bytecode,
+# or which of Python 3.11/3.12/3.13 happened to be first on PATH.
+#
+#   docker build -f Dockerfile.test -t mcp-logseq-db-tests .
+#   docker run --rm mcp-logseq-db-tests
+#
+# Override the Python version to reproduce a version-specific failure:
+#   docker build -f Dockerfile.test --build-arg PYTHON_VERSION=3.11 -t ... .
+
+ARG PYTHON_VERSION=3.13
+FROM python:${PYTHON_VERSION}-slim
+
+# Never write .pyc into the mounted source tree. Cross-version stale bytecode
+# is one of the things this image exists to rule out.
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Dependencies first so edits to source do not invalidate the install layer.
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN python -m pip install --upgrade pip \
+ && python -m pip install ".[dev]"
+
+# The package is now installed AND present at ./src. tests/conftest.py forces
+# src to the front of sys.path, so the run exercises the working tree; the
+# install is only here to satisfy dependencies.
+COPY tests ./tests
+
+# No Logseq in this image. Tests that need a live graph must be marked `live`
+# and are deselected here -- see pyproject's markers.
+CMD ["python", "-m", "pytest", "-q", "-m", "not live"]

@@ -1,207 +1,208 @@
-# Write workflows reference
+# Write workflows
 
-Load this file only when performing a content, property, tag, or icon
-mutation. Not needed for read-only tasks.
+Exact shapes and verification steps. Read before an unfamiliar write.
 
-## Page and block content
+Every write returns `verified`, `verified_state`, and on failure
+`previous_state` and `observed_state`. **`verified=false` is a failure**, even
+though no error was raised — this API reports success for calls that do
+nothing, so the read-back is the only evidence.
 
-Use `upsert_nodes` for the supported DB content operations. The server
-always runs Logseq's dry-run validation before a commit and then reads every
-affected entity back.
+---
 
-For a single operation, prefer the explicit wrapper:
+## Blocks
 
-- `create_page(title)` creates one page.
-- `create_top_level_block(page_uuid, title, tag_uuids)` creates one block
-  directly under a page.
-- `upsert_block(block_uuid, title)` edits one existing block title.
+### Creating
 
-All three wrappers support `dry_run=true` and delegate to the same validated
-`DB.upsertNodes` path. They do not call the timeout-prone direct aliases.
-
-Supported operation shapes:
-
-```json
-{"operation":"add","entityType":"page","id":"temp-page","data":{"title":"Page title"}}
-{"operation":"add","entityType":"block","data":{"title":"Block text","page-id":"temp-page"}}
-{"operation":"edit","entityType":"block","id":"BLOCK_UUID","data":{"title":"New text"}}
+```
+createBlock(parent_uuid, title)
 ```
 
-- For an existing page, `data.page-id` must be that page's exact UUID.
-- For a page created earlier in the same batch, use its temporary ID.
-- Added titles must be unique within the batch so read-back is unambiguous.
-- A batch may contain at most 100 operations.
-- Set `dry_run=true` to validate without committing.
-- Do not pass a block UUID as `data.page-id`. Although Logseq accepts it and
-  renders a child, live testing showed malformed ownership where `:block/page`
-  pointed to the parent block. The server rejects this.
-- Use `rename_page` with an exact page UUID.
-- Use `upsert_block(block_uuid, title)` for a single existing block-title
-  edit. It is an edit-only convenience wrapper over `upsert_nodes`; it does
-  not create, move, nest, or delete a block. Set `dry_run=true` to validate
-  without committing.
-- `recycle_page` recycles an exact page UUID and verifies its
-  `:logseq.property/deleted-at` marker. It does not permanently erase it.
-  Before mutation, the tool snapshots page-owned blocks and inbound
-  `:block/refs`. If inbound references exist, it returns `verified=false`
-  unless `acknowledge_reference_rewrite=true` is supplied, because Logseq can
-  rewrite visible inbound page references during recycle.
-- `delete_page` is retained only as a compatibility alias. Prefer
-  `recycle_page` in plans and user-facing language.
-- Use `insert_block` and `move_block` for verified `child` or `after`
-  placement, and `delete_block` for verified subtree deletion. True
-  `before` placement is unavailable.
+`parent_uuid` may be a **page** UUID (top-level block) or a **block** UUID
+(nested child). The underlying field is called `page-id` but behaves as a
+parent pointer. It will not resolve a page title — passing one returns success
+and creates nothing.
 
-### Page references and backlinks
+Only `title` can be set. Tags, order, and position are rejected at creation and
+must be follow-up calls. The new UUID is assigned by Logseq and **not
+returned**; read it back if you need it.
 
-- Write `[[TARGET_PAGE_UUID]]` in a block title to create a structural
-  `:block/refs` relation. The server verifies UUID bracket references after
-  creation or title edits.
-- `[[Page Title]]` stores literal bracket text on this write path and does not
-  create `:block/refs`, even if Logseq renders it as clickable text.
-- A node-typed property also creates a structural ref when its value is the
-  target page's numeric `:db/id`, not its UUID string.
-- Tag assignments create refs with tag semantics; they are not equivalent to
-  ordinary backlinks in Logseq views.
-- Check incoming references with `:block/refs`; `:block/path-refs` is not
-  available on the tested build.
-
-```clojure
-[:find (pull ?source [:db/id :block/uuid :block/title
-                      {:block/page [:db/id :block/title]}])
- :where
- [?source :block/refs ?target]
- [?target :block/uuid #uuid "TARGET_PAGE_UUID"]]
+```
+createManyBlocks([{parent_uuid, title}, ...])
 ```
 
-### Block hierarchy and deletion
+One batched call. Each item may target a different parent. Titles must be
+unique **among siblings** — two blocks may share a title under different
+parents, but not under the same one, because verification finds a new block
+among its parent's children.
 
-Promoted structural tools:
+Whether a batch applies atomically is untested. On failure, read back rather
+than assuming all-or-nothing.
 
-- `insert_block(target_uuid, title, placement)` supports `child` and `after`.
-- `move_block(block_uuid, target_uuid, placement)` supports `child` and
-  `after` while preserving the complete subtree.
-- `delete_block(block_uuid)` deletes and verifies the complete subtree.
+### Outlines
 
-Structural writes return `verified` and `diagnostic` in addition to the normal
-result envelope. A completed MCP call is not proof of mutation:
+```
+createPageofBlocks(page_uuid, outline)
+```
 
-- `verified=true`: the requested state was observed.
-- `verified=false`: report that the operation did not complete; include the
-  diagnostic and observed state. Do not retry automatically.
-- `recovered_after_timeout=true`: the underlying write timed out and read-back
-  determined the outcome.
-- Unsupported placement values fail before HTTP and make no mutation.
+Indented text in, tree out. Costs 2d−1 calls for depth *d*, independent of
+width: create a level, read back the UUIDs Logseq assigned, create the next.
 
-## Property workflow
+The read-back between levels is structural, not defensive. Creation returns no
+UUIDs and no field resolves a title, so children have no way to name their
+parents until the level above exists.
 
-### Create or update a property
+Indent width is taken from the first indented line, so 2-space and 4-space both
+work if consistent. Skipping a level raises.
 
-1. Call `get_all_properties` and check for an existing exact title/ident.
-2. Choose a valid schema type: `date`, `number`, `checkbox`, `default`,
-   `string`, `node`, `url`, `datetime`, `json`, or `asset`.
-  Built-in definitions may display internal types such as `map`, `page`,
-  `class`, or `property`; these are not accepted user-property creation types.
-3. Call `upsert_property(title, schema, options)` once.
-4. Retain the generated ident from `verified_state`.
-5. Do not retry blindly if the tool reports an ambiguous timeout.
+There is no transaction. A failure at level three leaves levels one and two in
+place; the error names which level stopped.
 
-### Remove a property
+### Editing and deleting
 
-1. Use `get_property` only when the conversation needs a visible confirmation
-  snapshot before deletion. `remove_property` performs its own exact
-  `getProperty` preflight and refuses missing or mismatched idents before
-  mutation.
-2. Confirm the exact namespaced ident with the user. Explain that property
-  removal is destructive and removes the definition plus stored values.
-3. Call `remove_property(property_ident)` only after confirmation. Do not pass a
-  display title.
-4. The server verifies that `get_property` returns no entity afterward.
-5. The server also verifies that no direct attribute use or property-created
-  value entity remains. `previous_state` retains the removed definition and
-  its pre-delete usage evidence gathered by `remove_property` itself.
+```
+updateBlock(block_uuid, title)
+removeBlock(block_uuid)
+```
 
-### Block properties
+`removeBlock` takes the whole subtree and verifies every descendant is absent,
+not just the root. Subtrees over 1000 nodes are refused rather than partially
+deleted — it will not delete what it cannot verify.
 
-- Use `upsert_block_property` with an exact block UUID, exact property
-  ident, typed value, and optional options object. Never pass a property display
-  name. The raw verified shape is `[block_uuid, property_ident, value, options]`;
-  the MCP supplies `{}` when options are omitted.
-- `remove_block_property` remains available for cleanup of an existing
-  value. Verify exact absence afterward.
+There is **no move**. No route exists for it.
 
-### Page properties
+---
 
-- Use `upsert_page_property` with an exact page UUID, exact property ident,
-  typed value, and optional options object. It uses Logseq's same DB property
-  route as block properties, but validates that the target UUID is a page before
-  mutation.
-- Use `remove_page_property` to remove a property value from a page and verify
-  exact absence afterward.
-- Prefer tag properties when every page with a tag should expose the same field;
-  prefer page properties for values specific to one page.
+## Properties
 
-## Tag workflow
+### Definition versus value
 
-### Discover and create
+Four tools, two different entities:
 
-- Use `get_all_tags`, `get_tag`, or `get_tags_by_name` before creating
-  a tag.
-- Call `create_tag` only when no existing exact tag is suitable.
-- Retain the returned tag UUID and ident.
-- Direct API creation commonly generates a plugin-namespaced ident and extends
-  Root automatically. Read and retain the returned values; never construct the
-  ident from the title.
-- Use `rename_tag(tag_uuid, new_title)` to rename an exact tag.
-- A rename changes title/name fields but leaves the generated ident unchanged.
-  Treat the ident and UUID as durable identities. After a rename,
-  `get_tag(old_title)` may still resolve through the old title fragment in
-  the unchanged ident, while `get_tags_by_name(old_title)` returns nothing.
-  Use UUID or exact ident when lookup semantics matter.
-- Use `delete_tag(tag_uuid)` only after explicit confirmation. It permanently
-  removes the tag, verifies that `get_tag` returns no entity, and returns the
-  deleted snapshot in `previous_state`. It also verifies that no `:block/tags`
-  or `:block/refs` datoms still point to the deleted tag. Deleting an in-use
-  tag removes assignments/references graph-wide without deleting the tagged
-  entities. If child tags extend the target tag, the tool refuses before
-  mutation unless `acknowledge_child_reparent=true` is supplied because Logseq
-  reparents those children.
+| | Definition | Value on a target |
+| --- | --- | --- |
+| create | `createProperty(title, schema)` | `addProperty(uuid, ident, value)` |
+| remove | `deleteProperty(ident)` | `removeProperty(uuid, ident)` |
+| keyed by | `:db/ident` | target UUID + ident |
 
-### Tag properties and inheritance
+Choosing wrong yields a silent no-op, so confirm which you mean before calling.
 
-- `add_tag_property(tag_uuid, property_ident)` adds a property to a tag.
-  It updates `:logseq.property.class/properties`; the property also appears in
-  the tag's structural refs.
-- `remove_tag_property(tag_uuid, property_ident)` removes it. The server
-  resolves the property ident to the UUID form required by Logseq.
-- `remove_tag_extends(tag_uuid, parent_tag_uuid)` removes inheritance.
-- `set_tag_parent(tag_uuid, parent_tag_uuid, acknowledge_replacement=false)`
-  sets one parent through Logseq's `addTagExtends` route. If the child already
-  has a different parent, the tool refuses before mutation unless replacement
-  is explicitly acknowledged.
-- `set_tag_parent` and `remove_tag_extends` require exact child and parent tag
-  UUIDs. Do not pass titles or numeric ids.
+### Creating a definition
 
-### Tagging a page or block
+```
+createProperty("Effort", {"type": "number"})
+```
 
-- `create_top_level_block(page_uuid, title, tag_uuids)` can apply tags in
-  the same creation call.
-- `add_block_tag` and `remove_block_tag` require an exact block UUID and exact
-  tag UUID. They reject page UUIDs before mutation. The MCP does not resolve
-  display titles for these writes. These tools use the graph-worker path
-  because it remained responsive when the equivalent DB HTTP aliases timed out
-  in mixed write sequences.
-- `add_page_tag` and `remove_page_tag` require an exact page UUID and exact tag
-  UUID. They use the native DB tag route because the graph-worker block path is
-  block-only: a live probe on 2026-09-03 against Logseq 2.0.1 confirmed the CLI
-  rejects a page UUID with `invalid-source: source must be a non-page block`.
-  Page tags therefore have no CLI fallback and remain exposed to the ambiguous
-  HTTP write-circuit-breaker risk that block tags no longer have.
-- Do not insert `#tag` text as a substitute for changing `:block/tags`.
+A **plain title**, never a namespaced ident — Logseq treats the first argument
+as a page name and rejects the `/`.
 
-## Block icons
+Types: `default` (text), `number`, `string`, `datetime`, `checkbox`, `url`,
+`node`, `page`, `class`, `property`, `map`.
 
-- `set_block_icon` requires an exact block UUID, `icon_type` of
-  `tabler-icon` or `emoji`, and the icon name. Use a Tabler id such as `test` or
-  the exact emoji-mart display name.
-- `remove_block_icon` removes the icon from an exact block UUID.
+The namespace comes from caller identity and cannot be chosen. An explicit
+ident in the schema is accepted and silently discarded. **Retain the ident
+returned in `verified_state`** — for plugin properties it is predictable
+(`:plugin.property.<caller>/<Title>`, no suffix), but read it rather than
+constructing it.
+
+### Setting a value
+
+```
+addProperty(target_uuid, ":plugin.property._test_plugin/Effort", 5)
+```
+
+Target may be a page or a block.
+
+**Reference types take an entity, not a literal.** `node`, `page`, `class`, and
+`property` values are entity ids. So are closed enums: call `listClosedValues`
+and pass one of the listed entities. `Status` renders as "Doing" but is stored
+as a reference.
+
+Cardinality matters. `many` adds to a set; `one` replaces.
+
+### The namespace sandbox
+
+Writes reach only `plugin.property.<caller>/*`. Everything else is read-only:
+
+| Namespace | Source | Writable |
+| --- | --- | --- |
+| `plugin.property.<caller>/*` | this API | yes |
+| `user.property/*` | the Logseq UI | no |
+| `:logseq.property/*` | built-in | no |
+
+The server rejects out-of-namespace idents **before** the call, so the failure
+is a clear error rather than a silent no-op. This is Logseq's restriction, not
+the server's — there is no workaround, and the user should be told plainly
+rather than watching attempts fail.
+
+### Deleting a definition
+
+```
+deleteProperty(":plugin.property._test_plugin/Effort")
+```
+
+Graph-wide, taking every value with it, and **not reversible** — recreating
+mints a new entity and the old values do not return.
+
+Run `getProperyUsers(ident)` first. An empty result makes this safe; anything
+else is data you are about to destroy.
+
+This route is **untested**. The UUID form is confirmed to do nothing; whether
+the ident form works has not been established. Check `verified`.
+
+---
+
+## Tags
+
+### Creating
+
+```
+creatTag(title)
+```
+
+The ident carries a random suffix (`:user.class/xzy-bc0auNqC`), so it cannot be
+derived from the title and must be read back.
+
+### Attaching and detaching
+
+```
+addTag(target_uuid, tag_uuid)
+removeTag(target_uuid, tag_uuid)
+```
+
+**Target first.** Both arguments are UUIDs; the tag's ident will not work.
+Target may be a page or a block.
+
+`removeTag` removes one relation. Other tags survive and so does the tag
+entity.
+
+There is no `upsertNodes` route for removal: `operation` offers only `add` and
+`edit`, with no retraction verb. Expressing removal as an upsert would mean
+overwriting the entire tag set — and a page that loses `:logseq.class/Page`
+stops being a page. The dedicated route cannot make that mistake; the server
+also checks for it after every tag change.
+
+### Deleting
+
+```
+deleteTag(tag_uuid)
+```
+
+**Unverified route.** It goes through `deletePage`, which has never been run
+against a tag, and whose identifier type is unconfirmed. Check `verified`.
+
+Run `getTagUsers(uuid)` first. Deleting a tag with child tags requires
+`acknowledge_child_reparent=true`.
+
+---
+
+## When a write reports verified=false
+
+Read `previous_state` and `observed_state`. Identical means nothing happened —
+almost always an identifier of the wrong type. Different means something
+happened, but not what was asked, which is more serious.
+
+Do not retry. A repeat with the same arguments produces the same silent
+no-op, and if the first call *did* land, a second may duplicate it.
+
+Resolve the identifier and re-read the target before trying anything else. See
+`troubleshooting.md` for ambiguous timeouts and `writes_disabled`.

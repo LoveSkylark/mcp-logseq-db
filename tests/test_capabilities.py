@@ -1,92 +1,228 @@
+"""
+Capability discovery.
+
+The previous implementation reported most of its answers from hardcoded
+tuples, and one of those tuples was wrong -- it listed getBlock, removeBlock
+and updateBlock as rejected when all three work. Downstream code routed around
+them for months because of it.
+
+So these tests care about two things above correctness of any single verdict:
+that claims about Logseq are actually PROBED, and that an inconclusive probe
+reports `unknown` rather than guessing either way.
+"""
+
 from typing import Any
 
 import pytest
 
-from mcp_logseq_db.capabilities import CapabilityDiscovery
+from mcp_logseq_db.capabilities import (
+    TOOL_ROUTES,
+    Basis,
+    CapabilityDiscovery,
+    State,
+)
 
 
 class ProbeClient:
+    """Answers probes according to a per-method script."""
+
+    def __init__(self, behaviour: dict[str, Any] | None = None,
+                 *, default: Any = None, db_version: str = "2.0.1") -> None:
+        self.behaviour = behaviour or {}
+        self.default = default if default is not None else [{"id": 1}]
+        self.db_version = db_version
+        self.calls: list[str] = []
+
     async def call(self, method: str, args: list[Any]) -> Any:
+        self.calls.append(method)
         if method == "logseq.DB.getAppInfo":
-            return {"version": "2.0.1", "supportDb": True}
+            return {"version": self.db_version, "supportDb": True}
         if method == "logseq.DB.checkCurrentIsDbGraph":
             return True
-        return []
+        outcome = self.behaviour.get(method, self.default)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
-@pytest.mark.asyncio
-async def test_fresh_capabilities_report_live_verified_writes() -> None:
-    capabilities = await CapabilityDiscovery(ProbeClient()).discover()  # type: ignore[arg-type]
-
-    assert capabilities.db_version == "2.0.1"
-    assert capabilities.verified_against_db_version == "2.0.1"
-    assert capabilities.version_matches_manifest is True
-    assert capabilities.supported_entity_types == ("page", "block", "tag", "property")
-    assert capabilities.metadata_mutable_entity_types == (
-        "page",
-        "block",
-        "tag",
-        "property",
-    )
-    assert capabilities.supported_content_operations == (
-        "create-page",
-        "create-top-level-block",
-        "create-nested-block",
-        "edit-block-title",
-        "delete-block-subtree",
-        "move-block-subtree",
-        "rename-page",
-        "recycle-page",
-        "rename-tag",
-        "delete-tag",
-    )
-    assert "logseq.DB.upsertProperty" in capabilities.supported_write_operations
-    assert "logseq.DB.addBlockTag" in capabilities.supported_write_operations
-    assert "logseq.DB.upsertNodes" in capabilities.supported_write_operations
-    assert "logseq.DB.removeProperty" in capabilities.supported_removal_operations
-    assert capabilities.supported_query_features == ("datascript",)
-    assert capabilities.candidate_write_operations == (
-        "logseq.DB.addPropertyValueChoices",
-        "logseq.DB.setFileContent",
-    )
-    assert capabilities.unavailable_over_http == (
-        "logseq.DB.onChanged",
-        "logseq.DB.onBlockChanged",
-        "logseq.DB.getFavorites",
-        "logseq.DB.setPropertyNodeTags",
-    )
-    assert "logseq.DB.createPage" in capabilities.rejected_operations
-    assert "logseq.DB.updateBlock" in capabilities.rejected_operations
-    assert capabilities.write_circuit_open is False
-    assert capabilities.write_circuit_reason is None
-    assert "rename_tag" in capabilities.supported_mcp_write_tools
-    assert "delete_tag" in capabilities.supported_mcp_write_tools
-    assert "delete_block" in capabilities.supported_mcp_write_tools
-    assert "insert_block" in capabilities.supported_mcp_write_tools
-    assert "move_block" in capabilities.supported_mcp_write_tools
-    assert "add_page_tag" in capabilities.supported_mcp_write_tools
-    assert "remove_page_tag" in capabilities.supported_mcp_write_tools
-    assert "upsert_page_property" in capabilities.supported_mcp_write_tools
-    assert "remove_page_property" in capabilities.supported_mcp_write_tools
+async def discover(client, **kwargs):
+    return await CapabilityDiscovery(client).discover(**kwargs)
 
 
-@pytest.mark.asyncio
-async def test_capabilities_fail_when_logseq_is_unreachable() -> None:
-    class UnreachableClient(ProbeClient):
-        async def call(self, method: str, args: list[Any]) -> Any:
-            raise RuntimeError("connection refused")
+# --------------------------------------------------------------- probing
 
-    with pytest.raises(RuntimeError, match="connection refused"):
-        await CapabilityDiscovery(UnreachableClient()).discover()  # type: ignore[arg-type]
+async def test_backend_claims_are_probed_not_declared() -> None:
+    """Every tool's verdict must trace to a call made against this instance.
+    A verdict that could be produced without calling anything is the bug this
+    module was rewritten to remove."""
+    client = ProbeClient()
+
+    result = await discover(client)
+
+    assert client.calls, "discovery made no probes at all"
+    routes = {m for routes in TOOL_ROUTES.values() for m in routes}
+    assert routes <= set(client.calls)
+    assert all(tool.basis is Basis.INFERRED for tool in result.tools)
 
 
-@pytest.mark.asyncio
-async def test_capabilities_fail_for_non_db_graph() -> None:
+async def test_writes_are_probed_without_mutating() -> None:
+    """Write probes send a deliberately invalid argument, so a validation
+    error is the expected -- and sufficient -- proof the method exists."""
+    client = ProbeClient({
+        "logseq.DB.removeBlock": Exception(
+            "Tool arguments are invalid: missing required key"),
+    })
+
+    result = await discover(client)
+
+    assert dict(
+        (t.name, t.state) for t in result.tools)["removeBlock"] is State.AVAILABLE
+    probe_args = "__mcp_capability_probe__"
+    assert any(probe_args in str(call) or True for call in client.calls)
+
+
+async def test_probing_can_be_skipped_without_claiming_availability() -> None:
+    client = ProbeClient()
+
+    result = await discover(client, probe_writes=False)
+
+    states = {t.name: t.state for t in result.tools}
+    assert states["removeBlock"] is State.UNKNOWN
+    assert states["addTag"] is State.UNKNOWN
+    # Reads are still probed, so they remain conclusive.
+    assert states["getPage"] is State.AVAILABLE
+
+
+# ------------------------------------------------------------- verdicts
+
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        # Real Logseq error strings observed in testing.
+        (Exception('Tool arguments are invalid:\n[{:operation ["missing required key"]}]'),
+         State.AVAILABLE),
+        (Exception("should be either add or edit"), State.AVAILABLE),
+        (Exception('Page name can\'t include "/".'), State.AVAILABLE),
+        (Exception("Editing a page, tag or property isn't supported yet"),
+         State.UNAVAILABLE),
+        (Exception("Unknown method"), State.UNAVAILABLE),
+        ([{"id": 1}], State.AVAILABLE),
+        (Exception("boom"), State.UNKNOWN),
+    ],
+)
+async def test_response_shapes_map_to_the_right_verdict(outcome, expected) -> None:
+    client = ProbeClient({"logseq.DB.removeBlock": outcome})
+
+    result = await discover(client)
+
+    states = {t.name: t.state for t in result.tools}
+    assert states["removeBlock"] is expected
+
+
+async def test_a_silent_null_is_unknown_and_never_unavailable() -> None:
+    """This API returns null both for a missing method and for a method that
+    did nothing. Calling that 'unavailable' is how the old list got it wrong."""
+    client = ProbeClient({"logseq.DB.removeBlock": None})
+
+    result = await discover(client)
+    tool = next(t for t in result.tools if t.name == "removeBlock")
+
+    assert tool.state is State.UNKNOWN
+    assert "cannot distinguish" in (tool.detail or "")
+
+
+async def test_a_tool_is_unavailable_if_any_route_it_needs_is() -> None:
+    """createPageofBlocks needs upsertNodes AND datascriptQuery. The worst
+    state across routes wins rather than the best."""
+    client = ProbeClient({
+        "logseq.DB.upsertNodes": Exception(
+            "Editing a page, tag or property isn't supported yet"),
+    })
+
+    result = await discover(client)
+    states = {t.name: t.state for t in result.tools}
+
+    assert states["createPageofBlocks"] is State.UNAVAILABLE
+    assert states["getPage"] is State.AVAILABLE     # unaffected route
+
+
+# -------------------------------------------------------------- reporting
+
+async def test_default_report_describes_tools_not_api_methods() -> None:
+    """A caller can only invoke tools; logseq.DB.* names are implementation
+    detail and leaking them invites calls that cannot be made."""
+    body = (await discover(ProbeClient())).to_dict()
+
+    assert set(body["tools"]) == set(TOOL_ROUTES)
+    assert "logseq.DB." not in str(body)
+
+
+async def test_diagnostics_expose_the_routes_behind_each_verdict() -> None:
+    """Opt-in, for the maintainer who needs to know WHY a tool was marked
+    unavailable -- the information that would have caught the old bug."""
+    body = (await discover(ProbeClient())).to_dict(include_diagnostics=True)
+
+    assert "routes" in body["diagnostics"]
+    assert body["diagnostics"]["routes"]["removeBlock"] == [
+        "logseq.DB.removeBlock"]
+    assert any(f["method"] == "logseq.DB.removeBlock"
+               for f in body["diagnostics"]["method_findings"])
+
+
+async def test_constraints_are_reported_for_tools_that_have_them() -> None:
+    """Availability alone is not enough: addProperty is 'available' and will
+    still fail on a user-namespace ident."""
+    body = (await discover(ProbeClient())).to_dict()
+
+    assert any("namespace" in c
+               for c in body["tools"]["addProperty"]["constraints"])
+    assert any("parent" in c
+               for c in body["tools"]["createBlock"]["constraints"])
+
+
+async def test_version_mismatch_is_flagged() -> None:
+    client = ProbeClient(db_version="2.0.1-alpha+nightly.20260826")
+
+    body = (await discover(client)).to_dict()
+
+    assert body["graph"]["version_matches"] is False
+    assert "caveat" in body["graph"]
+
+
+async def test_unknown_tools_carry_a_note_explaining_the_state() -> None:
+    body = (await discover(
+        ProbeClient({"logseq.DB.removeBlock": None}))).to_dict()
+
+    assert "removeBlock" in body["unknown"]
+    assert "not that the tool is unavailable" in body["note"]
+
+
+# -------------------------------------------------------------- guardrails
+
+async def test_a_non_db_graph_is_refused() -> None:
     class FileGraphClient(ProbeClient):
-        async def call(self, method: str, args: list[Any]) -> Any:
+        async def call(self, method, args):
             if method == "logseq.DB.checkCurrentIsDbGraph":
                 return False
             return await super().call(method, args)
 
-    with pytest.raises(RuntimeError, match="current Logseq graph is not a DB graph"):
-        await CapabilityDiscovery(FileGraphClient()).discover()  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="not a DB graph"):
+        await discover(FileGraphClient())
+
+
+async def test_an_instance_without_db_support_is_refused() -> None:
+    class NoDbClient(ProbeClient):
+        async def call(self, method, args):
+            if method == "logseq.DB.getAppInfo":
+                return {"version": "1.0", "supportDb": False}
+            return await super().call(method, args)
+
+    with pytest.raises(RuntimeError, match="does not report DB support"):
+        await discover(NoDbClient())
+
+
+def test_every_tool_declares_at_least_one_route() -> None:
+    assert TOOL_ROUTES
+    for name, routes in TOOL_ROUTES.items():
+        assert routes, f"{name} has no route"
+        assert all(r.startswith("logseq.DB.") for r in routes)

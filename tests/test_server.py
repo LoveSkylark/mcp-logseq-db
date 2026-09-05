@@ -1,145 +1,173 @@
+"""
+The MCP surface.
+
+Two things matter here and nothing else does: which tools exist, and what a
+caller sees when one fails. The behaviour behind each tool is covered by
+test_content and test_mutations against fakes that model the graph; repeating
+it through the server layer would only test the wiring twice.
+"""
+
+import json
 from typing import Any
-from collections import deque
 
 import pytest
-from mcp import Client
+from mcp.server.mcpserver.exceptions import ToolError
 
+from mcp_logseq_db.capabilities import TOOL_ROUTES
 from mcp_logseq_db.server import create_server
+
+# The contract. A tool added or renamed without updating this set is a change
+# to the public surface, so it should require a deliberate edit here.
+EXPECTED_TOOLS = {
+    "capabilities",
+    # Pages
+    "getPageUUID", "getPage",
+    # Blocks
+    "getBlockUUID", "getBlock", "getBlockTree", "createBlock",
+    "createManyBlocks", "createPageofBlocks", "updateBlock", "removeBlock",
+    # Tags
+    "getTagUUID", "getTag", "getTagUsers", "creatTag", "deleteTag",
+    "addTag", "removeTag",
+    # Properties
+    "getPropertyIndent", "getProperyUsers", "createProperty",
+    "deleteProperty", "addProperty", "removeProperty",
+    # Lists
+    "listPages", "listJournals", "listTags", "listProperties",
+    "listClosedValues", "listOrphanTags", "listOrphanProperties",
+    "listAssets", "listStatus", "listRecycled",
+}
+
+# Removed in the rewrite. Each is listed with why, so a future reader does not
+# restore one by assuming it was an oversight.
+REMOVED_TOOLS = {
+    "insert_block":            "no verified route; nesting is createBlock",
+    "move_block":              "no verified route at all",
+    "create_top_level_block":  "createBlock covers page and block parents",
+    "add_page_tag":            "a page is a block; addTag takes either",
+    "remove_page_tag":         "a page is a block; removeTag takes either",
+    "add_block_tag":           "renamed to addTag",
+    "remove_block_tag":        "renamed to removeTag",
+    "upsert_page_property":    "a page is a block; addProperty takes either",
+    "upsert_block_property":   "renamed to addProperty",
+    "set_block_icon":          "no tool needs it",
+    "remove_block_icon":       "no tool needs it",
+    "rename_tag":              "routed through renamePage; untested",
+    "add_tag_property":        "no tool needs it",
+    "set_tag_parent":          "no tool needs it",
+    "delete_page":             "documented as an alias of recycle_page",
+    "recycle_page":            "reversibility unresolved; neither exposed",
+    "search":                  "not in the tool surface",
+    "get_page_data":           "replaced by getPage with a detail selector",
+    "datascript_query":        "no raw query escape hatch is exposed",
+}
 
 
 class FakeClient:
+    write_policy = None
+    writable_property_prefix = "plugin.property._test_plugin/"
+
+    def __init__(self, responses: dict[str, Any] | None = None) -> None:
+        self.responses = responses or {}
+        self.calls: list[tuple[str, list[Any]]] = []
+
     async def call(self, method: str, args: list[Any]) -> Any:
-        return []
+        self.calls.append((method, args))
+        outcome = self.responses.get(method, [])
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
-class RecordingClient(FakeClient):
-    def __init__(self, responses: list[Any]) -> None:
-        self.responses = deque(responses)
-
-    async def call(self, method: str, args: list[Any]) -> Any:
-        response = self.responses.popleft()
-        if isinstance(response, Exception):
-            raise response
-        return response
+async def tool_names() -> set[str]:
+    server = create_server(FakeClient())  # type: ignore[arg-type]
+    return {tool.name for tool in await server.list_tools()}
 
 
-@pytest.mark.asyncio
-async def test_server_exposes_only_verified_read_tools() -> None:
+# ----------------------------------------------------------- the surface
+
+async def test_server_exposes_exactly_the_expected_tools() -> None:
+    assert await tool_names() == EXPECTED_TOOLS
+
+
+@pytest.mark.parametrize(
+    ("name", "reason"), sorted(REMOVED_TOOLS.items()))
+async def test_removed_tools_stay_removed(name: str, reason: str) -> None:
+    assert name not in await tool_names(), f"{name} was removed: {reason}"
+
+
+async def test_every_exposed_tool_has_a_route_or_is_meta() -> None:
+    """A tool with no entry in TOOL_ROUTES cannot be reported by capabilities,
+    so it would be invisible to a caller checking availability."""
+    names = await tool_names()
+    unrouted = names - set(TOOL_ROUTES) - {"capabilities", "getBlockTree"}
+    assert not unrouted, f"tools with no declared route: {sorted(unrouted)}"
+
+
+async def test_no_tool_name_leaks_the_api_method_it_uses() -> None:
+    assert not any(name.startswith("logseq") for name in await tool_names())
+
+
+async def test_every_tool_has_a_description() -> None:
+    """The description carries the constraints -- which identifier a tool
+    takes, whether a route is unverified. A tool without one is a trap."""
+    server = create_server(FakeClient())  # type: ignore[arg-type]
+    missing = [t.name for t in await server.list_tools() if not t.description]
+    assert not missing
+
+
+# ------------------------------------------------------- error envelope
+
+async def test_failures_are_returned_as_a_structured_envelope() -> None:
+    """A caller needs to distinguish a bad argument from a Logseq error from
+    a write that silently did nothing, so the stage is machine-readable."""
     server = create_server(FakeClient())  # type: ignore[arg-type]
 
-    tools = await server.list_tools()
+    with pytest.raises(ToolError) as caught:
+        await server.call_tool("getTag", {"tag_uuid": "TAG-TEST"})
 
-    assert {tool.name for tool in tools} == {
-        "capabilities",
-        "check_current_is_db_graph",
-        "get_app_info",
-        "get_current_graph",
-        "list_pages",
-        "get_page_data",
-        "search",
-        "list_properties",
-        "list_tags",
-        "upsert_nodes",
-        "get_block",
-        "get_block_tree",
-        "create_page",
-        "create_top_level_block",
-        "insert_block",
-        "delete_block",
-        "move_block",
-        "upsert_block",
-        "rename_page",
-        "delete_page",
-        "recycle_page",
-        "datascript_query",
-        "get_all_properties",
-        "get_property",
-        "get_all_tags",
-        "get_tag",
-        "get_tags_by_name",
-        "get_tag_objects",
-        "upsert_property",
-        "remove_property",
-        "create_tag",
-        "rename_tag",
-        "delete_tag",
-        "add_tag_property",
-        "remove_tag_property",
-        "set_tag_parent",
-        "remove_tag_extends",
-        "upsert_block_property",
-        "remove_block_property",
-        "upsert_page_property",
-        "remove_page_property",
-        "add_block_tag",
-        "remove_block_tag",
-        "add_page_tag",
-        "remove_page_tag",
-        "set_block_icon",
-        "remove_block_icon",
-    }
+    payload = json.loads(str(caught.value))
+    assert payload["verified"] is False
+    assert payload["failure_stage"] == "validation"
+    assert "title or name" in payload["diagnostic"]
+    assert payload["suggestion"]
 
 
-@pytest.mark.asyncio
-async def test_direct_read_failure_is_visible_to_mcp_client() -> None:
-    class ErrorClient(FakeClient):
-        async def call(self, method: str, args: list[Any]) -> Any:
-            raise RuntimeError("Logseq DB worker may be wedged")
+async def test_a_wrong_identifier_type_is_refused_before_the_api() -> None:
+    client = FakeClient()
+    server = create_server(client)  # type: ignore[arg-type]
 
-    async with Client(create_server(ErrorClient())) as client:  # type: ignore[arg-type]
-        result = await client.call_tool("search", {"query": "test"})
+    with pytest.raises(ToolError):
+        await server.call_tool(
+            "addTag",
+            {"target_uuid": ":user.class/xzy", "tag_uuid": "TAG-TEST"})
 
-    assert result.is_error is True
-    assert "DB worker may be wedged" in result.content[0].text
-    assert '"failure_stage": "readback_mismatch"' in result.content[0].text
+    assert client.calls == []
 
 
-@pytest.mark.asyncio
-async def test_validation_failure_returns_diagnostic_envelope() -> None:
-    async with Client(create_server(FakeClient())) as client:  # type: ignore[arg-type]
-        result = await client.call_tool("get_block", {"block_uuid": "not-a-uuid"})
+async def test_the_offending_argument_is_named() -> None:
+    """addTag takes two UUIDs; a message that does not say which one is wrong
+    leaves the caller guessing."""
+    server = create_server(FakeClient())  # type: ignore[arg-type]
+    good = "6a9a1a1c-cede-430f-8768-7a3609d4039b"
 
-    assert result.is_error is True
-    assert '"verified": false' in result.content[0].text
-    assert '"failure_stage": "validation"' in result.content[0].text
-    assert "Expected an exact UUID" in result.content[0].text
-    assert '"suggestion": "Use block_uuid as the exact UUID of a block."' in result.content[0].text
+    with pytest.raises(ToolError) as caught:
+        await server.call_tool(
+            "addTag", {"target_uuid": good, "tag_uuid": "not-a-uuid"})
 
-
-@pytest.mark.asyncio
-async def test_move_validation_failure_suggests_public_input_format() -> None:
-    async with Client(create_server(FakeClient())) as client:  # type: ignore[arg-type]
-        result = await client.call_tool(
-            "move_block",
-            {"block_uuid": "bad", "target_uuid": "also-bad", "placement": "child"},
-        )
-
-    assert result.is_error is True
-    assert "Use distinct exact block and target UUIDs" in result.content[0].text
-    assert "positional" not in result.content[0].text
+    assert "tag_uuid" in json.loads(str(caught.value))["diagnostic"]
 
 
-@pytest.mark.asyncio
-async def test_mutation_verification_failure_returns_observed_state() -> None:
-    block_uuid = "87654321-4321-8765-4321-876543218765"
-    ident = ":user.property/status"
-    previous = {"id": 11, "uuid": block_uuid, ident: "before"}
-    observed = {"id": 11, "uuid": block_uuid, ident: "unexpected"}
-    client_impl = RecordingClient([
-        {"ident": ident, "id": 42, "type": "default"},
-        previous,
-        {"ok": True},
-        observed,
-        ["unexpected"],
-    ])
+# --------------------------------------------------------- probe_writes
 
-    async with Client(create_server(client_impl)) as client:  # type: ignore[arg-type]
-        result = await client.call_tool(
-            "upsert_block_property",
-            {"block_uuid": block_uuid, "property_ident": ident, "value": "expected"},
-        )
+async def test_probe_writes_setting_reaches_capability_discovery() -> None:
+    """Off, capabilities makes ~11 fewer calls and marks writes unknown."""
+    client = FakeClient({
+        "logseq.DB.getAppInfo": {"version": "2.0.1", "supportDb": True},
+        "logseq.DB.checkCurrentIsDbGraph": True,
+    })
+    server = create_server(client, probe_writes=False)  # type: ignore[arg-type]
 
-    assert result.is_error is True
-    assert '"error_type": "MutationVerificationError"' in result.content[0].text
-    assert '"previous_state": {"id": 11' in result.content[0].text
-    assert '"observed_state": {"id": 11' in result.content[0].text
+    await server.call_tool("capabilities", {})
+
+    assert not any(method == "logseq.DB.removeBlock"
+                   for method, _ in client.calls)

@@ -40,10 +40,27 @@ class VerifiedWriteHelpers:
         """
         return require_uuid(value, role=role)
 
-    def _require_title(self, title: Any) -> str:
-        """Validate the title, then apply any configured write scope."""
+    @staticmethod
+    def _validate_title(title: Any) -> str:
+        """
+        Check that a title is usable, without applying any write scope.
+
+        Used for block content. LOGSEQ_WRITE_TITLE_PREFIXES scopes which NAMED
+        ENTITIES may be created -- pages, tags, properties. Applying it to
+        block bodies too would mean every sentence written into the graph had
+        to begin with the operator's prefix, which is not what it is for.
+        """
         if not isinstance(title, str) or not title.strip():
             raise ValueError(f"Expected a non-empty title, got {title!r}")
+        return title
+
+    def _require_title(self, title: Any) -> str:
+        """
+        Validate a NAMED ENTITY title, then apply any configured write scope.
+
+        For block content use `_validate_title`, which skips the scope.
+        """
+        self._validate_title(title)
         policy = getattr(self._client, "write_policy", None)
         if policy is not None:
             policy.require_title(title)

@@ -1,0 +1,24 @@
+[tool.pytest.ini_options]
+# `src` is also forced to the front of sys.path by tests/conftest.py. Both are
+# kept: this covers plain collection, conftest covers invocation differences
+# between `pytest` and `python -m pytest`.
+pythonpath = ["src"]
+
+# importlib mode stops pytest from inserting test directories into sys.path,
+# which is what lets an installed copy shadow the working tree.
+addopts = "--import-mode=importlib -ra --strict-markers"
+
+testpaths = ["tests"]
+
+asyncio_mode = "auto"
+# Pinned explicitly: pytest-asyncio 0.24 warns without it and 1.0 changes the
+# default, so leaving it unset makes behaviour depend on the installed version.
+asyncio_default_fixture_loop_scope = "function"
+
+markers = [
+    "live: requires a running Logseq with LOGSEQ_API_TOKEN set. Deselected in Docker and CI with `-m 'not live'`.",
+]
+
+filterwarnings = [
+    "error::DeprecationWarning:mcp_logseq_db.*",
+]
