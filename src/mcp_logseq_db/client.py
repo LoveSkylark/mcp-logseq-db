@@ -65,7 +65,8 @@ WRITE_METHODS = frozenset({
     "logseq.DB.updateBlock",            # updateBlock
     "logseq.DB.removeBlock",            # removeBlock
     "logseq.DB.createTag",              # creatTag
-    "logseq.DB.deletePage",             # deleteTag
+    "logseq.DB.renamePage",             # renamePage
+    "logseq.DB.deletePage",             # deleteTag, deletePage
     "logseq.DB.addBlockTag",            # addTag
     "logseq.DB.removeBlockTag",         # removeTag
     "logseq.DB.upsertProperty",         # createProperty

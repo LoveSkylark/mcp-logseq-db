@@ -16,7 +16,9 @@ from typing import Any
 import pytest
 
 from mcp_logseq_db.capabilities import (
+    PROBE_ARGS,
     TOOL_ROUTES,
+    WRITE_PROBE_METHODS,
     Basis,
     CapabilityDiscovery,
     State,
@@ -226,3 +228,17 @@ def test_every_tool_declares_at_least_one_route() -> None:
     for name, routes in TOOL_ROUTES.items():
         assert routes, f"{name} has no route"
         assert all(r.startswith("logseq.DB.") for r in routes)
+
+
+def test_every_route_has_probe_arguments() -> None:
+    """A route with no PROBE_ARGS entry would report `unknown` forever and
+    leak its method name into the caller-facing detail. Deriving the probe set
+    from TOOL_ROUTES makes that a startup error; this pins the invariant."""
+    routes = {m for methods in TOOL_ROUTES.values() for m in methods}
+    assert routes <= set(PROBE_ARGS)
+
+
+def test_write_probes_cover_every_write_route() -> None:
+    assert "logseq.DB.upsertNodes" in WRITE_PROBE_METHODS
+    assert "logseq.DB.renamePage" in WRITE_PROBE_METHODS
+    assert "logseq.DB.datascriptQuery" not in WRITE_PROBE_METHODS

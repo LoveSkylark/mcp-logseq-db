@@ -105,6 +105,10 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     # Pages
     "getPageUUID":          ("logseq.DB.datascriptQuery",),
     "getPage":              ("logseq.DB.datascriptQuery",),
+    "createPage":           ("logseq.DB.upsertNodes",),
+    "renamePage":           ("logseq.DB.renamePage",),
+    "deletePage":           ("logseq.DB.deletePage",),
+    "clearPage":            ("logseq.DB.removeBlock",),
     # Lists
     "listPages":            ("logseq.DB.datascriptQuery",),
     "listJournals":         ("logseq.DB.datascriptQuery",),
@@ -181,6 +185,27 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "The detail selector matters: a page's own tags and its blocks' tags "
         "are different queries, and properties that are declared but unset "
         "appear in neither.",
+    ),
+    "createPage": (
+        "A title that already exists is rejected rather than duplicated; "
+        "verification could not otherwise tell the new page from the old.",
+    ),
+    "renamePage": (
+        "Verified by UUID, not by the new title -- reading back by title "
+        "cannot distinguish a rename from a second page being created.",
+    ),
+    "deletePage": (
+        "Recycles rather than destroys: the page keeps its UUID, tags, refs "
+        "and blocks, and stops appearing in listPages.",
+        "Inbound references are NOT rewritten. Entities linking to the page "
+        "keep pointing at it, so acknowledge_reference_rewrite is required "
+        "when any exist.",
+        "The identifier this route accepts is unconfirmed; the UUID is tried "
+        "first and the page name second.",
+    ),
+    "clearPage": (
+        "One call per top-level block, since no batch delete exists. The page "
+        "entity, its tags and its property values are untouched.",
     ),
     "listPages": (
         "Excludes recycled pages, which keep the Page class and would "
@@ -279,30 +304,65 @@ class DBCapabilities:
         return body
 
 
-# Read methods are safe to call for real.
-READ_PROBES: tuple[tuple[str, list[Any]], ...] = (
-    ("logseq.DB.getAllProperties", []),
-    ("logseq.DB.getAllTags", []),
-    ("logseq.DB.datascriptQuery", ["[:find ?e . :where [?e :block/uuid]]"]),
-    ("logseq.DB.getTagsByName", [BAD_ARG]),
-    ("logseq.DB.getBlock", [BAD_ARG]),
-)
+# Arguments used to probe each method. Reads get real ones; writes get
+# deliberately invalid ones, so a validation error proves the method exists
+# without mutating anything. Arity matters -- too few arguments can look like a
+# missing method rather than a rejected call.
+PROBE_ARGS: dict[str, list[Any]] = {
+    # Reads, safe to call for real.
+    "logseq.DB.getAllProperties": [],
+    "logseq.DB.getAllTags": [],
+    "logseq.DB.datascriptQuery": ["[:find ?e . :where [?e :block/uuid]]"],
+    "logseq.DB.getTagsByName": [BAD_ARG],
+    "logseq.DB.getBlock": [BAD_ARG],
+    # Writes, probed with invalid arguments.
+    "logseq.DB.upsertNodes": [[{}]],
+    "logseq.DB.updateBlock": [BAD_ARG, BAD_ARG],
+    "logseq.DB.removeBlock": [BAD_ARG],
+    "logseq.DB.renamePage": [BAD_ARG, BAD_ARG],
+    "logseq.DB.deletePage": [BAD_ARG],
+    "logseq.DB.createTag": [BAD_ARG],
+    "logseq.DB.addBlockTag": [BAD_ARG, BAD_ARG],
+    "logseq.DB.removeBlockTag": [BAD_ARG, BAD_ARG],
+    "logseq.DB.upsertProperty": [BAD_ARG, {}],
+    "logseq.DB.removeProperty": [BAD_ARG],
+    "logseq.DB.upsertBlockProperty": [BAD_ARG, BAD_ARG, BAD_ARG],
+    "logseq.DB.removeBlockProperty": [BAD_ARG, BAD_ARG],
+}
 
-# Write methods, probed with invalid arguments so nothing mutates. Arity
-# matters: too few arguments can look like a missing method.
-WRITE_PROBES: tuple[tuple[str, list[Any]], ...] = (
-    ("logseq.DB.upsertNodes", [[{}]]),
-    ("logseq.DB.updateBlock", [BAD_ARG, BAD_ARG]),
-    ("logseq.DB.removeBlock", [BAD_ARG]),
-    ("logseq.DB.deletePage", [BAD_ARG]),
-    ("logseq.DB.createTag", [BAD_ARG]),
-    ("logseq.DB.addBlockTag", [BAD_ARG, BAD_ARG]),
-    ("logseq.DB.removeBlockTag", [BAD_ARG, BAD_ARG]),
-    ("logseq.DB.upsertProperty", [BAD_ARG, {}]),
-    ("logseq.DB.removeProperty", [BAD_ARG]),
-    ("logseq.DB.upsertBlockProperty", [BAD_ARG, BAD_ARG, BAD_ARG]),
-    ("logseq.DB.removeBlockProperty", [BAD_ARG, BAD_ARG]),
-)
+# Which methods are writes, so probing can be skipped for them. Everything a
+# tool routes through and that is not a read is treated as a write.
+READ_METHODS = frozenset({
+    "logseq.DB.getAllProperties",
+    "logseq.DB.getAllTags",
+    "logseq.DB.datascriptQuery",
+    "logseq.DB.getTagsByName",
+    "logseq.DB.getBlock",
+})
+
+
+def _probe_targets() -> tuple[frozenset[str], frozenset[str]]:
+    """
+    Derive what to probe from TOOL_ROUTES rather than from a second list.
+
+    Keeping a separate probe list meant a tool could route through a method
+    nobody probed: it then reported `unknown` forever, and the unprobed method
+    name leaked into the caller-facing detail. Deriving the set means adding a
+    tool is one edit, and a route with no arguments defined fails loudly here
+    instead of silently degrading at runtime.
+    """
+    routes = {m for methods in TOOL_ROUTES.values() for m in methods}
+    undefined = routes - set(PROBE_ARGS)
+    if undefined:
+        raise RuntimeError(
+            "TOOL_ROUTES references methods with no PROBE_ARGS entry: "
+            + ", ".join(sorted(undefined))
+        )
+    return (frozenset(routes & READ_METHODS),
+            frozenset(routes - READ_METHODS))
+
+
+READ_PROBE_METHODS, WRITE_PROBE_METHODS = _probe_targets()
 
 # Kept narrow: a phrase that also matched an argument complaint would turn a
 # working method into a false unavailable -- the exact bug being fixed.
@@ -343,11 +403,14 @@ class CapabilityDiscovery:
 
         version = str(app_info["version"]) if app_info.get("version") else None
 
-        probes = list(READ_PROBES) + (list(WRITE_PROBES) if probe_writes else [])
+        methods = set(READ_PROBE_METHODS)
+        if probe_writes:
+            methods |= WRITE_PROBE_METHODS
         try:
             async with asyncio.timeout(PROBE_TIMEOUT_SECONDS):
                 results = await asyncio.gather(
-                    *(self._classify(m, a) for m, a in probes))
+                    *(self._classify(m, PROBE_ARGS[m])
+                      for m in sorted(methods)))
         except TimeoutError as error:
             raise RuntimeError(
                 "Method probes exceeded %d seconds" % PROBE_TIMEOUT_SECONDS
@@ -355,7 +418,7 @@ class CapabilityDiscovery:
 
         findings = {f.method: f for f in results}
         if not probe_writes:
-            for method, _ in WRITE_PROBES:
+            for method in WRITE_PROBE_METHODS:
                 findings.setdefault(method, MethodFinding(
                     method, State.UNKNOWN, Basis.DECLARED,
                     "write probing disabled"))
@@ -389,7 +452,8 @@ class CapabilityDiscovery:
                 f = findings.get(method)
                 states.append(
                     (f.state, f.detail) if f
-                    else (State.UNKNOWN, "route %s was not probed" % method))
+                    else (State.UNKNOWN,
+                          "a route this tool depends on was not probed"))
             state, detail = max(states, key=lambda s: order[s[0]])
             tools.append(ToolStatus(
                 name=name,

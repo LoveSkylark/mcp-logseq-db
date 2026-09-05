@@ -1,7 +1,7 @@
 # Install the Logseq DB-Native Skill
 
 This skill is for the `mcp-logseq-db` Claude Desktop server only. It must not be
-loaded together with the legacy `logseq-db-graph` or `logseq-file-graph` skill.
+loaded together with any legacy `logseq-db-graph` or `logseq-file-graph` skill.
 
 Import this `logseq-db-native` folder into Claude Desktop Skills. Restart
 Claude Desktop if the skill does not appear immediately, then enable the skill

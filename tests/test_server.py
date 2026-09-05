@@ -21,7 +21,8 @@ from mcp_logseq_db.server import create_server
 EXPECTED_TOOLS = {
     "capabilities",
     # Pages
-    "getPageUUID", "getPage",
+    "getPageUUID", "getPage", "createPage", "renamePage", "deletePage",
+    "clearPage",
     # Blocks
     "getBlockUUID", "getBlock", "getBlockTree", "createBlock",
     "createManyBlocks", "createPageofBlocks", "updateBlock", "removeBlock",
@@ -54,8 +55,7 @@ REMOVED_TOOLS = {
     "rename_tag":              "routed through renamePage; untested",
     "add_tag_property":        "no tool needs it",
     "set_tag_parent":          "no tool needs it",
-    "delete_page":             "documented as an alias of recycle_page",
-    "recycle_page":            "reversibility unresolved; neither exposed",
+    "recycle_page":            "deletePage covers it; one tool, not an alias pair",
     "search":                  "not in the tool surface",
     "get_page_data":           "replaced by getPage with a detail selector",
     "datascript_query":        "no raw query escape hatch is exposed",
@@ -76,6 +76,20 @@ class FakeClient:
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
+
+
+def error_payload(error: Exception) -> dict[str, Any]:
+    """
+    Pull the JSON envelope out of a ToolError.
+
+    The framework prefixes the message with "Error executing tool <name>: ",
+    so the string is not itself valid JSON. Slicing from the first brace is
+    enough because the envelope is the whole remainder.
+    """
+    text = str(error)
+    start = text.find("{")
+    assert start != -1, f"no JSON envelope in ToolError: {text}"
+    return json.loads(text[start:])
 
 
 async def tool_names() -> set[str]:
@@ -125,7 +139,7 @@ async def test_failures_are_returned_as_a_structured_envelope() -> None:
     with pytest.raises(ToolError) as caught:
         await server.call_tool("getTag", {"tag_uuid": "TAG-TEST"})
 
-    payload = json.loads(str(caught.value))
+    payload = error_payload(caught.value)
     assert payload["verified"] is False
     assert payload["failure_stage"] == "validation"
     assert "title or name" in payload["diagnostic"]
@@ -154,7 +168,7 @@ async def test_the_offending_argument_is_named() -> None:
         await server.call_tool(
             "addTag", {"target_uuid": good, "tag_uuid": "not-a-uuid"})
 
-    assert "tag_uuid" in json.loads(str(caught.value))["diagnostic"]
+    assert "tag_uuid" in error_payload(caught.value)["diagnostic"]
 
 
 # --------------------------------------------------------- probe_writes

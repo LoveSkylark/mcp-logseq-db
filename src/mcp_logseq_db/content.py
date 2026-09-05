@@ -44,6 +44,10 @@ from .client import LogseqDBClient, poll_readback, serialized_write
 MAX_BATCH_OPERATIONS = 100
 MAX_SUBTREE_NODES = 1000
 
+# Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
+# rebuilt, so nothing here hardcodes them.
+PROPERTY_CLASS = ":logseq.class/Property"
+
 UUID_PATTERN = re.compile(
     r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
     r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
@@ -168,13 +172,15 @@ class VerifiedContent(VerifiedWriteHelpers):
             "[:find (pull ?prop [:db/id :db/ident :block/title]) "
             "(pull ?holder [:db/id :block/uuid :block/title :block/name]) "
             "?value (pull ?value [:db/id :db/ident :block/title]) "
-            ":in $ ?page :where "
+            ":in $ ?page ?class :where "
             "(or-join [?page ?holder] "
             "[(identity ?page) ?holder] [?holder :block/page ?page]) "
-            "[?prop :block/tags 3] [?prop :db/ident ?attr] "
+            "[?prop :block/tags ?class] [?prop :db/ident ?attr] "
             "[?holder ?attr ?value]]"
         )
-        rows = await self._query_list(query, "Page property lookup", page_id)
+        rows = await self._query_list(
+            query, "Page property lookup", page_id,
+            await self._class_id(PROPERTY_CLASS))
         out = []
         for row in rows:
             if isinstance(row, list) and len(row) == 4:
@@ -332,6 +338,232 @@ class VerifiedContent(VerifiedWriteHelpers):
             "truncated": truncated,
         }
 
+    # ----------------------------------------------------------- page writes
+
+    async def create_page(
+        self, title: str, *, dry_run: bool = False
+    ) -> ContentResult:
+        """
+        Create one page.
+
+        Goes through the same batch path as block creation, so it inherits the
+        duplicate-title snapshot and the read-back. A page whose title already
+        exists is rejected rather than created, because verification could not
+        then tell the new page from the old one.
+        """
+        return await self.upsert_nodes(
+            [{"operation": "add", "entityType": "page",
+              "data": {"title": title}}],
+            dry_run=dry_run)
+
+    @serialized_write
+    async def rename_page(self, page_uuid: str, new_title: str) -> ContentResult:
+        """
+        Rename a page, verifying by UUID rather than by the new title.
+
+        Reading back by title would not distinguish a rename from Logseq having
+        created a second page and left the original alone. Reading the original
+        UUID and checking its title catches that, and also confirms the entity
+        is still a page.
+        """
+        page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+        self._require_title(new_title)
+        page = await self._page_by_uuid(page_uuid)
+
+        clashes = [e for e in await self._entities_by_title(new_title)
+                   if e["id"] != page["id"]]
+        if clashes:
+            raise ValueError(
+                f"An entity titled {new_title!r} already exists; renaming onto "
+                "it would make the two indistinguishable")
+
+        response: Any = None
+        timed_out = False
+        try:
+            response = await self._client.call(
+                "logseq.DB.renamePage", [page_uuid, new_title])
+        except httpx.TimeoutException:
+            timed_out = True
+
+        current = await poll_readback(
+            self._client,
+            lambda: self._optional_entity_by_uuid(page_uuid),
+            lambda value: value is not None and value.get("title") == new_title,
+        )
+        if current is None or current.get("title") != new_title:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "Rename was not observed. This route may take a page name "
+                    "rather than a UUID."),
+                previous_entities=(page,),
+                observed_entities=(current,) if current else ())
+        if not current.get("name"):
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic="The entity lost its page identity during the rename",
+                previous_entities=(page,), observed_entities=(current,))
+        return ContentResult(
+            validation=None, response=response, verified_entities=(current,),
+            recovered_after_timeout=timed_out, previous_entities=(page,))
+
+    @serialized_write
+    async def delete_page(
+        self, page_uuid: str, *, acknowledge_reference_rewrite: bool = False
+    ) -> ContentResult:
+        """
+        Delete a page, which on this build recycles rather than destroys it.
+
+        A recycled page keeps its UUID, tags, refs and blocks, gaining
+        :logseq.property/deleted-at. Inbound references are NOT rewritten, so
+        anything linking to it keeps pointing at a page that no longer appears
+        in listings -- which is why references are surfaced and require
+        acknowledgement.
+
+        The identifier this route wants is unconfirmed, so the UUID is tried
+        first and the page name second. Whichever worked is reported.
+        """
+        page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+        page = await self._page_by_uuid(page_uuid)
+        if page.get(":logseq.property/deleted-at") is not None:
+            raise ValueError("Page is already recycled")
+
+        blocks = await self.get_block_uuid(page_uuid)
+        inbound = await self._inbound_references(page["id"])
+        previous = (page, *blocks)
+
+        if inbound and not acknowledge_reference_rewrite:
+            return ContentResult(
+                validation=None, response=None, verified_entities=(),
+                verified=False,
+                diagnostic=(
+                    f"{len(inbound)} entities reference this page and those "
+                    "references are not rewritten on delete; set "
+                    "acknowledge_reference_rewrite=true to proceed"),
+                previous_entities=previous,
+                observed_entities=tuple(inbound))
+
+        def deleted(value: dict[str, Any] | None) -> bool:
+            # Either outcome counts: the entity may vanish, or survive carrying
+            # a deletion timestamp. Both mean the page is gone from listings.
+            return (value is None
+                    or value.get(":logseq.property/deleted-at") is not None)
+
+        response: Any = None
+        timed_out = False
+        used = "uuid"
+        try:
+            response = await self._client.call(
+                "logseq.DB.deletePage", [page_uuid])
+        except httpx.TimeoutException:
+            timed_out = True
+
+        current = await poll_readback(
+            self._client,
+            lambda: self._optional_entity_by_uuid(page_uuid),
+            deleted)
+
+        if not deleted(current) and not timed_out:
+            # The UUID form did nothing -- silently, as this API does. Fall
+            # back to the name before reporting failure.
+            used = "name"
+            try:
+                response = await self._client.call(
+                    "logseq.DB.deletePage", [page["name"]])
+            except httpx.TimeoutException:
+                timed_out = True
+            current = await poll_readback(
+                self._client,
+                lambda: self._optional_entity_by_uuid(page_uuid),
+                deleted)
+
+        if not deleted(current):
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "Deletion was not observed with either a UUID or a page "
+                    "name; the page is still present"),
+                previous_entities=previous,
+                observed_entities=(current,) if current else ())
+
+        return ContentResult(
+            validation=None, response=response,
+            verified_entities=(current,) if current else (),
+            recovered_after_timeout=timed_out,
+            diagnostic=(
+                f"Page recycled via its {used}. It keeps its UUID and tags, "
+                f"and {len(inbound)} inbound reference(s) were not rewritten."
+                if current else f"Page removed via its {used}."),
+            previous_entities=previous,
+            observed_entities=tuple(inbound))
+
+    @serialized_write
+    async def clear_page(self, page_uuid: str) -> ContentResult:
+        """
+        Delete every block on a page, keeping the page itself.
+
+        There is no batch delete, so this is one call per top-level block --
+        each taking its subtree with it. The page entity, its tags and its
+        property values are untouched.
+        """
+        page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+        page = await self._page_by_uuid(page_uuid)
+        before = await self.get_block_uuid(page_uuid)
+        top_level = await self._children_of(page_uuid)
+
+        if not top_level:
+            return ContentResult(
+                validation=None, response=None, verified_entities=(),
+                diagnostic="The page already has no blocks",
+                previous_entities=(page,))
+
+        response: Any = None
+        timed_out = False
+        for block in top_level:
+            try:
+                # A subtree deleted earlier in the loop may already have taken
+                # this block, so a miss here is expected rather than an error.
+                response = await self._client.call(
+                    "logseq.DB.removeBlock", [block["uuid"]])
+            except httpx.TimeoutException:
+                timed_out = True
+
+        remaining = await poll_readback(
+            self._client,
+            lambda: self.get_block_uuid(page_uuid),
+            lambda blocks: not blocks)
+
+        if remaining:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=f"{len(remaining)} block(s) remain on the page",
+                previous_entities=tuple(before),
+                observed_entities=tuple(remaining))
+
+        return ContentResult(
+            validation=None, response=response, verified_entities=(page,),
+            recovered_after_timeout=timed_out,
+            diagnostic=f"Removed {len(top_level)} top-level block(s)",
+            previous_entities=tuple(before))
+
+    async def _page_by_uuid(self, page_uuid: str) -> dict[str, Any]:
+        page = await self._entity_by_uuid(page_uuid)
+        if not page.get("name"):
+            raise ValueError("UUID identifies a block, not a page")
+        return page
+
+    async def _inbound_references(self, page_id: int) -> list[dict[str, Any]]:
+        query = (
+            "[:find [(pull ?entity [:db/id :block/uuid :block/title "
+            ":block/name {:block/page [:db/id :block/title]}]) ...] "
+            ":in $ ?page :where [?entity :block/refs ?page]]"
+        )
+        return await self._query_list(query, "Inbound reference lookup", page_id)
+
     # ---------------------------------------------------------- block writes
 
     async def create_block(
@@ -375,7 +607,9 @@ class VerifiedContent(VerifiedWriteHelpers):
             title = block.get("title")
             if not isinstance(title, str) or not title.strip():
                 raise ValueError(f"block {index} requires a non-empty title")
-            self._require_title(title)
+            # Block content, not a named entity -- no title scope. See
+            # VerifiedWriteHelpers._validate_title.
+            self._validate_title(title)
             operations.append({
                 "operation": "add",
                 "entityType": "block",
@@ -539,7 +773,8 @@ class VerifiedContent(VerifiedWriteHelpers):
     async def _children_of(self, parent_uuid: str) -> list[dict[str, Any]]:
         query = (
             "[:find [(pull ?child [:db/id :block/uuid :block/title "
-            ":block/order]) ...] :where "
+            ":block/order {:block/parent [:db/id]} {:block/page [:db/id]} "
+            "{:block/refs [:db/id :block/uuid]}]) ...] :where "
             f"[?parent :block/uuid #uuid \"{parent_uuid}\"] "
             "[?child :block/parent ?parent]]"
         )
@@ -570,14 +805,16 @@ class VerifiedContent(VerifiedWriteHelpers):
             return ContentResult(
                 validation=validation, response=None, verified_entities=())
 
-        # Snapshot per add so the read-back can tell a new entity from one that
-        # already carried the same title. Titles are not unique.
-        before_ids = {
-            index: {e["id"] for e in
-                    await self._entities_by_title(op["data"]["title"])}
-            for index, op in enumerate(normalized)
-            if op["operation"] == "add"
-        }
+        # Snapshot per add so the read-back can tell a new entity from one
+        # that already carried the same title. Titles are not unique, so the
+        # snapshot is scoped the same way verification is: siblings for a
+        # block, the whole graph for a page.
+        before_ids: dict[int, set[int]] = {}
+        for index, op in enumerate(normalized):
+            if op["operation"] != "add":
+                continue
+            before_ids[index] = {
+                e["id"] for e in await self._candidates_for(op)}
 
         response: Any = None
         timed_out = False
@@ -617,21 +854,39 @@ class VerifiedContent(VerifiedWriteHelpers):
         await self._verify_title_uuid_refs(entity, expected)
         return entity
 
+    async def _candidates_for(
+        self, operation: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """
+        Entities a newly added one could be confused with.
+
+        For a block that is its prospective siblings; for a page it is every
+        entity sharing the title. Narrowing to siblings is what lets two
+        sections each hold a child called "Notes".
+        """
+        title = operation["data"]["title"]
+        if operation["entityType"] != "block":
+            return await self._entities_by_title(title)
+        siblings = await self._children_of(operation["data"]["page-id"])
+        return [s for s in siblings if s.get("title") == title]
+
     async def _verify_add(
         self, operation: dict[str, Any], before: set[int]
     ) -> dict[str, Any]:
         title = operation["data"]["title"]
         matches = await poll_readback(
             self._client,
-            lambda: self._entities_by_title(title),
+            lambda: self._candidates_for(operation),
             lambda values: any(e["id"] not in before for e in values),
         )
         created = [e for e in matches if e["id"] not in before]
         if len(created) != 1:
+            scope = ("under the requested parent"
+                     if operation["entityType"] == "block" else "in the graph")
             raise RuntimeError(
-                f"Expected one new {operation['entityType']} titled {title!r}, "
-                f"found {len(created)}. This API reports success for writes "
-                "that do nothing; check the parent UUID."
+                f"Expected one new {operation['entityType']} titled {title!r} "
+                f"{scope}, found {len(created)}. This API reports success for "
+                "writes that do nothing; check the parent UUID."
             )
         entity = created[0]
 
@@ -660,7 +915,11 @@ class VerifiedContent(VerifiedWriteHelpers):
         if not isinstance(operations, list) or not 1 <= len(operations) <= MAX_BATCH_OPERATIONS:
             raise ValueError(
                 f"operations must contain 1 to {MAX_BATCH_OPERATIONS} items")
-        add_titles: set[str] = set()
+        # (parent uuid, title) for blocks; (None, title) for pages. Two blocks
+        # may share a title in one batch as long as they have different
+        # parents -- verification looks for each new block among its own
+        # parent's children, so siblings are the only ambiguous case.
+        add_keys: set[tuple[str | None, str]] = set()
         normalized: list[dict[str, Any]] = []
 
         for index, operation in enumerate(operations):
@@ -674,11 +933,14 @@ class VerifiedContent(VerifiedWriteHelpers):
             title = data.get("title")
             if not isinstance(title, str) or not title.strip():
                 raise ValueError(f"operation {index} requires a non-empty title")
-            self._require_title(title)
+            self._validate_title(title)
 
             if op_type == "add" and entity_type == "page":
                 if set(data) != {"title"}:
                     raise ValueError("Page add supports only data.title")
+                # A page is a named entity, so the title scope applies here
+                # even though it does not apply to block content.
+                self._require_title(title)
 
             elif op_type == "add" and entity_type == "block":
                 # Closed allowlist. `tags`, `order` and `parent-id` are all
@@ -708,16 +970,29 @@ class VerifiedContent(VerifiedWriteHelpers):
                     "by Logseq, and there is no removal operation."
                 )
 
-            if title in add_titles:
+            key = (data.get("page-id") if entity_type == "block" else None,
+                   title)
+            if key in add_keys:
+                where = ("under the same parent" if key[0]
+                         else "for a page")
                 raise ValueError(
-                    "Added titles must be unique within a batch; verification "
-                    "cannot otherwise tell the new entities apart"
+                    f"Two operations in this batch add {title!r} {where}; "
+                    "verification could not tell the results apart. Titles "
+                    "need only be unique among siblings."
                 )
-            add_titles.add(title)
+            add_keys.add(key)
             normalized.append(dict(operation, data=data))
         return normalized
 
     # --------------------------------------------------------------- shared
+
+    async def _class_id(self, ident: str) -> int:
+        value = await self._client.call(
+            "logseq.DB.datascriptQuery",
+            [f"[:find ?class . :where [?class :db/ident {ident}]]"])
+        if not isinstance(value, int):
+            raise RuntimeError(f"Could not resolve the class {ident}")
+        return value
 
     async def _query_list(
         self, query: str, description: str, *params: Any

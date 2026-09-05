@@ -143,6 +143,37 @@ def create_server(
         """Read one page. detail=page is the page entity alone; blocks lists every block at any depth; tags covers the page and its blocks; properties returns values that are set; declared returns property slots inherited from the page's classes that have no value yet; all combines them."""
         return await content().get_page(page_uuid, detail)
 
+    @server.tool(name="createPage", structured_output=True)
+    async def create_page(title: str, dry_run: bool = False) -> dict[str, Any]:
+        """Create one page. A title that already exists is rejected rather than duplicated, because the read-back could not then tell the new page from the old one."""
+        return (await content().create_page(title, dry_run=dry_run)).to_dict()
+
+    @server.tool(name="renamePage", structured_output=True)
+    async def rename_page(page_uuid: str, new_title: str) -> dict[str, Any]:
+        """Rename a page and verify by UUID. Reading back by title would not distinguish a rename from Logseq creating a second page and leaving the original alone."""
+        page_uuid = require_uuid(
+            page_uuid, role="page_uuid", hint="getPageUUID")
+        return (await content().rename_page(page_uuid, new_title)).to_dict()
+
+    @server.tool(name="deletePage", structured_output=True)
+    async def delete_page(
+        page_uuid: str, acknowledge_reference_rewrite: bool = False
+    ) -> dict[str, Any]:
+        """Delete a page. On this build it recycles rather than destroys: the page keeps its UUID, tags and blocks and stops appearing in listPages. Inbound references are NOT rewritten, so acknowledge_reference_rewrite is required when any entity links to it."""
+        page_uuid = require_uuid(
+            page_uuid, role="page_uuid", hint="getPageUUID")
+        return (await content().delete_page(
+            page_uuid,
+            acknowledge_reference_rewrite=acknowledge_reference_rewrite
+        )).to_dict()
+
+    @server.tool(name="clearPage", structured_output=True)
+    async def clear_page(page_uuid: str) -> dict[str, Any]:
+        """Delete every block on a page, keeping the page itself along with its tags and property values. One call per top-level block, since the API has no batch delete."""
+        page_uuid = require_uuid(
+            page_uuid, role="page_uuid", hint="getPageUUID")
+        return (await content().clear_page(page_uuid)).to_dict()
+
     # ------------------------------------------------------------ blocks
 
     @server.tool(name="getBlockUUID", structured_output=True)
@@ -420,6 +451,16 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "Pass an exact page UUID and one of: page, blocks, tags, "
             "properties, declared, all."
         ),
+        "create_page": "Pass a title that no existing page or block uses.",
+        "rename_page": (
+            "Pass an exact page UUID and a title nothing else already uses."
+        ),
+        "delete_page": (
+            "Pass an exact page UUID. If entities reference the page, pass "
+            "acknowledge_reference_rewrite=true -- those references are not "
+            "rewritten."
+        ),
+        "clear_page": "Pass an exact page UUID, not a block UUID.",
         "get_block_uuid": "Pass an exact page UUID, not a block UUID.",
         "get_block": "Pass an exact block UUID.",
         "get_block_tree": (

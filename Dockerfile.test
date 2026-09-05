@@ -1,18 +1,21 @@
-# Test-only image. Runs the suite against `src` in a clean interpreter, so a
-# result here does not depend on a developer's installed copy, stale bytecode,
-# or which of Python 3.11/3.12/3.13 happened to be first on PATH.
+# Test-only image. Runs the suite in a clean interpreter, so a result does not
+# depend on a developer's installed copy, stale bytecode, or which of Python
+# 3.11/3.12/3.13 happened to be first on PATH.
 #
-#   docker build -f Dockerfile.test -t mcp-logseq-db-tests .
-#   docker run --rm mcp-logseq-db-tests
+#   podman build -f Dockerfile.test -t mcp-logseq-db-tests:3.13 .
+#   podman run --rm -v "${PWD}:/app:ro,z" mcp-logseq-db-tests:3.13
 #
-# Override the Python version to reproduce a version-specific failure:
-#   docker build -f Dockerfile.test --build-arg PYTHON_VERSION=3.11 -t ... .
+# Docker works identically; drop the ,z on Windows.
+#
+# There is no public image carrying pytest-asyncio, httpx and mcp together, so
+# the install has to happen somewhere. Doing it at build time and reusing the
+# image is cheaper than reinstalling on every run.
 
 ARG PYTHON_VERSION=3.13
 FROM python:${PYTHON_VERSION}-slim
 
-# Never write .pyc into the mounted source tree. Cross-version stale bytecode
-# is one of the things this image exists to rule out.
+# Never write .pyc into the mounted tree. Cross-version stale bytecode is one
+# of the things this image exists to rule out.
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -20,17 +23,25 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Dependencies first so edits to source do not invalidate the install layer.
+# Dependencies first, so editing source does not invalidate the install layer.
 COPY pyproject.toml README.md ./
 COPY src ./src
-RUN python -m pip install --upgrade pip \
- && python -m pip install ".[dev]"
 
-# The package is now installed AND present at ./src. tests/conftest.py forces
-# src to the front of sys.path, so the run exercises the working tree; the
-# install is only here to satisfy dependencies.
+# `.[dev]` should provide the test plugins, but they are also named explicitly:
+# a pyproject that has lost its optional-dependencies section still installs
+# cleanly and produces a container that cannot run a single async test. That
+# surfaces later as pytest's "install a suitable plugin for your async
+# framework", a long way from the actual cause.
+RUN python -m pip install --upgrade pip \
+ && python -m pip install ".[dev]" \
+ && python -m pip install "pytest>=8" "pytest-asyncio>=0.24"
+
+# Fail the BUILD if anything needed is missing. An image that builds and then
+# cannot run the suite is worse than one that refuses to build.
+COPY scripts/verify_test_image.py /tmp/verify_test_image.py
+RUN python /tmp/verify_test_image.py && rm /tmp/verify_test_image.py
+
 COPY tests ./tests
 
-# No Logseq in this image. Tests that need a live graph must be marked `live`
-# and are deselected here -- see pyproject's markers.
+# No Logseq in this image, so anything needing a live graph is deselected.
 CMD ["python", "-m", "pytest", "-q", "-m", "not live"]
