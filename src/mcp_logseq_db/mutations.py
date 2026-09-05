@@ -494,6 +494,11 @@ class VerifiedMutations(VerifiedWriteHelpers):
                     "Recreating the property does not restore them. Set "
                     "acknowledge_value_loss=true to proceed."))
 
+        # Value entities are materialized as blocks. Removing the definition
+        # clears the attribute but leaves them behind as orphans on whatever
+        # page held them, so they are captured first and removed afterwards.
+        orphan_candidates = await self._value_blocks_for(existing["id"])
+
         response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeProperty", [ident])
         current = await poll_readback(
@@ -520,12 +525,42 @@ class VerifiedMutations(VerifiedWriteHelpers):
                 observed_state=remaining,
                 timed_out=timed_out)
 
+        # Sweep the value blocks the removal orphaned. Best effort: a failure
+        # here leaves clutter, not corruption, and must not turn a completed
+        # deletion into a reported failure.
+        swept, left = 0, []
+        for block_uuid in orphan_candidates:
+            try:
+                await self._client.call("logseq.DB.removeBlock", [block_uuid])
+                if await self._optional_entity(block_uuid) is None:
+                    swept += 1
+                else:
+                    left.append(block_uuid)
+            except Exception:  # noqa: BLE001 -- clutter, not corruption
+                left.append(block_uuid)
+
         return MutationResult(
             response=response,
             verified_state=None,
             recovered_after_timeout=timed_out,
             previous_state={"property": existing, "usage": usage_before},
+            diagnostic=(
+                f"Removed {ident}"
+                + (f"; swept {swept} orphaned value block(s)" if swept else "")
+                + (f"; {len(left)} value block(s) could not be removed and "
+                   "remain on their pages" if left else "")),
         )
+
+    async def _value_blocks_for(self, property_id: int) -> list[str]:
+        """UUIDs of blocks that exist only to hold this property's values."""
+        query = (
+            "[:find [?uuid ...] :in $ ?property :where "
+            "[?block :logseq.property/created-from-property ?property] "
+            "[?block :block/uuid ?uuid]]"
+        )
+        found = await self._query_list(
+            query, "Value block lookup", property_id)
+        return [str(v) for v in found if v]
 
     @serialized_write
     async def set_property(
@@ -557,8 +592,13 @@ class VerifiedMutations(VerifiedWriteHelpers):
         # Cardinality-many accumulates. Writing the same value twice creates a
         # third distinct value entity, so an import run twice silently doubles
         # its values. Skip a write that would duplicate.
+        #
+        # The comparison has to happen on RESOLVED values: most types store a
+        # pointer to a minted value entity, so the held value is an entity id
+        # while the incoming one is a literal. Comparing those directly never
+        # matches, which is why the first attempt at this did not dedupe.
         if self._is_cardinality_many(definition):
-            existing = previous.get(ident)
+            existing = await self._resolved_values(previous.get(ident))
             if self._value_already_present(existing, value):
                 return MutationResult(
                     response=None, verified_state=previous,
@@ -739,18 +779,38 @@ class VerifiedMutations(VerifiedWriteHelpers):
                        or definition.get(":db/cardinality"))
         return isinstance(cardinality, str) and cardinality.endswith("/many")
 
+    async def _resolved_values(self, held: Any) -> list[Any]:
+        """
+        Flatten a property's current value(s) into comparable literals.
+
+        Reference-typed values are entity ids pointing at minted value
+        entities; the literal lives inside them under
+        :logseq.property/value or as the title.
+        """
+        if held is None:
+            return []
+        items = held if isinstance(held, list) else [held]
+        ids = {item.get("id") if isinstance(item, dict) else item
+               for item in items}
+        ids = {i for i in ids if isinstance(i, int) and not isinstance(i, bool)}
+        entities = await self._resolve_entities(ids)
+
+        out: list[Any] = []
+        for item in items:
+            key = item.get("id") if isinstance(item, dict) else item
+            entity = entities.get(key) if isinstance(key, int) else None
+            if entity is not None:
+                out.append(entity.get(":logseq.property/value",
+                                      entity.get("title", key)))
+            else:
+                out.append(key)
+        return out
+
     @staticmethod
-    def _value_already_present(existing: Any, value: Any) -> bool:
-        if existing is None:
-            return False
-        current = existing if isinstance(existing, list) else [existing]
+    def _value_already_present(existing: list[Any], value: Any) -> bool:
         wanted = (value.get("db/id", value.get("id"))
                   if isinstance(value, dict) else value)
-        for item in current:
-            held = (item.get("id") if isinstance(item, dict) else item)
-            if held == wanted:
-                return True
-        return False
+        return any(held == wanted for held in existing)
 
     def _require_writable_property(self, ident: str) -> None:
         """

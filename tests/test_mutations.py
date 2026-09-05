@@ -139,6 +139,12 @@ class FakeClient:
         self.graph.entities[target][ident] = value
         return None
 
+    def _removeBlock(self, uuid):
+        if not self.write_effective:
+            return None
+        self.graph.entities.pop(uuid, None)
+        return None
+
     def _removeBlockProperty(self, target, ident):
         if not self.write_effective:
             return None
@@ -152,6 +158,11 @@ class FakeClient:
                 and any(t["id"] == TAG_CLASS_ID for t in e.get("tags", []))]
 
     def _datascriptQuery(self, query, *params):
+        # Value blocks belonging to a property definition.
+        if ":logseq.property/created-from-property ?property" in query:
+            return [e["uuid"] for e in self.graph.entities.values()
+                    if (e.get(":logseq.property/created-from-property") or {})
+                    .get("id") == params[0]]
         # Tag usage: [?holder :block/tags ?tag]
         if "[?holder :block/tags ?tag]" in query:
             return [e for e in self.graph.entities.values()
@@ -386,7 +397,11 @@ async def test_reference_property_accepts_an_entity(graph, mutations, value):
 
 async def test_cardinality_many_does_not_duplicate(graph):
     """Writing the same value twice to a many property creates a third value
-    entity rather than replacing. An import run twice would silently double."""
+    entity rather than replacing. An import run twice would silently double.
+
+    The held value is an entity id and the incoming one a literal, so the
+    comparison has to resolve before comparing -- a direct comparison never
+    matches and the dedupe silently does nothing."""
     client = FakeClient(graph)
     mutations = VerifiedMutations(client)  # type: ignore[arg-type]
 
@@ -453,3 +468,36 @@ async def test_property_usage_survives_a_literal_value(graph, mutations):
     assert users
     assert users[0]["value"] is True
     assert users[0]["value_entity"] is None
+
+
+async def test_cardinality_many_dedupes_against_a_materialized_value(graph):
+    """The realistic shape: the property holds a pointer to a value entity,
+    not the literal that was written."""
+    client = FakeClient(graph)
+    mutations = VerifiedMutations(client)  # type: ignore[arg-type]
+
+    value_entity = graph.add("alpha", extra={":logseq.property/value": "alpha"})
+    graph.entities[graph.page["uuid"]][MANY_PROP] = [{"id": value_entity["id"]}]
+
+    result = await mutations.set_property(graph.page["uuid"], MANY_PROP, "alpha")
+
+    assert "duplicate" in (result.diagnostic or "")
+    assert not any(m == "logseq.DB.upsertBlockProperty" for m, _ in client.calls)
+
+
+async def test_delete_property_sweeps_its_value_blocks(graph):
+    """Removing the definition clears the attribute but leaves the
+    materialized value blocks behind as orphans on their pages."""
+    client = FakeClient(graph)
+    mutations = VerifiedMutations(client)  # type: ignore[arg-type]
+
+    value_block = graph.add(
+        "42", parent=graph.page["id"], page=graph.page["id"],
+        extra={":logseq.property/created-from-property": {"id": graph.prop["id"]}})
+
+    result = await mutations.delete_property(
+        WRITABLE, acknowledge_value_loss=True)
+
+    assert result.verified is True
+    assert value_block["uuid"] not in graph.entities
+    assert "swept 1" in (result.diagnostic or "")

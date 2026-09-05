@@ -24,7 +24,7 @@ EXPECTED_TOOLS = {
     "getPageUUID", "getPage", "createPage", "renamePage", "deletePage",
     "clearPage",
     # Blocks
-    "getBlockUUID", "getBlock", "getBlockTree", "createBlock",
+    "getBlockUUID", "getBlock", "getBlockTree", "findOrphans", "createBlock",
     "createManyBlocks", "createPageofBlocks", "updateBlock", "removeBlock",
     # Tags
     "getTagUUID", "getTag", "getTagUsers", "creatTag", "deleteTag",

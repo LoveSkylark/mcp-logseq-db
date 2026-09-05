@@ -102,6 +102,7 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "removeProperty":       ("logseq.DB.removeBlockProperty",),
     # Blocks
     "getBlockUUID":         ("logseq.DB.datascriptQuery",),
+    "findOrphans":          ("logseq.DB.datascriptQuery",),
     "getBlock":             ("logseq.DB.getBlock",),
     "createBlock":          ("logseq.DB.upsertNodes",),
     "updateBlock":          ("logseq.DB.updateBlock",),
@@ -187,6 +188,13 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     ),
     "getBlockUUID": (
         "Returns every block on the page at any depth, not a single UUID.",
+        "Walks :block/parent rather than :block/page, so it still sees blocks "
+        "whose :block/page is wrong.",
+    ),
+    "findOrphans": (
+        "Reports blocks whose :block/parent and :block/page disagree. Such "
+        "blocks are invisible to page-scoped queries; this is the only way to "
+        "audit a page after a nested write fails.",
     ),
     "getPage": (
         "The detail selector matters: a page's own tags and its blocks' tags "

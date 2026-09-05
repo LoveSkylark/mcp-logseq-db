@@ -135,6 +135,20 @@ class FakeClient:
             ident = query.split(":db/ident ")[1].split("]")[0]
             return next((e["id"] for e in self.graph.entities.values()
                          if e.get("ident") == ident), None)
+        if ":block/_parent" in query and "#uuid" in query:
+            uuid = query.split('#uuid "')[1].split('"')[0]
+            root = self.graph.entities.get(uuid)
+            if root is None:
+                return None
+
+            def build(entity):
+                node = dict(entity)
+                kids = self.graph.children(entity["id"])
+                if kids:
+                    node["_parent"] = [build(k) for k in kids]
+                return node
+
+            return build(root)
         if "#uuid" in query and "[?child :block/parent ?parent]" in query:
             uuid = query.split('#uuid "')[1].split('"')[0]
             entity = self.graph.entities.get(uuid)
@@ -501,3 +515,51 @@ async def test_clear_page_on_a_page_of_only_value_blocks(graph, content):
 
     assert result.verified is True
     assert len(graph.children(graph.page["id"])) == 1
+
+
+# ------------------------------------------- orphan visibility and detection
+
+async def test_reads_see_a_block_whose_page_pointer_is_wrong(graph, content):
+    """The failure mode that made nested writes unauditable: a real child with
+    :block/page pointing at its parent block. A page-scoped query cannot see
+    it, so a clean read was reported over a broken page."""
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    # :block/page deliberately wrong, :block/parent correct.
+    graph.add("Orphaned child", parent["id"], parent["id"])
+
+    blocks = await content.get_block_uuid(graph.page["uuid"])
+
+    assert "Orphaned child" in {b["title"] for b in blocks}
+
+
+async def test_block_tree_sees_a_child_with_a_wrong_page_pointer(graph, content):
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    graph.add("Orphaned child", parent["id"], parent["id"])
+
+    tree = await content.find_block_tree(parent["uuid"])
+
+    assert tree["node_count"] == 2
+    assert [c["title"] for c in tree["block"]["children"]] == ["Orphaned child"]
+
+
+async def test_find_orphans_reports_the_disagreement(graph, content):
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    graph.add("Orphaned child", parent["id"], parent["id"])
+
+    report = await content.find_orphans(graph.page["uuid"])
+
+    assert len(report["orphans"]) == 1
+    assert report["orphans"][0]["title"] == "Orphaned child"
+    assert report["reachable_by_parent"] > report["reachable_by_page"]
+
+
+async def test_find_orphans_is_quiet_on_a_healthy_page(graph, content):
+    await content.create_block(graph.page["uuid"], "Fine")
+
+    report = await content.find_orphans(graph.page["uuid"])
+
+    assert report["orphans"] == []
+    assert "Every block" in report["diagnostic"]

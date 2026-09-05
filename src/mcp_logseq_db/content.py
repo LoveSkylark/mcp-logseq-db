@@ -296,15 +296,81 @@ class VerifiedContent(VerifiedWriteHelpers):
         page = await self._entity_by_uuid(page_uuid)
         if not page.get("name"):
             raise ValueError("UUID identifies a block, not a page")
-        query = (
-            "[:find [(pull ?block [:db/id :block/uuid :block/title "
-            ":block/order {:block/parent [:db/id :block/uuid]}]) ...] "
-            ":in $ ?page :where [?block :block/page ?page]]"
-        )
-        blocks = await self._query_list(query, "Page block lookup", page["id"])
+
+        blocks = await self._descendants_by_parent(page_uuid)
         # Fractional-index strings sort lexicographically into document order.
         blocks.sort(key=lambda b: str(b.get("order", "")))
         return blocks
+
+    async def _descendants_by_parent(
+        self, root_uuid: str
+    ) -> list[dict[str, Any]]:
+        """
+        Every descendant, found by walking :block/parent.
+
+        Deliberately not `[?b :block/page ?page]`. A block whose :block/page is
+        wrong is invisible to that query while still being a real child, so a
+        page-scoped read reports a clean page over a broken one. :block/parent
+        is the attribute that stays correct, and `{:block/_parent ...}` walks
+        its reverse to arbitrary depth in one call.
+        """
+        query = (
+            "[:find (pull ?root [{:block/_parent ...}]) . :where "
+            f"[?root :block/uuid #uuid \"{root_uuid}\"]]"
+        )
+        root = await self._client.call(
+            "logseq.DB.datascriptQuery", [query])
+        if not isinstance(root, dict):
+            return []
+
+        flat: list[dict[str, Any]] = []
+
+        def walk(node: dict[str, Any]) -> None:
+            for child in node.get("_parent", []) or []:
+                if not isinstance(child, dict):
+                    continue
+                flat.append(child)
+                walk(child)
+
+        walk(root)
+        return flat
+
+    async def find_orphans(self, page_uuid: str) -> dict[str, Any]:
+        """
+        Blocks whose :block/parent and :block/page disagree.
+
+        This is the signature of a failed nested write, and until now nothing
+        could see it: the page-scoped reads miss exactly the blocks that are
+        wrong. Compare the two views and report the difference.
+        """
+        page_uuid = self._validated_uuid(page_uuid)
+        page = await self._entity_by_uuid(page_uuid)
+        if not page.get("name"):
+            raise ValueError("UUID identifies a block, not a page")
+
+        by_parent = await self._descendants_by_parent(page_uuid)
+        by_page = await self._query_list(
+            "[:find [(pull ?block [:db/id :block/uuid :block/title "
+            "{:block/page [:db/id]}]) ...] :in $ ?page :where "
+            "[?block :block/page ?page]]",
+            "Page block lookup", page["id"])
+
+        page_ids = {b["id"] for b in by_page if isinstance(b.get("id"), int)}
+        orphans = [b for b in by_parent
+                   if isinstance(b.get("id"), int) and b["id"] not in page_ids]
+
+        return {
+            "page_uuid": page_uuid,
+            "reachable_by_parent": len(by_parent),
+            "reachable_by_page": len(by_page),
+            "orphans": orphans,
+            "diagnostic": (
+                f"{len(orphans)} block(s) are children of this page's tree but "
+                "their :block/page points elsewhere. They are invisible to any "
+                "page-scoped query and were likely created by a nested write."
+                if orphans else
+                "Every block reachable by parent is also reachable by page."),
+        }
 
     async def find_block_tree(
         self,
@@ -337,18 +403,13 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "truncated": False,
                 **({"reason": "target is a page, not a block"} if root else {}),
             }
-        page_id = self._reference_id(root.get("page"))
-        if page_id is None:
-            raise RuntimeError("Block has no owning page reference")
-
-        query = (
-            "[:find [(pull ?block [*]) ...] :in $ ?page :where "
-            "[?block :block/page ?page]]"
-        )
-        page_blocks = await self._query_list(query, "Page block lookup", page_id)
+        # Walk :block/parent rather than scoping to :block/page. A child whose
+        # :block/page is wrong is a real child and must appear in the tree;
+        # the page-scoped form reported `children: []` over exactly those.
+        descendants = await self._descendants_by_parent(block_uuid)
 
         by_parent: dict[int, list[dict[str, Any]]] = {}
-        for entity in page_blocks:
+        for entity in descendants:
             if not isinstance(entity.get("id"), int):
                 continue
             parent_id = self._reference_id(entity.get("parent"))

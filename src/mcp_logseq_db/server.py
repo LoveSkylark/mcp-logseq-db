@@ -186,6 +186,13 @@ def create_server(
         """Read one exact block. A missing UUID returns found=false rather than raising."""
         return await content().find_block(block_uuid)
 
+    @server.tool(name="findOrphans", structured_output=True)
+    async def find_orphans(page_uuid: str) -> dict[str, Any]:
+        """List blocks whose :block/parent and :block/page disagree. Such blocks are real children but are invisible to every page-scoped query, which is the signature of a failed nested write. Run this to audit a page after a nested create fails."""
+        page_uuid = require_uuid(
+            page_uuid, role="page_uuid", hint="getPageUUID")
+        return await content().find_orphans(page_uuid)
+
     @server.tool(name="getBlockTree", structured_output=True)
     async def get_block_tree(
         block_uuid: str, max_depth: int = 20, max_nodes: int = 1000
