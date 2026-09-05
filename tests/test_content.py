@@ -88,9 +88,11 @@ class FakeClient:
             return self._query(args[0], args[1:])
         raise AssertionError(f"unexpected method {method}")
 
-    def _upsert(self, operations, options):
-        if options.get("dry-run"):
-            return "Dry run: ok"
+    def _upsert(self, operations):
+        # ONE argument. A second (the old {"dry-run": ...} map) is rejected by
+        # the real API with "The Imported EDN has 4 validation error(s)", which
+        # took down every write tool. The fake enforces the same arity so a
+        # regression fails here rather than on a live graph.
         if not self.write_effective:
             return None          # the silent no-op
         for op in operations:
@@ -144,6 +146,17 @@ class FakeClient:
             return [e for e in self.graph.entities.values()
                     if e.get("page", {}).get("id") == params[0]]
         return []
+
+
+def test_upsert_nodes_sends_exactly_one_argument() -> None:
+    """Pinned because the second argument is not a harmless extra: the API
+    rejects the whole call, so every write tool fails at once."""
+    import inspect
+    from mcp_logseq_db import content as content_module
+
+    source = inspect.getsource(content_module.VerifiedContent.upsert_nodes)
+    assert '"logseq.DB.upsertNodes", [normalized]' in source
+    assert "dry-run" not in source
 
 
 @pytest.fixture
@@ -320,6 +333,19 @@ async def test_outline_dry_run_writes_nothing(graph, content):
     assert result["levels"] == 2
     assert result["estimated_calls"] == 3
     assert graph.children(graph.page["id"]) == []
+
+
+async def test_dry_run_is_local_only_and_says_so(graph, content):
+    """A dry run used to call the API and could report success on a build
+    where the write route was broken. It is now local validation, and the
+    result states that rather than implying more."""
+    result = await content.create_block(
+        graph.page["uuid"], "Never created", dry_run=True)
+
+    assert result.verified_entities == ()
+    assert graph.children(graph.page["id"]) == []
+    assert "not evidence" in (result.diagnostic or "")
+    assert "not_checked" in result.validation
 
 
 # ------------------------------------------------------------- write scope

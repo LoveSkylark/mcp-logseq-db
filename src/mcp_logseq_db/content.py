@@ -47,6 +47,7 @@ MAX_SUBTREE_NODES = 1000
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
+PAGE_CLASS = ":logseq.class/Page"
 
 UUID_PATTERN = re.compile(
     r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
@@ -88,13 +89,32 @@ class VerifiedContent(VerifiedWriteHelpers):
         titles are not unique, and selecting a write target from a fuzzy match
         is how the wrong entity gets modified.
         """
-        self._require_title(title)
+        self._validate_title(title)
+        page_class = await self._class_id(PAGE_CLASS)
+
+        # Exact display title first.
         query = (
-            "[:find [(pull ?page [:db/id :block/uuid :block/name :block/title]) "
-            "...] :where [?page :block/name] "
+            "[:find [(pull ?page [:db/id :block/uuid :block/name :block/title "
+            ":logseq.property/deleted-at]) ...] :in $ ?class :where "
+            "[?page :block/tags ?class] "
             f"[?page :block/title {json.dumps(title)}]]"
         )
-        pages = await self._query_list(query, "Page title lookup")
+        pages = await self._query_list(
+            query, "Page title lookup", page_class)
+
+        if not pages:
+            # Fall back to the normalized name, which is lowercased. Without
+            # this, the exact string Logseq stores in :block/name fails to
+            # resolve the page it names.
+            query = (
+                "[:find [(pull ?page [:db/id :block/uuid :block/name "
+                ":block/title :logseq.property/deleted-at]) ...] "
+                ":in $ ?class :where [?page :block/tags ?class] "
+                f"[?page :block/name {json.dumps(title.lower())}]]"
+            )
+            pages = await self._query_list(
+                query, "Page name lookup", page_class)
+
         live = [p for p in pages
                 if p.get(":logseq.property/deleted-at") is None]
         if not live:
@@ -171,7 +191,7 @@ class VerifiedContent(VerifiedWriteHelpers):
         query = (
             "[:find (pull ?prop [:db/id :db/ident :block/title]) "
             "(pull ?holder [:db/id :block/uuid :block/title :block/name]) "
-            "?value (pull ?value [:db/id :db/ident :block/title]) "
+            "?value "
             ":in $ ?page ?class :where "
             "(or-join [?page ?holder] "
             "[(identity ?page) ?holder] [?holder :block/page ?page]) "
@@ -181,19 +201,47 @@ class VerifiedContent(VerifiedWriteHelpers):
         rows = await self._query_list(
             query, "Page property lookup", page_id,
             await self._class_id(PROPERTY_CLASS))
-        out = []
-        for row in rows:
-            if isinstance(row, list) and len(row) == 4:
-                prop, holder, raw, resolved = row
-                out.append({
-                    "property": prop,
-                    "holder": holder,
-                    # Both forms: reference-typed values arrive as an entity id
-                    # and resolve; scalar values sit in `raw` and do not.
-                    "value": raw,
-                    "value_entity": resolved,
-                })
-        return out
+
+        parsed = [row for row in rows if isinstance(row, list) and len(row) == 3]
+        # Reference-typed values arrive as integer entity ids. Resolve them in
+        # one extra query rather than per row; scalars are left as they are.
+        resolved = await self._resolve_entities(
+            {row[2] for row in parsed if isinstance(row[2], int)
+             and not isinstance(row[2], bool)})
+
+        return [
+            {
+                "property": prop,
+                "holder": holder,
+                "value": value,
+                "value_entity": resolved.get(value)
+                if isinstance(value, int) and not isinstance(value, bool)
+                else None,
+            }
+            for prop, holder, value in parsed
+        ]
+
+    async def _resolve_entities(
+        self, entity_ids: set[int]
+    ) -> dict[int, dict[str, Any]]:
+        """
+        Resolve entity ids to readable entities in one call.
+
+        `[?e ?a _]` matches any entity carrying any attribute, which is the
+        broadest safe pattern -- value entities need not have a :block/uuid, so
+        matching on that would silently drop them.
+        """
+        if not entity_ids:
+            return {}
+        query = (
+            "[:find [(pull ?e [:db/id :db/ident :block/title "
+            ":logseq.property/value]) ...] "
+            ":in $ [?e ...] :where [?e ?a _]]"
+        )
+        found = await self._query_list(
+            query, "Value entity lookup", sorted(entity_ids))
+        return {e["id"]: e for e in found
+                if isinstance(e, dict) and isinstance(e.get("id"), int)}
 
     async def _declared_properties(self, page_id: int) -> list[dict[str, Any]]:
         """
@@ -265,7 +313,13 @@ class VerifiedContent(VerifiedWriteHelpers):
         max_depth: int = 20,
         max_nodes: int = MAX_SUBTREE_NODES,
     ) -> dict[str, Any]:
-        """Read one block subtree with a single page-scoped query."""
+        """
+        Read one block subtree with a single page-scoped query.
+
+        `max_depth` counts generations BELOW the root, so 0 is the root alone
+        and 1 is the root plus its children. Use `max_nodes` to cap the total
+        instead; `truncated` reports whichever bound stopped traversal.
+        """
         block_uuid = self._validated_uuid(block_uuid)
         if not isinstance(max_depth, int) or not 0 <= max_depth <= 100:
             raise ValueError("max_depth must be an integer between 0 and 100")
@@ -799,11 +853,24 @@ class VerifiedContent(VerifiedWriteHelpers):
         removal verb at all -- `operation` offers only add and edit.
         """
         normalized = await self._validate_operations(operations)
-        validation = await self._client.call(
-            "logseq.DB.upsertNodes", [normalized, {"dry-run": True}])
+
         if dry_run:
+            # Local validation only. There is no server-side dry run: the
+            # options argument that used to request one is rejected by the API
+            # and broke every write that carried it. So this proves the
+            # arguments are well formed and the targets exist -- nothing more.
+            # It cannot tell you the write will land.
             return ContentResult(
-                validation=validation, response=None, verified_entities=())
+                validation={
+                    "checked": "arguments and target existence, locally",
+                    "not_checked": "whether the write route works on this build",
+                    "operations": normalized,
+                },
+                response=None,
+                verified_entities=(),
+                diagnostic=(
+                    "Dry run is local validation only and is not evidence that "
+                    "the write will succeed."))
 
         # Snapshot per add so the read-back can tell a new entity from one
         # that already carried the same title. Titles are not unique, so the
@@ -819,8 +886,9 @@ class VerifiedContent(VerifiedWriteHelpers):
         response: Any = None
         timed_out = False
         try:
+            # ONE argument. See the note on the options map above.
             response = await self._client.call(
-                "logseq.DB.upsertNodes", [normalized, {"dry-run": False}])
+                "logseq.DB.upsertNodes", [normalized])
         except httpx.TimeoutException:
             timed_out = True
 
@@ -833,7 +901,7 @@ class VerifiedContent(VerifiedWriteHelpers):
                 await self._verify_add(operation, before_ids[index]))
 
         return ContentResult(
-            validation=validation,
+            validation=None,
             response=response,
             verified_entities=tuple(verified),
             recovered_after_timeout=timed_out,
