@@ -39,6 +39,7 @@ silent no-op.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -142,6 +143,21 @@ class VerifiedMutations(VerifiedWriteHelpers):
         if not title.strip():
             raise ValueError("Tag title must not be empty")
 
+        # Tags and pages share a title space, and createPage already refuses a
+        # title a tag holds. Without the mirror check the guard is asymmetric:
+        # a tag could be created over a page's title, making both
+        # unresolvable by name afterwards.
+        clashes = await self._query_list(
+            "[:find [(pull ?e [:db/id :block/uuid :block/title :block/name]) "
+            "...] :where [?e :block/name] "
+            f"[?e :block/title {json.dumps(title)}]]",
+            "Title clash lookup")
+        if clashes:
+            raise ValueError(
+                f"An entity titled {title!r} already exists. Tags and pages "
+                "share a title space, so creating this tag would make both "
+                "unresolvable by title.")
+
         response, timed_out = await self._call_ambiguous(
             "logseq.DB.createTag", [title, options or {}])
         if timed_out:
@@ -171,7 +187,11 @@ class VerifiedMutations(VerifiedWriteHelpers):
 
     @serialized_write
     async def delete_tag(
-        self, tag_uuid: str, *, acknowledge_child_reparent: bool = False
+        self,
+        tag_uuid: str,
+        *,
+        acknowledge_child_reparent: bool = False,
+        acknowledge_detach: bool = False,
     ) -> MutationResult:
         """
         Delete one tag entity.
@@ -191,6 +211,18 @@ class VerifiedMutations(VerifiedWriteHelpers):
                 "acknowledge_child_reparent=true to proceed"
             )
         holders = await self.get_tag_users(tag_uuid)
+
+        # Deleting a tag strips it from everything carrying it. That is a
+        # multi-entity change with no undo, so it is gated like deletePage.
+        if holders and not acknowledge_detach:
+            return MutationResult(
+                response=None, verified_state=None, verified=False,
+                previous_state={"tag": previous, "holders": holders,
+                                "child_tags": children},
+                observed_state=holders,
+                diagnostic=(
+                    f"{len(holders)} pages or blocks carry this tag and will "
+                    "lose it. Set acknowledge_detach=true to proceed."))
 
         response, timed_out = await self._call_ambiguous(
             "logseq.DB.deletePage", [tag_uuid])
@@ -330,17 +362,49 @@ class VerifiedMutations(VerifiedWriteHelpers):
         query has to serve both.
         """
         ident = self._validated_ident(property_ident)
+        # The value is NOT pulled. `pull` requires an entity id, but checkbox
+        # and datetime properties store literals inline -- so pulling made the
+        # query 500 with "Expected number or lookup ref for entity id, got
+        # true", and left those properties undeletable.
         query = (
             "[:find (pull ?holder [:db/id :block/uuid :block/title "
             ":block/name {:block/page [:db/id :block/uuid :block/title]}]) "
-            "?value (pull ?value [:db/id :db/ident :block/title]) "
-            f":where [?holder {ident} ?value]]"
+            f"?value :where [?holder {ident} ?value]]"
         )
-        rows = await self._query_list(query, "Property usage lookup")
+        rows = [r for r in await self._query_list(query, "Property usage lookup")
+                if isinstance(r, list) and len(r) == 2]
+
+        # Reference-typed values come back as entity ids; resolve those and
+        # leave literals alone.
+        resolved = await self._resolve_entities(
+            {r[1] for r in rows
+             if isinstance(r[1], int) and not isinstance(r[1], bool)})
         return [
-            {"holder": r[0], "value": r[1], "value_entity": r[2]}
-            for r in rows if isinstance(r, list) and len(r) == 3
+            {
+                "holder": holder,
+                "value": value,
+                "value_entity": resolved.get(value)
+                if isinstance(value, int) and not isinstance(value, bool)
+                else None,
+            }
+            for holder, value in rows
         ]
+
+    async def _resolve_entities(
+        self, entity_ids: set[int]
+    ) -> dict[int, dict[str, Any]]:
+        """Resolve entity ids to readable entities in one call."""
+        if not entity_ids:
+            return {}
+        query = (
+            "[:find [(pull ?e [:db/id :db/ident :block/title "
+            ":logseq.property/value]) ...] "
+            ":in $ [?e ...] :where [?e ?a _]]"
+        )
+        found = await self._query_list(
+            query, "Value entity lookup", sorted(entity_ids))
+        return {e["id"]: e for e in found
+                if isinstance(e, dict) and isinstance(e.get("id"), int)}
 
     # ------------------------------------------------------ property writes
 
@@ -400,7 +464,9 @@ class VerifiedMutations(VerifiedWriteHelpers):
             response=response, verified_state=current, diagnostic=diagnostic)
 
     @serialized_write
-    async def delete_property(self, property_ident: str) -> MutationResult:
+    async def delete_property(
+        self, property_ident: str, *, acknowledge_value_loss: bool = False
+    ) -> MutationResult:
         """
         Delete a property definition graph-wide.
 
@@ -413,6 +479,20 @@ class VerifiedMutations(VerifiedWriteHelpers):
         self._require_writable_property(ident)
         existing = await self._property(ident)
         usage_before = await self.get_property_users(ident)
+
+        # deletePage requires acknowledgement before it can orphan references;
+        # this destroys every value of the property and had no gate at all.
+        # Same class of loss, so the same confirmation.
+        if usage_before and not acknowledge_value_loss:
+            return MutationResult(
+                response=None, verified_state=None, verified=False,
+                previous_state={"property": existing, "usage": usage_before},
+                observed_state=usage_before,
+                diagnostic=(
+                    f"{len(usage_before)} entities hold a value for {ident}, "
+                    "and deleting the definition destroys every one of them. "
+                    "Recreating the property does not restore them. Set "
+                    "acknowledge_value_loss=true to proceed."))
 
         response, timed_out = await self._call_ambiguous(
             "logseq.DB.removeProperty", [ident])
@@ -465,8 +545,28 @@ class VerifiedMutations(VerifiedWriteHelpers):
         target_uuid = self._require_entity(self._validated_uuid(target_uuid))
         ident = self._validated_ident(property_ident)
         self._require_writable_property(ident)
-        await self._property(ident)
+        definition = await self._property(ident)
         previous = await self._entity(target_uuid)
+
+        # A reference-typed property given a literal does not error: Logseq
+        # mints a value entity whose title is the string, and the read-back
+        # sees a value present and passes. That is a silent miswrite, so the
+        # type is checked here rather than trusted afterwards.
+        self._require_value_matches_type(definition, ident, value)
+
+        # Cardinality-many accumulates. Writing the same value twice creates a
+        # third distinct value entity, so an import run twice silently doubles
+        # its values. Skip a write that would duplicate.
+        if self._is_cardinality_many(definition):
+            existing = previous.get(ident)
+            if self._value_already_present(existing, value):
+                return MutationResult(
+                    response=None, verified_state=previous,
+                    previous_state=previous,
+                    diagnostic=(
+                        f"{ident} already holds this value and is "
+                        "cardinality-many; writing again would add a duplicate "
+                        "rather than replace it, so nothing was sent."))
 
         response, timed_out = await self._call_ambiguous(
             "logseq.DB.upsertBlockProperty",
@@ -602,6 +702,55 @@ class VerifiedMutations(VerifiedWriteHelpers):
                 query, "Reference lookup", entity_id)
             found.update(v for v in result if isinstance(v, int))
         return found
+
+    # Types whose values are entity references rather than literals. Passing a
+    # string to one of these is accepted by the API and produces a value entity
+    # named after the string -- verifiable, and wrong.
+    REFERENCE_TYPES = frozenset({"node", "page", "class", "property"})
+
+    @staticmethod
+    def _property_type(definition: dict[str, Any]) -> str | None:
+        return (definition.get(":logseq.property/type")
+                or definition.get("type"))
+
+    @classmethod
+    def _require_value_matches_type(
+        cls, definition: dict[str, Any], ident: str, value: Any
+    ) -> None:
+        property_type = cls._property_type(definition)
+        if property_type not in cls.REFERENCE_TYPES:
+            return
+        # An entity id, or a map carrying one.
+        if isinstance(value, int) and not isinstance(value, bool):
+            return
+        if isinstance(value, dict) and isinstance(
+                value.get("db/id", value.get("id")), int):
+            return
+        raise ValueError(
+            f"{ident} is a {property_type!r} property, so its value must be an "
+            f"entity id -- got {value!r}. Passing a literal does not error: "
+            "Logseq creates a value entity named after it, which reads back as "
+            "success while pointing at nothing."
+        )
+
+    @staticmethod
+    def _is_cardinality_many(definition: dict[str, Any]) -> bool:
+        cardinality = (definition.get("cardinality")
+                       or definition.get(":db/cardinality"))
+        return isinstance(cardinality, str) and cardinality.endswith("/many")
+
+    @staticmethod
+    def _value_already_present(existing: Any, value: Any) -> bool:
+        if existing is None:
+            return False
+        current = existing if isinstance(existing, list) else [existing]
+        wanted = (value.get("db/id", value.get("id"))
+                  if isinstance(value, dict) else value)
+        for item in current:
+            held = (item.get("id") if isinstance(item, dict) else item)
+            if held == wanted:
+                return True
+        return False
 
     def _require_writable_property(self, ident: str) -> None:
         """

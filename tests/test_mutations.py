@@ -10,6 +10,7 @@ Two properties of this API shape most of these tests:
 """
 
 import itertools
+import re
 from typing import Any
 
 import pytest
@@ -22,6 +23,8 @@ TAG_CLASS_ID = 2
 PROPERTY_CLASS_ID = 3
 PAGE_CLASS_ID = 4
 WRITABLE = ":plugin.property._test_plugin/Effort"
+NODE_PROP = ":plugin.property._test_plugin/Related"
+MANY_PROP = ":plugin.property._test_plugin/Labels"
 
 
 class FakeGraph:
@@ -37,12 +40,22 @@ class FakeGraph:
                               page=self.page["id"])
         self.tag = self.add("xzy", ident=":user.class/xzy-bc0auNqC",
                             tags=[TAG_CLASS_ID])
-        self.prop = self.add("Effort", ident=WRITABLE, tags=[PROPERTY_CLASS_ID])
+        self.prop = self.add("Effort", ident=WRITABLE, tags=[PROPERTY_CLASS_ID],
+                             extra={":logseq.property/type": "number",
+                                    "cardinality": ":db.cardinality/one"})
+        self.node_prop = self.add(
+            "Related", ident=NODE_PROP, tags=[PROPERTY_CLASS_ID],
+            extra={":logseq.property/type": "node",
+                   "cardinality": ":db.cardinality/one"})
+        self.many_prop = self.add(
+            "Labels", ident=MANY_PROP, tags=[PROPERTY_CLASS_ID],
+            extra={":logseq.property/type": "default",
+                   "cardinality": ":db.cardinality/many"})
         self.user_prop = self.add("fun", ident=":user.property/fun-W8dp1CaI",
                                   tags=[PROPERTY_CLASS_ID])
 
     def add(self, title, *, name=None, ident=None, tags=None, parent=None,
-            page=None, entity_id=None) -> dict[str, Any]:
+            page=None, entity_id=None, extra=None) -> dict[str, Any]:
         entity_id = entity_id if entity_id is not None else next(self._ids)
         uuid = "%08x-0000-4000-8000-000000000000" % entity_id
         entity: dict[str, Any] = {"id": entity_id, "uuid": uuid, "title": title}
@@ -56,6 +69,8 @@ class FakeGraph:
             entity["parent"] = {"id": parent}
         if page is not None:
             entity["page"] = {"id": page}
+        if extra:
+            entity.update(extra)
         self.entities[uuid] = entity
         return entity
 
@@ -137,6 +152,26 @@ class FakeClient:
                 and any(t["id"] == TAG_CLASS_ID for t in e.get("tags", []))]
 
     def _datascriptQuery(self, query, *params):
+        # Tag usage: [?holder :block/tags ?tag]
+        if "[?holder :block/tags ?tag]" in query:
+            return [e for e in self.graph.entities.values()
+                    if any(t.get("id") == params[0]
+                           for t in e.get("tags", []))]
+        # Property usage: [?holder <ident> ?value]
+        match = re.search(r"\[\?holder (:[\w.]+/[\w.-]+) \?value\]", query)
+        if match:
+            ident = match.group(1)
+            return [[e, e[ident]] for e in self.graph.entities.values()
+                    if ident in e]
+        # Batch entity resolution: [?e ?a _] with an [?e ...] binding
+        if ":in $ [?e ...]" in query:
+            wanted = set(params[0])
+            return [e for e in self.graph.entities.values()
+                    if e["id"] in wanted]
+        if ':block/title "' in query and ":find [(pull ?e" in query:
+            title = query.split(':block/title "')[1].split('"')[0]
+            return [e for e in self.graph.entities.values()
+                    if e.get("title") == title and e.get("name")]
         if ":find ?class" in query:
             ident = query.split(":db/ident ")[1].split("]")[0]
             return next((e["id"] for e in self.graph.entities.values()
@@ -324,3 +359,97 @@ async def test_entity_scope_applies_to_the_target_being_changed(graph):
 
     with pytest.raises(PermissionError):
         await mutations.add_tag(graph.page["uuid"], graph.tag["uuid"])
+
+
+# ------------------------------------------------- value type and cardinality
+
+async def test_reference_property_rejects_a_literal(graph):
+    """The silent-miswrite case: Logseq accepts a string for a node property,
+    mints a value entity named after it, and the read-back sees a value and
+    passes. Rejecting before the call is the only way to catch it."""
+    client = FakeClient(graph)
+
+    with pytest.raises(ValueError, match="must be an entity id"):
+        await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
+            graph.page["uuid"], NODE_PROP, "just a string")
+
+    # Reads to resolve the property and target are expected; the point is that
+    # no write was sent.
+    assert not any(m == "logseq.DB.upsertBlockProperty" for m, _ in client.calls)
+
+
+@pytest.mark.parametrize("value", [859, {"db/id": 859}])
+async def test_reference_property_accepts_an_entity(graph, mutations, value):
+    result = await mutations.set_property(graph.page["uuid"], NODE_PROP, value)
+    assert result.verified is True
+
+
+async def test_cardinality_many_does_not_duplicate(graph):
+    """Writing the same value twice to a many property creates a third value
+    entity rather than replacing. An import run twice would silently double."""
+    client = FakeClient(graph)
+    mutations = VerifiedMutations(client)  # type: ignore[arg-type]
+
+    await mutations.set_property(graph.page["uuid"], MANY_PROP, "alpha")
+    sent_after_first = len(client.calls)
+
+    result = await mutations.set_property(graph.page["uuid"], MANY_PROP, "alpha")
+
+    assert "duplicate" in (result.diagnostic or "")
+    # No write was sent the second time.
+    assert not any(m == "logseq.DB.upsertBlockProperty"
+                   for m, _ in client.calls[sent_after_first:])
+
+
+async def test_cardinality_one_still_overwrites(graph, mutations):
+    """The dedupe applies only to many; a one property must stay replaceable."""
+    await mutations.set_property(graph.page["uuid"], WRITABLE, 5)
+    result = await mutations.set_property(graph.page["uuid"], WRITABLE, 5)
+    assert result.verified is True
+
+
+async def test_create_tag_refuses_an_existing_page_title(graph, mutations):
+    """createPage already refuses a tag's title. Without the mirror check the
+    guard is asymmetric and both entities become unresolvable by title."""
+    with pytest.raises(ValueError, match="already exists"):
+        await mutations.create_tag("TEST-PAGE")
+
+
+# ------------------------------------------------- destructive-operation gates
+
+async def test_delete_property_refuses_while_values_exist(graph, mutations):
+    """deletePage gates on orphaning references; this destroys every value of
+    the property and had no gate at all."""
+    await mutations.set_property(graph.page["uuid"], WRITABLE, 5)
+
+    result = await mutations.delete_property(WRITABLE)
+
+    assert result.verified is False
+    assert "acknowledge_value_loss" in (result.diagnostic or "")
+    assert graph.entities[graph.prop["uuid"]] is not None
+
+
+async def test_delete_tag_refuses_while_holders_exist(graph, mutations):
+    await mutations.add_tag(graph.page["uuid"], graph.tag["uuid"])
+
+    result = await mutations.delete_tag(graph.tag["uuid"])
+
+    assert result.verified is False
+    assert "acknowledge_detach" in (result.diagnostic or "")
+    assert graph.tag["uuid"] in graph.entities
+
+
+async def test_property_usage_survives_a_literal_value(graph, mutations):
+    """checkbox and datetime store literals inline. Pulling the value made the
+    usage query 500 and left those properties undeletable."""
+    checkbox = graph.add("Flag", ident=":plugin.property._test_plugin/Flag",
+                         tags=[PROPERTY_CLASS_ID],
+                         extra={":logseq.property/type": "checkbox",
+                                "cardinality": ":db.cardinality/one"})
+    graph.entities[graph.page["uuid"]][checkbox["ident"]] = True
+
+    users = await mutations.get_property_users(checkbox["ident"])
+
+    assert users
+    assert users[0]["value"] is True
+    assert users[0]["value_entity"] is None

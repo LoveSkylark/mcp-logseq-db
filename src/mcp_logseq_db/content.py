@@ -405,6 +405,19 @@ class VerifiedContent(VerifiedWriteHelpers):
         exists is rejected rather than created, because verification could not
         then tell the new page from the old one.
         """
+        # Checked before the write, not after. Relying on Logseq to no-op a
+        # duplicate meant the failure surfaced as a readback mismatch, which
+        # reads like a transport problem rather than a rejected argument.
+        self._require_title(title)
+        existing = await self._entities_by_title(title)
+        if existing and not dry_run:
+            kinds = ", ".join(
+                "page" if e.get("name") else "block" for e in existing)
+            raise ValueError(
+                f"An entity titled {title!r} already exists ({kinds}). Pages, "
+                "tags and blocks share a title space, and a duplicate could "
+                "not be told from the original on read-back.")
+
         return await self.upsert_nodes(
             [{"operation": "add", "entityType": "page",
               "data": {"title": title}}],
@@ -566,12 +579,24 @@ class VerifiedContent(VerifiedWriteHelpers):
         page_uuid = self._require_entity(self._validated_uuid(page_uuid))
         page = await self._page_by_uuid(page_uuid)
         before = await self.get_block_uuid(page_uuid)
-        top_level = await self._children_of(page_uuid)
+
+        # Property values are materialized as blocks on the holder's page, so
+        # an unfiltered "delete every block" destroys them -- contradicting
+        # this tool's contract that property values survive. A value block
+        # carries :logseq.property/created-from-property.
+        value_block_ids = await self._property_value_block_ids(page["id"])
+        all_top_level = await self._children_of(page_uuid)
+        top_level = [b for b in all_top_level
+                     if b.get("id") not in value_block_ids]
+        preserved = len(all_top_level) - len(top_level)
 
         if not top_level:
             return ContentResult(
                 validation=None, response=None, verified_entities=(),
-                diagnostic="The page already has no blocks",
+                diagnostic=(
+                    "The page has no content blocks to remove"
+                    + (f"; {preserved} property value block(s) left in place"
+                       if preserved else "")),
                 previous_entities=(page,))
 
         response: Any = None
@@ -585,10 +610,16 @@ class VerifiedContent(VerifiedWriteHelpers):
             except httpx.TimeoutException:
                 timed_out = True
 
+        # Only content blocks should be gone. Property value blocks are
+        # expected to remain, so the predicate cannot simply be "no blocks" --
+        # that was why the read-back reported a state that did not hold.
+        async def content_blocks_left() -> list[dict[str, Any]]:
+            current = await self.get_block_uuid(page_uuid)
+            keep = await self._property_value_block_ids(page["id"])
+            return [b for b in current if b.get("id") not in keep]
+
         remaining = await poll_readback(
-            self._client,
-            lambda: self.get_block_uuid(page_uuid),
-            lambda blocks: not blocks)
+            self._client, content_blocks_left, lambda blocks: not blocks)
 
         if remaining:
             return ContentResult(
@@ -598,10 +629,17 @@ class VerifiedContent(VerifiedWriteHelpers):
                 previous_entities=tuple(before),
                 observed_entities=tuple(remaining))
 
+        # Re-read the page so verified_entities reflects the post-write state
+        # rather than the snapshot taken before it.
+        current_page = await self._optional_entity_by_uuid(page_uuid) or page
         return ContentResult(
-            validation=None, response=response, verified_entities=(page,),
+            validation=None, response=response,
+            verified_entities=(current_page,),
             recovered_after_timeout=timed_out,
-            diagnostic=f"Removed {len(top_level)} top-level block(s)",
+            diagnostic=(
+                f"Removed {len(top_level)} top-level block(s)"
+                + (f"; preserved {preserved} property value block(s)"
+                   if preserved else "")),
             previous_entities=tuple(before))
 
     async def _page_by_uuid(self, page_uuid: str) -> dict[str, Any]:
@@ -609,6 +647,23 @@ class VerifiedContent(VerifiedWriteHelpers):
         if not page.get("name"):
             raise ValueError("UUID identifies a block, not a page")
         return page
+
+    async def _property_value_block_ids(self, page_id: int) -> set[int]:
+        """
+        Blocks on this page that exist only to hold a property value.
+
+        Logseq materializes reference-typed property values as blocks, so they
+        appear in any page-scoped block query. Deleting them silently discards
+        the property values they carry.
+        """
+        query = (
+            "[:find [?block ...] :in $ ?page :where "
+            "[?block :block/page ?page] "
+            "[?block :logseq.property/created-from-property _]]"
+        )
+        found = await self._query_list(
+            query, "Property value block lookup", page_id)
+        return {value for value in found if isinstance(value, int)}
 
     async def _inbound_references(self, page_id: int) -> list[dict[str, Any]]:
         query = (
@@ -681,14 +736,34 @@ class VerifiedContent(VerifiedWriteHelpers):
         dry_run: bool = False,
     ) -> ContentResult:
         """Edit one existing block title."""
-        return await self.upsert_nodes(
+        block_uuid = self._require_entity(self._validated_uuid(block_uuid))
+        # Captured so the envelope can report the prior title. Without it an
+        # edit is the one write whose previous state cannot be recovered from
+        # its own result, which makes an unwanted change hard to undo.
+        previous = None
+        if not dry_run:
+            previous = await self._optional_entity_by_uuid(block_uuid)
+
+        result = await self.upsert_nodes(
             [{
                 "operation": "edit",
                 "entityType": "block",
-                "id": self._require_entity(self._validated_uuid(block_uuid)),
+                "id": block_uuid,
                 "data": {"title": title},
             }],
             dry_run=dry_run,
+        )
+        if previous is None:
+            return result
+        return ContentResult(
+            validation=result.validation,
+            response=result.response,
+            verified_entities=result.verified_entities,
+            recovered_after_timeout=result.recovered_after_timeout,
+            verified=result.verified,
+            diagnostic=result.diagnostic,
+            previous_entities=(previous,),
+            observed_entities=result.observed_entities,
         )
 
     @serialized_write
@@ -854,23 +929,22 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         normalized = await self._validate_operations(operations)
 
+        # The options map is REQUIRED. Sending one argument makes every write
+        # fail with "The Imported EDN has 4 validation error(s)".
+        validation = await self._client.call(
+            "logseq.DB.upsertNodes", [normalized, {"dry-run": True}])
         if dry_run:
-            # Local validation only. There is no server-side dry run: the
-            # options argument that used to request one is rejected by the API
-            # and broke every write that carried it. So this proves the
-            # arguments are well formed and the targets exist -- nothing more.
-            # It cannot tell you the write will land.
+            # verified=False deliberately. Nothing was written, so anything
+            # reading the boolean alone must not see a success -- the
+            # diagnostic explains, but the flag is what gets checked.
             return ContentResult(
-                validation={
-                    "checked": "arguments and target existence, locally",
-                    "not_checked": "whether the write route works on this build",
-                    "operations": normalized,
-                },
-                response=None,
-                verified_entities=(),
+                validation=validation, response=None, verified_entities=(),
+                verified=False,
                 diagnostic=(
-                    "Dry run is local validation only and is not evidence that "
-                    "the write will succeed."))
+                    "Dry run: nothing was written, so verified is false by "
+                    "design. It validates the PAYLOAD, not the transaction -- "
+                    "Logseq reports what it would create, and a graph carrying "
+                    "invalid entities can still reject the real write."))
 
         # Snapshot per add so the read-back can tell a new entity from one
         # that already carried the same title. Titles are not unique, so the
@@ -886,9 +960,8 @@ class VerifiedContent(VerifiedWriteHelpers):
         response: Any = None
         timed_out = False
         try:
-            # ONE argument. See the note on the options map above.
             response = await self._client.call(
-                "logseq.DB.upsertNodes", [normalized])
+                "logseq.DB.upsertNodes", [normalized, {"dry-run": False}])
         except httpx.TimeoutException:
             timed_out = True
 
@@ -901,7 +974,7 @@ class VerifiedContent(VerifiedWriteHelpers):
                 await self._verify_add(operation, before_ids[index]))
 
         return ContentResult(
-            validation=None,
+            validation=validation,
             response=response,
             verified_entities=tuple(verified),
             recovered_after_timeout=timed_out,
@@ -951,10 +1024,13 @@ class VerifiedContent(VerifiedWriteHelpers):
         if len(created) != 1:
             scope = ("under the requested parent"
                      if operation["entityType"] == "block" else "in the graph")
+            hint = ("check the parent UUID"
+                    if operation["entityType"] == "block"
+                    else "check whether the title is already taken")
             raise RuntimeError(
                 f"Expected one new {operation['entityType']} titled {title!r} "
                 f"{scope}, found {len(created)}. This API reports success for "
-                "writes that do nothing; check the parent UUID."
+                f"writes that do nothing; {hint}."
             )
         entity = created[0]
 

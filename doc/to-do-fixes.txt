@@ -1,26 +1,46 @@
-skill > data-modeling needs to be rebuilt:
+Final run log
+run: 2026-09-05 | logseq 2.0.1-alpha+nightly.20260826 | version_matches false
 
-**No page creation tool.** 
-    > therw are new page creation tools in place
-
-**No block movement.** 
-    > investigate the posibility of moveBlock tool, since the block possition is base on the parent UUID and the order: value both could be adjusted to move the block around
-
-
-**Properties: your namespace only.** You can create and set
-`plugin.property.<caller>/*`. Properties the user made in the UI live under
-`user.property/*` and are readable but not writable. If a model depends on
-writing an existing user property, it will not work.
-    > This needs furthe rexamination and testing are there shared namespaces available for global use.
-    > also we neeed to figure out how to set the <caller> th current ID just says "_tester"
-
-**Tags: creatable, deletion unverified.** 
-    > is should be simple to build an API check into the creatTag and deleteTag to verify if the change occure instead of depending on the original apic call for verification
-    > same should be investigated for all <null> repsones
-
-**Never report a write as done on the strength of the response.** Every tool
-returns `verified` and `verified_state`. `verified=false` means the write did
-not take effect even though no error was raised. Report that as a failure.
-    this needs to be fixed if the tool does no repson propperly then we will need to build a query into it to extract a response:
-        if tool API call is "create A" then we need the mcp tool to perform two API callsnad be "create A then check if A exists"
+SUITE 0                     SUITE 3                     SUITE 6
+T-001 PASS                  T-301 PASS (assum. wrong)   T-601 FAIL
+T-002 FAIL                  T-302 PASS                  T-602 BLOCKED (needs UI)
+T-003 PASS                  T-303 PASS                  T-603 PASS
+T-004 PASS                  T-304 PASS                  T-604 BLOCKED (no tool)
+T-005 PASS                  T-305 PASS                  T-605 PASS
+T-006 PASS                  T-306 PASS
+T-007 PASS                  T-307 PASS                  SUITE 7
+                            T-308 BLOCKED               T-701 PASS
+SUITE 1                     T-309 PASS                  T-702 PASS
+T-101 PASS                  T-310 PASS                  T-703 PASS
+T-102 PASS (wrong stage)    T-311 PASS                  T-704 PASS
+T-103 BLOCKED                                           T-705 PASS
+T-104 PASS                  SUITE 4                     T-706 NOT RUN
+T-105 PASS                  T-401 PASS                  T-707 PASS
+T-106 PASS                  T-402 PASS                  T-708 FAIL
+T-107 PASS                  T-403 PASS
+T-108 PASS                  T-404 PASS                  SUITE 8
+T-109 PASS                  T-405 PASS                  T-801 PASS
+T-110 PASS                  T-406 PASS                  T-802 PASS (key nit)
+T-111 PASS (uuid)           T-407 PASS                  T-803 PASS
+T-112 FAIL                  T-408 PASS                  T-804 PASS
+T-113 PASS                  T-409 FAIL                  T-805 FAIL
+                            T-410 FAIL                  T-806 PASS
+SUITE 2                     T-411 PASS                  T-807 PASS
+T-201 PASS                  T-412 PASS (not writable)
+T-202 FAIL                  T-413 PASS
+T-203 BLOCKED               T-414 PASS
+T-204 PASS                  T-415 PASS
+T-205 FAIL (hung server)    T-416 BLOCKED
+T-206 SKIPPED               T-417 partial FAIL
+T-207 FAIL
+T-208 BLOCKED               SUITE 5
+T-209 PASS                  T-501 PASS
+T-210 PASS                  T-502 PASS
+T-211 PASS                  T-503 BLOCKED
+T-212 PASS (caveat)         T-504 FAIL
+T-213 FAIL                  T-505 PASS
+T-214 PASS
+T-215 BLOCKED
+T-216 BLOCKED
+T-217 SKIPPED
 

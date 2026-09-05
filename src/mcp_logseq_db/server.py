@@ -259,13 +259,16 @@ def create_server(
 
     @server.tool(name="deleteTag", structured_output=True)
     async def delete_tag(
-        tag_uuid: str, acknowledge_child_reparent: bool = False
+        tag_uuid: str,
+        acknowledge_child_reparent: bool = False,
+        acknowledge_detach: bool = False,
     ) -> dict[str, Any]:
-        """Delete one tag entity. UNVERIFIED ROUTE: this has never been run successfully and its identifier type is unconfirmed, so check verified in the result. Requires acknowledgement when child tags would be reparented."""
+        """Delete one tag entity. Everything carrying the tag loses it, so acknowledge_detach is required when any page or block holds it, and acknowledge_child_reparent when child tags would be reparented. Run getTagUsers first to see what is affected."""
         tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
         return (await mutations().delete_tag(
             tag_uuid,
-            acknowledge_child_reparent=acknowledge_child_reparent)).to_dict()
+            acknowledge_child_reparent=acknowledge_child_reparent,
+            acknowledge_detach=acknowledge_detach)).to_dict()
 
     @server.tool(name="addTag", structured_output=True)
     async def add_tag(target_uuid: str, tag_uuid: str) -> dict[str, Any]:
@@ -311,9 +314,13 @@ def create_server(
             title, schema, options)).to_dict()
 
     @server.tool(name="deleteProperty", structured_output=True)
-    async def delete_property(property_ident: str) -> dict[str, Any]:
-        """Delete a property definition graph-wide, taking every value with it. Not reversible -- recreating mints a new entity. UNVERIFIED ROUTE: check verified in the result."""
-        return (await mutations().delete_property(property_ident)).to_dict()
+    async def delete_property(
+        property_ident: str, acknowledge_value_loss: bool = False
+    ) -> dict[str, Any]:
+        """Delete a property definition graph-wide, taking every value with it. Not reversible -- recreating mints a new entity and the old values do not return. acknowledge_value_loss is required when anything holds a value; run getProperyUsers first to see what is affected."""
+        return (await mutations().delete_property(
+            property_ident,
+            acknowledge_value_loss=acknowledge_value_loss)).to_dict()
 
     @server.tool(name="addProperty", structured_output=True)
     async def add_property(
@@ -451,7 +458,12 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "Pass an exact page UUID and one of: page, blocks, tags, "
             "properties, declared, all."
         ),
-        "create_page": "Pass a title that no existing page or block uses.",
+        "create_page": (
+            "Use a title no existing page, tag or block holds -- they share "
+            "one title space. If the failure is an EDN validation error from "
+            "upsertNodes instead, the title is not the problem: the graph is "
+            "refusing the transaction, and no retry or rename will help."
+        ),
         "rename_page": (
             "Pass an exact page UUID and a title nothing else already uses."
         ),

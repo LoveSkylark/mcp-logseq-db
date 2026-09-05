@@ -34,7 +34,7 @@ class FakeGraph:
                              tags=[PAGE_CLASS_ID])
 
     def add(self, title, parent, page, *, name=None, tags=None, ident=None,
-            entity_id=None) -> dict[str, Any]:
+            entity_id=None, extra=None) -> dict[str, Any]:
         entity_id = entity_id if entity_id is not None else next(self._ids)
         uuid = "%08x-0000-4000-8000-000000000000" % entity_id
         entity: dict[str, Any] = {"id": entity_id, "uuid": uuid, "title": title}
@@ -48,6 +48,8 @@ class FakeGraph:
             entity["parent"] = {"id": parent}
         if page is not None:
             entity["page"] = {"id": page}
+        if extra:
+            entity.update(extra)
         self.entities[uuid] = entity
         return entity
 
@@ -88,16 +90,23 @@ class FakeClient:
             return self._query(args[0], args[1:])
         raise AssertionError(f"unexpected method {method}")
 
-    def _upsert(self, operations):
-        # ONE argument. A second (the old {"dry-run": ...} map) is rejected by
-        # the real API with "The Imported EDN has 4 validation error(s)", which
-        # took down every write tool. The fake enforces the same arity so a
-        # regression fails here rather than on a live graph.
+    def _upsert(self, operations, options):
+        # TWO arguments. The options map is required -- sending one argument
+        # makes every write fail with "The Imported EDN has 4 validation
+        # error(s)". The fake enforces the arity so dropping it again fails
+        # here rather than on a live graph.
+        if options.get("dry-run"):
+            return "Dry run: ok"
         if not self.write_effective:
             return None          # the silent no-op
         for op in operations:
             if op["operation"] == "edit":
-                self.graph.entities[op["id"]]["title"] = op["data"]["title"]
+                # Replace rather than mutate: the real client returns a fresh
+                # dict per call, so an in-place edit would let a caller's
+                # earlier snapshot alias the updated entity.
+                current = self.graph.entities[op["id"]]
+                self.graph.entities[op["id"]] = {
+                    **current, "title": op["data"]["title"]}
                 continue
             data = op["data"]
             if op["entityType"] == "page":
@@ -134,7 +143,8 @@ class FakeClient:
             return self.graph.children(params[0])
         if "#uuid" in query and ":find (pull ?entity" in query:
             uuid = query.split('#uuid "')[1].split('"')[0]
-            return self.graph.entities.get(uuid)
+            found = self.graph.entities.get(uuid)
+            return dict(found) if found else None
         if ':block/title "' in query and ":find [(pull ?" in query:
             title = query.split(':block/title "')[1].split('"')[0]
             matches = [e for e in self.graph.entities.values()
@@ -142,21 +152,26 @@ class FakeClient:
             if "[?page :block/name]" in query:
                 matches = [e for e in matches if e.get("name")]
             return matches
+        if ":logseq.property/created-from-property" in query:
+            return [e["id"] for e in self.graph.entities.values()
+                    if e.get("page", {}).get("id") == params[0]
+                    and e.get(":logseq.property/created-from-property")]
         if "[?block :block/page ?page]" in query:
             return [e for e in self.graph.entities.values()
                     if e.get("page", {}).get("id") == params[0]]
         return []
 
 
-def test_upsert_nodes_sends_exactly_one_argument() -> None:
-    """Pinned because the second argument is not a harmless extra: the API
-    rejects the whole call, so every write tool fails at once."""
+def test_upsert_nodes_sends_the_options_map() -> None:
+    """Pinned because omitting it is not a harmless simplification: the API
+    rejects the whole call and every write tool fails at once. This was
+    removed once on the strength of a single call that appeared to work."""
     import inspect
     from mcp_logseq_db import content as content_module
 
     source = inspect.getsource(content_module.VerifiedContent.upsert_nodes)
-    assert '"logseq.DB.upsertNodes", [normalized]' in source
-    assert "dry-run" not in source
+    assert '[normalized, {"dry-run": True}]' in source
+    assert '[normalized, {"dry-run": False}]' in source
 
 
 @pytest.fixture
@@ -335,17 +350,17 @@ async def test_outline_dry_run_writes_nothing(graph, content):
     assert graph.children(graph.page["id"]) == []
 
 
-async def test_dry_run_is_local_only_and_says_so(graph, content):
-    """A dry run used to call the API and could report success on a build
-    where the write route was broken. It is now local validation, and the
-    result states that rather than implying more."""
+async def test_dry_run_validates_without_writing(graph, content):
+    """A dry run is a real API call that validates the payload. It is not
+    evidence the write will land: a graph carrying invalid entities passes
+    validation and still rejects the transaction."""
     result = await content.create_block(
         graph.page["uuid"], "Never created", dry_run=True)
 
     assert result.verified_entities == ()
     assert graph.children(graph.page["id"]) == []
-    assert "not evidence" in (result.diagnostic or "")
-    assert "not_checked" in result.validation
+    assert result.validation is not None
+    assert "not the transaction" in (result.diagnostic or "")
 
 
 # ------------------------------------------------------------- write scope
@@ -421,3 +436,68 @@ async def test_find_block_reports_missing_rather_than_raising(content):
         "block_uuid": "11111111-1111-4111-8111-111111111111",
         "block": None,
     }
+
+
+# --------------------------------------------------------- guard consistency
+
+async def test_create_page_refuses_a_duplicate_before_writing(graph, content):
+    """Pre-write, like renamePage. Relying on Logseq to no-op surfaced the
+    failure as a readback mismatch, which reads like a transport problem."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="already exists"):
+        await verified.create_page("TEST-PAGE")
+
+    assert not any(m == "logseq.DB.upsertNodes" for m, _ in client.calls)
+
+
+async def test_dry_run_does_not_report_verified_true(graph, content):
+    """Nothing was written, so anything reading the boolean alone must not
+    see a success."""
+    result = await content.create_block(
+        graph.page["uuid"], "Never created", dry_run=True)
+
+    assert result.verified is False
+    assert result.verified_entities == ()
+    assert graph.children(graph.page["id"]) == []
+
+
+async def test_update_block_envelope_carries_the_prior_title(graph, content):
+    """Without this an edit is the one write whose previous state cannot be
+    recovered from its own result."""
+    block = (await content.create_block(
+        graph.page["uuid"], "Before")).verified_entities[0]
+
+    result = await content.update_block(block["uuid"], "After")
+
+    assert result.previous_entities
+    assert result.previous_entities[0]["title"] == "Before"
+    assert result.verified_entities[0]["title"] == "After"
+
+
+# ----------------------------------------------------- clearPage preservation
+
+async def test_clear_page_preserves_property_value_blocks(graph, content):
+    """Property values are materialized as blocks on the page. An unfiltered
+    delete takes them, contradicting the tool's contract."""
+    await content.create_block(graph.page["uuid"], "real content")
+    graph.add("42", graph.page["id"], graph.page["id"],
+              extra={":logseq.property/created-from-property": {"id": 900}})
+
+    result = await content.clear_page(graph.page["uuid"])
+
+    assert result.verified is True
+    survivors = graph.children(graph.page["id"])
+    assert [b["title"] for b in survivors] == ["42"]
+    assert "preserved 1" in (result.diagnostic or "")
+
+
+async def test_clear_page_on_a_page_of_only_value_blocks(graph, content):
+    graph.add("42", graph.page["id"], graph.page["id"],
+              extra={":logseq.property/created-from-property": {"id": 900}})
+
+    result = await content.clear_page(graph.page["uuid"])
+
+    assert result.verified is True
+    assert len(graph.children(graph.page["id"])) == 1

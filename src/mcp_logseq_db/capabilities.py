@@ -58,6 +58,13 @@ PROBE_TIMEOUT_SECONDS = 30
 # not an ident, not a page name. Anything that acts on this is a Logseq bug.
 BAD_ARG = "__mcp_capability_probe__"
 
+# For methods that accept an arbitrary TITLE, BAD_ARG is not invalid enough:
+# createTag and upsertProperty happily create an entity named after it, and
+# every capabilities call then litters the graph with an orphan. A slash makes
+# the title unusable as a page name, which Logseq refuses -- proving the method
+# exists without creating anything.
+BAD_TITLE = "__mcp_capability_probe__/invalid"
+
 
 class State(str, Enum):
     AVAILABLE = "available"
@@ -204,8 +211,10 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "first and the page name second.",
     ),
     "clearPage": (
-        "One call per top-level block, since no batch delete exists. The page "
-        "entity, its tags and its property values are untouched.",
+        "One call per top-level content block, since no batch delete exists.",
+        "Property values are materialized as blocks on the page. They are "
+        "identified and preserved, so the number removed may be lower than "
+        "the number getBlockUUID reports.",
     ),
     "listPages": (
         "Excludes recycled pages, which keep the Page class and would "
@@ -287,6 +296,12 @@ class DBCapabilities:
                 "`unknown` means the probe was inconclusive, not that the tool "
                 "is unavailable. Try it and check the result."
             )
+        body["what_available_means"] = (
+            "The route exists and responds. Probes send deliberately invalid "
+            "arguments, so `available` establishes reachability, not that the "
+            "route accepts a real payload -- a method can reject valid "
+            "requests and still probe as available."
+        )
         if not self.version_matches:
             body["graph"]["caveat"] = (
                 "This graph is not the version these tools were verified "
@@ -321,10 +336,10 @@ PROBE_ARGS: dict[str, list[Any]] = {
     "logseq.DB.removeBlock": [BAD_ARG],
     "logseq.DB.renamePage": [BAD_ARG, BAD_ARG],
     "logseq.DB.deletePage": [BAD_ARG],
-    "logseq.DB.createTag": [BAD_ARG],
+    "logseq.DB.createTag": [BAD_TITLE],
     "logseq.DB.addBlockTag": [BAD_ARG, BAD_ARG],
     "logseq.DB.removeBlockTag": [BAD_ARG, BAD_ARG],
-    "logseq.DB.upsertProperty": [BAD_ARG, {}],
+    "logseq.DB.upsertProperty": [BAD_TITLE, {}],
     "logseq.DB.removeProperty": [BAD_ARG],
     "logseq.DB.upsertBlockProperty": [BAD_ARG, BAD_ARG, BAD_ARG],
     "logseq.DB.removeBlockProperty": [BAD_ARG, BAD_ARG],
