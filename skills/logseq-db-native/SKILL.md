@@ -5,7 +5,7 @@ description: "Use when reading or modifying a Logseq 2.x DB graph through the mc
 
 # Logseq DB-Native MCP
 
-For `mcp-logseq-db` against a Logseq 2.x **DB** graph. Do not load a
+For `mcp-logseq-db` against a Logseq 2.x **DB** graph. Do not load any other
 file-graph or legacy Logseq skill in the same conversation.
 
 ## The governing fact

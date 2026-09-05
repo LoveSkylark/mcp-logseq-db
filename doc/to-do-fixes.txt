@@ -1,0 +1,26 @@
+skill > data-modeling needs to be rebuilt:
+
+**No page creation tool.** 
+    > therw are new page creation tools in place
+
+**No block movement.** 
+    > investigate the posibility of moveBlock tool, since the block possition is base on the parent UUID and the order: value both could be adjusted to move the block around
+
+
+**Properties: your namespace only.** You can create and set
+`plugin.property.<caller>/*`. Properties the user made in the UI live under
+`user.property/*` and are readable but not writable. If a model depends on
+writing an existing user property, it will not work.
+    > This needs furthe rexamination and testing are there shared namespaces available for global use.
+    > also we neeed to figure out how to set the <caller> th current ID just says "_tester"
+
+**Tags: creatable, deletion unverified.** 
+    > is should be simple to build an API check into the creatTag and deleteTag to verify if the change occure instead of depending on the original apic call for verification
+    > same should be investigated for all <null> repsones
+
+**Never report a write as done on the strength of the response.** Every tool
+returns `verified` and `verified_state`. `verified=false` means the write did
+not take effect even though no error was raised. Report that as a failure.
+    this needs to be fixed if the tool does no repson propperly then we will need to build a query into it to extract a response:
+        if tool API call is "create A" then we need the mcp tool to perform two API callsnad be "create A then check if A exists"
+
