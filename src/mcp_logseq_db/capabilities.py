@@ -107,6 +107,7 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "createBlock":          ("logseq.DB.insertBlock",),
     "updateBlock":          ("logseq.DB.updateBlock",),
     "removeBlock":          ("logseq.DB.removeBlock",),
+    "moveBlock":            ("logseq.DB.moveBlock",),
     "createManyBlocks":     ("logseq.DB.insertBatchBlock",),
     "createPageofBlocks":   ("logseq.DB.insertBatchBlock",
                              "logseq.DB.datascriptQuery"),
@@ -178,6 +179,16 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "Both :block/parent and :block/page are verified after the write. A "
         "block with the right parent and the wrong owning page is a real "
         "child that no page-scoped query can see.",
+    ),
+    "moveBlock": (
+        "moveBlock returns null whether it moved the block or did nothing, so "
+        "the result is established by reading back rather than from the "
+        "response.",
+        "Verified on three counts: the new parent, the owning page, and that "
+        "descendants followed. A block whose page did not follow is a real "
+        "child of the target that no page-scoped query can see.",
+        "placement is child, before or after. A page has no siblings, so a "
+        "page target requires child.",
     ),
     "createManyBlocks": (
         "Whether a batch applies atomically is untested. On failure, check "
@@ -345,6 +356,7 @@ PROBE_ARGS: dict[str, list[Any]] = {
     "logseq.DB.insertBatchBlock": [BAD_ARG, [], {}],
     "logseq.DB.updateBlock": [BAD_ARG, BAD_ARG],
     "logseq.DB.removeBlock": [BAD_ARG],
+    "logseq.DB.moveBlock": [BAD_ARG, BAD_ARG, {}],
     "logseq.DB.renamePage": [BAD_ARG, BAD_ARG],
     "logseq.DB.deletePage": [BAD_ARG],
     "logseq.DB.createTag": [BAD_TITLE],

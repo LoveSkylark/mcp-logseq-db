@@ -91,7 +91,6 @@ async def test_non_db_namespaces_are_rejected(method: str) -> None:
         "logseq.DB.setPropertyNodeTags",
         "logseq.DB.q",
         "logseq.DB.customQuery",
-        "logseq.DB.moveBlock",
         "logseq.DB.setBlockIcon",
         "logseq.DB.getProperty",
         "logseq.DB.getTag",

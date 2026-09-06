@@ -91,6 +91,8 @@ class FakeClient:
             return self._insert_batch(*args)
         if method == "logseq.DB.removeBlock":
             return self._remove(args[0])
+        if method == "logseq.DB.moveBlock":
+            return self._move(*args)
         if method == "logseq.DB.datascriptQuery":
             return self._query(args[0], args[1:])
         raise AssertionError(f"unexpected method {method}")
@@ -141,6 +143,23 @@ class FakeClient:
         page = target["id"] if target.get("name") else target["page"]["id"]
         return [dict(self.graph.add(b["content"], target["id"], page))
                 for b in blocks]
+
+    def _move(self, block_uuid, target_uuid, options=None):
+        """Reparent, carrying the subtree's page with it. Returns nothing --
+        which is the whole reason the tool verifies by reading back."""
+        if not self.write_effective:
+            return None
+        block = self.graph.entities[block_uuid]
+        target = self.graph.entities[target_uuid]
+        as_child = bool((options or {}).get("children"))
+        parent = target["id"] if as_child else target["parent"]["id"]
+        page = target["id"] if target.get("name") else target["page"]["id"]
+
+        block["parent"] = {"id": parent}
+        block["page"] = {"id": page}
+        for descendant in self.graph.descendants(block["id"]):
+            descendant["page"] = {"id": page}
+        return None
 
     def _remove(self, uuid):
         if not self.write_effective:
@@ -666,3 +685,94 @@ async def test_outline_children_belong_to_the_page_at_every_depth(graph, content
     for block in graph.entities.values():
         if block.get("title") in {"A", "A1", "A1a"}:
             assert block["page"]["id"] == graph.page["id"]
+
+
+# ------------------------------------------------------------------- moving
+
+async def test_move_reparents_and_keeps_the_page(graph, content):
+    first = (await content.create_block(
+        graph.page["uuid"], "First")).verified_entities[0]
+    second = (await content.create_block(
+        graph.page["uuid"], "Second")).verified_entities[0]
+
+    result = await content.move_block(second["uuid"], first["uuid"])
+
+    assert result.verified is True
+    moved = result.verified_entities[0]
+    assert moved["parent"]["id"] == first["id"]
+    assert moved["page"]["id"] == graph.page["id"]
+
+
+async def test_move_carries_descendants(graph, content):
+    """A subtree left pointing at the old page is the same invisible-orphan
+    failure, one level down."""
+    first = (await content.create_block(
+        graph.page["uuid"], "First")).verified_entities[0]
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    child = (await content.create_block(
+        parent["uuid"], "Child")).verified_entities[0]
+
+    result = await content.move_block(parent["uuid"], first["uuid"])
+
+    assert result.verified is True
+    assert graph.entities[child["uuid"]]["page"]["id"] == graph.page["id"]
+
+
+async def test_move_reports_a_silent_no_op(graph):
+    """moveBlock returns null whether or not it did anything, so a write that
+    changed nothing looks identical to one that worked."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    first = (await verified.create_block(
+        graph.page["uuid"], "First")).verified_entities[0]
+    second = (await verified.create_block(
+        graph.page["uuid"], "Second")).verified_entities[0]
+    client.write_effective = False
+
+    result = await verified.move_block(second["uuid"], first["uuid"])
+
+    assert result.verified is False
+    assert "silent no-op" in (result.diagnostic or "")
+
+
+async def test_move_detects_a_stranded_page_pointer(graph):
+    class StrandingClient(FakeClient):
+        def _move(self, block_uuid, target_uuid, options=None):
+            # Reparents but leaves the owning page behind.
+            block = self.graph.entities[block_uuid]
+            target = self.graph.entities[target_uuid]
+            block["parent"] = {"id": target["id"]}
+            return None
+
+    graph2 = FakeGraph()
+    other = graph2.add("OTHER", None, None, name="other",
+                       tags=[PAGE_CLASS_ID])
+    client = StrandingClient(graph2)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    block = (await verified.create_block(
+        graph2.page["uuid"], "Wanderer")).verified_entities[0]
+
+    result = await verified.move_block(block["uuid"], other["uuid"])
+
+    assert result.verified is False
+    assert "owning page did not follow" in (result.diagnostic or "")
+
+
+async def test_move_refuses_a_target_inside_its_own_subtree(graph, content):
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    child = (await content.create_block(
+        parent["uuid"], "Child")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="own subtree"):
+        await content.move_block(parent["uuid"], child["uuid"])
+
+
+async def test_move_refuses_a_page_target_for_sibling_placement(graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], "Block")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="page has no siblings"):
+        await content.move_block(
+            block["uuid"], graph.page["uuid"], placement="after")

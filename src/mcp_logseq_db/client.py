@@ -63,6 +63,7 @@ WRITE_METHODS = frozenset({
     "logseq.DB.upsertNodes",            # createPage
     "logseq.DB.insertBlock",            # createBlock
     "logseq.DB.insertBatchBlock",       # createManyBlocks, createPageofBlocks
+    "logseq.DB.moveBlock",              # moveBlock
     "logseq.DB.updateBlock",            # updateBlock
     "logseq.DB.removeBlock",            # removeBlock
     "logseq.DB.createTag",              # creatTag

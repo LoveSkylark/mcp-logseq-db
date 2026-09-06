@@ -233,6 +233,21 @@ def create_server(
         return (await content().update_block(
             block_uuid, title, dry_run=dry_run)).to_dict()
 
+    @server.tool(name="moveBlock", structured_output=True)
+    async def move_block(
+        block_uuid: str,
+        target_uuid: str,
+        placement: Literal["child", "before", "after"] = "child",
+    ) -> dict[str, Any]:
+        """Move a block and its subtree relative to a target. placement=child puts it under the target (a page target moves it to the page's top level); before and after place it as a sibling. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed."""
+        block_uuid = require_uuid(
+            block_uuid, role="block_uuid", hint="getBlockUUID")
+        target_uuid = require_uuid(
+            target_uuid, role="target_uuid",
+            hint="getBlockUUID or getPageUUID")
+        return (await content().move_block(
+            block_uuid, target_uuid, placement=placement)).to_dict()
+
     @server.tool(name="removeBlock", structured_output=True)
     async def remove_block(block_uuid: str) -> dict[str, Any]:
         """Delete a block and its entire subtree, then verify every UUID in that subtree is absent."""
@@ -382,10 +397,15 @@ def create_server(
     @server.tool(name="listClosedValues")
     async def list_closed_values() -> Any:
         """List every enum property with its permitted values. Required before setting Status, Priority, or any closed property -- the value must be one of these entities."""
+        # The relationship is stored on the VALUE, pointing back at its
+        # property, under a bare unnamespaced ident. Querying the property
+        # side for a `closed-values` attribute finds nothing, because no such
+        # attribute exists on this build.
         return await query(
-            "[:find (pull ?prop [:db/ident :block/title]) "
-            "(pull ?value [:db/id :db/ident :block/title]) "
-            ":where [?prop :property/closed-values ?value]]")
+            "[:find (pull ?prop [:db/id :db/ident :block/title]) "
+            "(pull ?value [:db/id :db/ident :block/title "
+            ":logseq.property/value :block/order]) "
+            ":where [?value :closed-value-property ?prop]]")
 
     @server.tool(name="listOrphanTags")
     async def list_orphan_tags() -> Any:
@@ -499,6 +519,11 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "consistent and never jumps more than one level."
         ),
         "update_block": "Pass an exact block UUID and a non-empty title.",
+        "move_block": (
+            "Pass the block to move, then the target, then placement. The "
+            "target may be a block, or a page when placement is child. A "
+            "block cannot be moved inside its own subtree."
+        ),
         "remove_block": "Pass an exact block UUID, not a page UUID.",
         "get_tag_uuid": "Pass the tag's display title.",
         "get_tag": "Pass an exact tag UUID.",

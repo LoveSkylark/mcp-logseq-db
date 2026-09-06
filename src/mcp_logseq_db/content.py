@@ -1004,6 +1004,122 @@ class VerifiedContent(VerifiedWriteHelpers):
         )
 
     @serialized_write
+    async def move_block(
+        self,
+        block_uuid: str,
+        target_uuid: str,
+        *,
+        placement: str = "child",
+    ) -> ContentResult:
+        """
+        Move a block, and its subtree, relative to a target.
+
+        `moveBlock` returns null whether it moved the block or did nothing, so
+        the outcome is established by reading afterwards rather than from the
+        response.
+
+        Three things are checked, because a move can go wrong in three ways:
+        the parent may not change; the owning page may not follow the block to
+        a new page; and descendants may be left behind pointing at the old
+        page. The last two are invisible to page-scoped queries, which is the
+        same failure that made malformed nested writes undetectable.
+        """
+        block_uuid = self._require_entity(self._validated_uuid(block_uuid))
+        target_uuid = self._validated_uuid(target_uuid)
+        if placement not in {"child", "before", "after"}:
+            raise ValueError("placement must be child, before, or after")
+
+        block = await self._preflight_block(block_uuid, role="source")
+        target = await self._entity_by_uuid(target_uuid)
+        if block["id"] == target["id"]:
+            raise ValueError("A block cannot be moved relative to itself")
+        if placement != "child" and target.get("name"):
+            raise ValueError(
+                "A page has no siblings; use placement=child to move a block "
+                "to the top level of a page")
+
+        # Moving a block beneath its own descendant would detach the subtree
+        # from the tree entirely.
+        subtree = await self._descendants_by_parent(block_uuid)
+        if any(d.get("id") == target["id"] for d in subtree):
+            raise ValueError(
+                "The target is inside the block's own subtree; moving there "
+                "would detach it from the graph")
+
+        expected_parent = (target["id"] if placement == "child"
+                           else self._reference_id(target.get("parent")))
+        expected_page = (target["id"] if target.get("name")
+                         else self._reference_id(target.get("page")))
+        if expected_parent is None or expected_page is None:
+            raise RuntimeError(
+                "The target is missing the parent or page reference needed to "
+                "place a block relative to it")
+
+        options = ({"children": True} if placement == "child"
+                   else {"before": placement == "before"})
+        response, timed_out = await self._call_ambiguous(
+            "logseq.DB.moveBlock", [block_uuid, target_uuid, options])
+
+        moved = await poll_readback(
+            self._client,
+            lambda: self._optional_entity_by_uuid(block_uuid),
+            lambda value: (
+                value is not None
+                and self._reference_id(value.get("parent")) == expected_parent
+                and self._reference_id(value.get("page")) == expected_page),
+        )
+        if moved is None:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic="The block disappeared during the move",
+                previous_entities=(block,))
+
+        actual_parent = self._reference_id(moved.get("parent"))
+        actual_page = self._reference_id(moved.get("page"))
+
+        if actual_parent != expected_parent:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(moved,),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "The move was not observed; the block still has its "
+                    "original parent. moveBlock returns null whether or not it "
+                    "did anything, so this is what a silent no-op looks like."),
+                previous_entities=(block,), observed_entities=(moved,))
+
+        if actual_page != expected_page:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(moved,),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "The block moved but its owning page did not follow. It is "
+                    "now a real child of the target while belonging to another "
+                    "page, so no page-scoped query can see it. Run findOrphans "
+                    "on both pages."),
+                previous_entities=(block,), observed_entities=(moved,))
+
+        # Descendants must have come along. A subtree left pointing at the old
+        # page is the same invisible-orphan failure, one level down.
+        stranded = [
+            d for d in await self._descendants_by_parent(block_uuid)
+            if self._reference_id(d.get("page")) != expected_page
+        ]
+        if stranded:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(moved,),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    f"The block moved but {len(stranded)} descendant(s) still "
+                    "belong to the old page. They are invisible to page-scoped "
+                    "queries until repaired."),
+                previous_entities=(block,), observed_entities=tuple(stranded))
+
+        return ContentResult(
+            validation=None, response=response, verified_entities=(moved,),
+            recovered_after_timeout=timed_out, previous_entities=(block,))
+
+    @serialized_write
     async def remove_block(self, block_uuid: str) -> ContentResult:
         """
         Delete one block and its subtree, then verify the whole subtree is gone.

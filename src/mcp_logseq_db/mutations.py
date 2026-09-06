@@ -1,5 +1,27 @@
 """Tag and property mutations with exact resolution and mandatory read-back.
 
+WHAT CHANGED, AND WHY
+---------------------
+The page/block method pairs are gone. `add_page_tag`/`add_block_tag` and
+`upsert_page_property`/`upsert_block_property` did the same thing through the
+same API method -- a page IS a block in the DB, so the target is uniform.
+Exposing both forced a caller to choose between identical operations. There is
+now one `add_tag` and one `set_property`, each taking a target UUID that may be
+either.
+
+The graph-worker CLI tag paths are gone. `addBlockTag` and `removeBlockTag`
+work over HTTP; the CLI fallback existed on the strength of a capability list
+that turned out to be wrong.
+
+Dropped entirely, having no tool in the current surface: `rename_tag`
+(routed through `renamePage`), `add_tag_property`, `remove_tag_property`,
+`set_tag_parent`, `remove_tag_extends`, `set_block_icon`, `remove_block_icon`.
+None of their API methods are in the client allowlist any more.
+
+`getTag` and `getProperty` are likewise gone as routes -- entities are resolved
+through Datascript, which is the only read this surface relies on beyond a
+handful of dedicated methods.
+
 IDENTIFIER DISCIPLINE
 ---------------------
 Tags are keyed by UUID for relation operations. Properties are keyed by
@@ -252,7 +274,10 @@ class VerifiedMutations(VerifiedWriteHelpers):
         Detach one tag from a page or a block.
 
         Removes that relation only. Other tags on the target are untouched and
-        the tag entity survives. Both arguments are UUIDs; the target comes first. 
+        the tag entity survives. There is no `upsertNodes` route for this --
+        `operation` offers only `add` and `edit`, with no retraction verb, so a
+        removal expressed as an upsert would mean overwriting the whole tag set
+        and risking the loss of `:logseq.class/Page`.
         """
         return await self._update_tag(target_uuid, tag_uuid, remove=True)
 
@@ -350,7 +375,7 @@ class VerifiedMutations(VerifiedWriteHelpers):
                 if isinstance(r, list) and len(r) == 2]
 
         # Reference-typed values come back as entity ids; resolve those and
-        # leave literals alone. The value is NOT pulled.
+        # leave literals alone.
         resolved = await self._resolve_entities(
             {r[1] for r in rows
              if isinstance(r[1], int) and not isinstance(r[1], bool)})
@@ -428,15 +453,39 @@ class VerifiedMutations(VerifiedWriteHelpers):
                 response=response, previous_state=None, observed_state=None,
                 timed_out=timed_out)
 
-        diagnostic = None
+        # Existence is not the whole contract. A property created with a
+        # different type than requested behaves differently on every later
+        # write -- a `number` that is really `default` will not reject a
+        # string, and a scalar that is really a ref stores something else
+        # entirely. Checking the type here is the only place that is cheap.
+        requested_type = (schema or {}).get("type")
+        actual_type = self._property_type(current)
+        if requested_type and actual_type != requested_type:
+            self._raise_verification(
+                f"Property {ident} was created with type {actual_type!r}, not "
+                f"the requested {requested_type!r}. Later writes would be "
+                "validated against the wrong type.",
+                response=response, previous_state=None,
+                observed_state=current, timed_out=timed_out)
+
+        notes = []
         actual_title = current.get("title")
         if isinstance(actual_title, str) and actual_title != title:
-            diagnostic = (
+            notes.append(
                 f"Logseq normalized the title {title!r} to {actual_title!r}; "
-                f"use the exact ident {ident!r} for later operations"
-            )
+                f"use the exact ident {ident!r} for later operations")
+        cardinality = (current.get("cardinality")
+                       or current.get(":db/cardinality"))
+        if cardinality:
+            notes.append(f"cardinality is {cardinality}")
+        if current.get("valueType"):
+            notes.append(
+                f"values are stored as {current['valueType']} -- a write "
+                "supplies a literal and Logseq mints the value entity")
+
         return MutationResult(
-            response=response, verified_state=current, diagnostic=diagnostic)
+            response=response, verified_state=current,
+            diagnostic="; ".join(notes) if notes else None)
 
     @serialized_write
     async def delete_property(
@@ -587,16 +636,33 @@ class VerifiedMutations(VerifiedWriteHelpers):
             "logseq.DB.upsertBlockProperty",
             [target_uuid, ident, value, options or {}])
 
-        current = await poll_readback(
-            self._client,
-            lambda: self._entity(target_uuid),
-            lambda e: ident in e,
-        )
+        async def value_matches() -> tuple[dict[str, Any], bool]:
+            entity = await self._entity(target_uuid)
+            if ident not in entity:
+                return entity, False
+            held = await self._resolved_values(entity.get(ident))
+            return entity, self._value_already_present(held, value)
+
+        current, matched = await poll_readback(
+            self._client, value_matches, lambda state: state[1])
+
         if ident not in current:
             self._raise_verification(
                 f"Property {ident} was not set on the target",
                 response=response, previous_state=previous,
                 observed_state=current, timed_out=timed_out)
+        if not matched:
+            # Presence is not correctness. The property is there holding
+            # something other than what was asked for, which reads as success
+            # if only presence is checked.
+            held = await self._resolved_values(current.get(ident))
+            self._raise_verification(
+                f"Property {ident} was set but holds {held!r}, not "
+                f"{value!r}. The write landed a different value than the one "
+                "requested.",
+                response=response, previous_state=previous,
+                observed_state=current, timed_out=timed_out)
+
         return MutationResult(
             response=response, verified_state=current,
             recovered_after_timeout=timed_out, previous_state=previous,
@@ -765,14 +831,20 @@ class VerifiedMutations(VerifiedWriteHelpers):
         if held is None:
             return []
         items = held if isinstance(held, list) else [held]
-        ids = {item.get("id") if isinstance(item, dict) else item
-               for item in items}
+
+        def key_of(item: Any) -> Any:
+            if isinstance(item, dict):
+                # A pull returns {"id": N}; a caller may pass {"db/id": N}.
+                return item.get("id", item.get("db/id"))
+            return item
+
+        ids = {key_of(item) for item in items}
         ids = {i for i in ids if isinstance(i, int) and not isinstance(i, bool)}
         entities = await self._resolve_entities(ids)
 
         out: list[Any] = []
         for item in items:
-            key = item.get("id") if isinstance(item, dict) else item
+            key = key_of(item)
             entity = entities.get(key) if isinstance(key, int) else None
             if entity is not None:
                 out.append(entity.get(":logseq.property/value",

@@ -123,7 +123,11 @@ class FakeClient:
 
     def _upsertProperty(self, title, schema=None, options=None):
         ident = f":plugin.property._test_plugin/{title}"
-        return self.graph.add(title, ident=ident, tags=[PROPERTY_CLASS_ID])
+        return self.graph.add(
+            title, ident=ident, tags=[PROPERTY_CLASS_ID],
+            extra={":logseq.property/type": (schema or {}).get("type",
+                                                               "default"),
+                   "cardinality": ":db.cardinality/one"})
 
     def _removeProperty(self, ident):
         if not self.write_effective:
@@ -501,3 +505,64 @@ async def test_delete_property_sweeps_its_value_blocks(graph):
     assert result.verified is True
     assert value_block["uuid"] not in graph.entities
     assert "swept 1" in (result.diagnostic or "")
+
+
+# ------------------------------------------------- verification is substantive
+
+async def test_set_property_rejects_a_value_that_did_not_land(graph):
+    """Presence is not correctness. Checking only that the ident appeared
+    would report success for a write that stored something else."""
+    class WrongValueClient(FakeClient):
+        def _upsertBlockProperty(self, target, ident, value, options=None):
+            self.graph.entities[target][ident] = "something else"
+            return None
+
+    client = WrongValueClient(graph)
+
+    with pytest.raises(MutationVerificationError, match="not 5"):
+        await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
+            graph.page["uuid"], WRITABLE, 5)
+
+
+async def test_set_property_accepts_a_materialized_value(graph):
+    """The realistic shape: the write stores a pointer to a minted value
+    entity, so the check has to resolve before comparing."""
+    class MaterializingClient(FakeClient):
+        def _upsertBlockProperty(self, target, ident, value, options=None):
+            entity = self.graph.add(
+                str(value), extra={":logseq.property/value": value})
+            self.graph.entities[target][ident] = {"id": entity["id"]}
+            return None
+
+    client = MaterializingClient(graph)
+
+    result = await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
+        graph.page["uuid"], WRITABLE, 5)
+
+    assert result.verified is True
+
+
+async def test_create_property_rejects_a_type_that_does_not_match(graph):
+    """A `number` that is really `default` will not reject a string later,
+    and every subsequent write is validated against the wrong type."""
+    class WrongTypeClient(FakeClient):
+        def _upsertProperty(self, title, schema=None, options=None):
+            return self.graph.add(
+                title, ident=f":plugin.property._test_plugin/{title}",
+                tags=[PROPERTY_CLASS_ID],
+                extra={":logseq.property/type": "default"})
+
+    client = WrongTypeClient(graph)
+
+    with pytest.raises(MutationVerificationError, match="not the requested"):
+        await VerifiedMutations(client).create_property(  # type: ignore[arg-type]
+            "Budget", {"type": "number"})
+
+
+async def test_create_property_reports_storage_shape(graph, mutations):
+    """Cardinality and valueType decide how later writes behave, so they are
+    surfaced rather than left to be discovered."""
+    result = await mutations.create_property("Budget", {"type": "number"})
+
+    assert result.verified is True
+    assert "cardinality" in (result.diagnostic or "")

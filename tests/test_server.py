@@ -26,6 +26,7 @@ EXPECTED_TOOLS = {
     # Blocks
     "getBlockUUID", "getBlock", "getBlockTree", "findOrphans", "createBlock",
     "createManyBlocks", "createPageofBlocks", "updateBlock", "removeBlock",
+    "moveBlock",
     # Tags
     "getTagUUID", "getTag", "getTagUsers", "creatTag", "deleteTag",
     "addTag", "removeTag",
@@ -42,7 +43,6 @@ EXPECTED_TOOLS = {
 # restore one by assuming it was an oversight.
 REMOVED_TOOLS = {
     "insert_block":            "no verified route; nesting is createBlock",
-    "move_block":              "no verified route at all",
     "create_top_level_block":  "createBlock covers page and block parents",
     "add_page_tag":            "a page is a block; addTag takes either",
     "remove_page_tag":         "a page is a block; removeTag takes either",
