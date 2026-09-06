@@ -24,8 +24,8 @@ still true.
 **Reads**
 
 `capabilities` · `getPageUUID` · `getPage` · `getBlockUUID` · `getBlock` ·
-`getBlockTree` · `getTagUUID` · `getTag` · `getTagUsers` · `getPropertyIndent`
-· `getProperyUsers`
+`getBlockTree` · `findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
+`getPropertyIndent` · `getProperyUsers`
 
 **Lists** — no arguments, each returns a whole kind
 
@@ -35,9 +35,10 @@ still true.
 
 **Writes** — each verifies by read-back
 
-`createBlock` · `createManyBlocks` · `createPageofBlocks` · `updateBlock` ·
-`removeBlock` · `creatTag` · `deleteTag` · `addTag` · `removeTag` ·
-`createProperty` · `deleteProperty` · `addProperty` · `removeProperty`
+`createPage` · `renamePage` · `deletePage` · `clearPage` · `createBlock` ·
+`createManyBlocks` · `createPageofBlocks` · `updateBlock` · `removeBlock` ·
+`creatTag` · `deleteTag` · `addTag` · `removeTag` · `createProperty` ·
+`deleteProperty` · `addProperty` · `removeProperty`
 
 There is one `addTag`, not an `addPageTag` and an `addBlockTag` — a page **is**
 a block in the DB, so the target is uniform and there is nothing to choose
@@ -55,13 +56,20 @@ writable. Properties created in the Logseq UI live under `user.property/*` and
 are readable but not writable, as are built-ins under `:logseq.property/`. This
 is Logseq's restriction, not this server's.
 
-**No page create, rename, or delete tool.** All three routes exist and none is
-exposed.
+**Property values are blocks.** Reference-typed values are materialized as
+blocks on the holder's page. `clearPage` identifies and preserves them; other
+tools should not assume every block on a page is content.
 
-**No block move.** No route has been found for it at all.
+**No block move.** `moveBlock` exists but has never been observed changing
+anything, and no tool exposes it.
 
-**`deleteTag` and `deleteProperty` are unverified.** Both are destructive and
-neither has been confirmed working. Check `verified` in the result.
+**Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
+`deleteProperty` refuse until you confirm, listing what would be affected.
+
+**Some Logseq behaviours are absent on recent builds.** `[[Page]]` written
+through the API stays inert — stored as text with no reference. And
+`listClosedValues` returns nothing, because no closed-value relationship
+exists in the graph.
 
 **Recycled pages survive deletion**, keeping their UUID, tags, and blocks, so
 `listPages` excludes them explicitly and `listRecycled` shows them. Inbound

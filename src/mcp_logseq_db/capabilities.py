@@ -104,11 +104,11 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "getBlockUUID":         ("logseq.DB.datascriptQuery",),
     "findOrphans":          ("logseq.DB.datascriptQuery",),
     "getBlock":             ("logseq.DB.getBlock",),
-    "createBlock":          ("logseq.DB.upsertNodes",),
+    "createBlock":          ("logseq.DB.insertBlock",),
     "updateBlock":          ("logseq.DB.updateBlock",),
     "removeBlock":          ("logseq.DB.removeBlock",),
-    "createManyBlocks":     ("logseq.DB.upsertNodes",),
-    "createPageofBlocks":   ("logseq.DB.upsertNodes",
+    "createManyBlocks":     ("logseq.DB.insertBatchBlock",),
+    "createPageofBlocks":   ("logseq.DB.insertBatchBlock",
                              "logseq.DB.datascriptQuery"),
     # Pages
     "getPageUUID":          ("logseq.DB.datascriptQuery",),
@@ -173,10 +173,11 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "createBlock": (
         "The parent may be a page UUID (top-level block) or a block UUID "
         "(nested child). It will not resolve a page name.",
-        "Only the title can be set at creation; tags, order and position are "
+        "Only the title can be set at creation; tags and position are "
         "follow-up calls.",
-        "The new UUID is assigned by Logseq and not returned. Read it back if "
-        "you need it.",
+        "Both :block/parent and :block/page are verified after the write. A "
+        "block with the right parent and the wrong owning page is a real "
+        "child that no page-scoped query can see.",
     ),
     "createManyBlocks": (
         "Whether a batch applies atomically is untested. On failure, check "
@@ -339,7 +340,9 @@ PROBE_ARGS: dict[str, list[Any]] = {
     "logseq.DB.getTagsByName": [BAD_ARG],
     "logseq.DB.getBlock": [BAD_ARG],
     # Writes, probed with invalid arguments.
-    "logseq.DB.upsertNodes": [[{}]],
+    "logseq.DB.upsertNodes": [[{}], {"dry-run": True}],
+    "logseq.DB.insertBlock": [BAD_ARG, BAD_TITLE, {}],
+    "logseq.DB.insertBatchBlock": [BAD_ARG, [], {}],
     "logseq.DB.updateBlock": [BAD_ARG, BAD_ARG],
     "logseq.DB.removeBlock": [BAD_ARG],
     "logseq.DB.renamePage": [BAD_ARG, BAD_ARG],

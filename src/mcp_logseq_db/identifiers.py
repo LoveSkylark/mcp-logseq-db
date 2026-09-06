@@ -12,16 +12,7 @@ not raise -- it returns success and does nothing:
 Because the failure is silent, the only place it can be caught cheaply is
 before the call. A validator that rejects a bad value is table stakes; the
 useful part is naming what was passed instead, since the caller nearly always
-has the right value one lookup away.
-
-Observed mistakes, all of which reach the API and quietly do nothing:
-
-    "$TAG-UUID"                     placeholder never substituted
-    "{{tagUuid}}"                   Postman-style variable
-    ":user.class/xzy-bc0auNqC"      the tag's ident, not its UUID
-    "TAG-TEST"                      the tag's title
-    "859"                           a :db/id, unstable across rebuilds
-"""
+has the right value one lookup away."""
 
 from __future__ import annotations
 

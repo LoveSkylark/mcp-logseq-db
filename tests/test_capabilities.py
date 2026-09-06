@@ -137,7 +137,7 @@ async def test_a_tool_is_unavailable_if_any_route_it_needs_is() -> None:
     """createPageofBlocks needs upsertNodes AND datascriptQuery. The worst
     state across routes wins rather than the best."""
     client = ProbeClient({
-        "logseq.DB.upsertNodes": Exception(
+        "logseq.DB.insertBatchBlock": Exception(
             "Editing a page, tag or property isn't supported yet"),
     })
 

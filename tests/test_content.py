@@ -9,6 +9,7 @@ failure mode this API actually has.
 """
 
 import itertools
+import re
 from typing import Any
 
 import pytest
@@ -84,6 +85,10 @@ class FakeClient:
         self.calls.append((method, args))
         if method == "logseq.DB.upsertNodes":
             return self._upsert(*args)
+        if method == "logseq.DB.insertBlock":
+            return self._insert_block(*args)
+        if method == "logseq.DB.insertBatchBlock":
+            return self._insert_batch(*args)
         if method == "logseq.DB.removeBlock":
             return self._remove(args[0])
         if method == "logseq.DB.datascriptQuery":
@@ -119,6 +124,24 @@ class FakeClient:
             self.graph.add(data["title"], parent["id"], page)
         return {"block": len(operations)}
 
+    def _insert_block(self, target_uuid, title, options=None):
+        """sibling: false means child of the target. Unlike upsertNodes this
+        sets :block/parent and :block/page independently, and returns the
+        created entity."""
+        if not self.write_effective:
+            return None
+        target = self.graph.entities[target_uuid]
+        page = target["id"] if target.get("name") else target["page"]["id"]
+        return dict(self.graph.add(title, target["id"], page))
+
+    def _insert_batch(self, target_uuid, blocks, options=None):
+        if not self.write_effective:
+            return None
+        target = self.graph.entities[target_uuid]
+        page = target["id"] if target.get("name") else target["page"]["id"]
+        return [dict(self.graph.add(b["content"], target["id"], page))
+                for b in blocks]
+
     def _remove(self, uuid):
         if not self.write_effective:
             return None
@@ -141,8 +164,21 @@ class FakeClient:
             if root is None:
                 return None
 
+            # Project only what the pull pattern names. Returning everything
+            # regardless is what let a pattern requesting NO attributes pass
+            # the suite while returning unusable nodes against the real API.
+            wanted = set(re.findall(r":block/(\w+)|:db/(id)", query))
+            keys = {a or b for a, b in wanted}
+
+            def project(entity):
+                node = {k: v for k, v in entity.items()
+                        if k in keys or k.lstrip(":").split("/")[-1] in keys}
+                if "id" in keys and "id" in entity:
+                    node["id"] = entity["id"]
+                return node
+
             def build(entity):
-                node = dict(entity)
+                node = project(entity)
                 kids = self.graph.children(entity["id"])
                 if kids:
                     node["_parent"] = [build(k) for k in kids]
@@ -228,9 +264,11 @@ async def test_a_write_that_does_nothing_is_not_reported_as_success(graph):
     Without the read-back this would pass silently."""
     client = FakeClient(graph, write_effective=False)
 
-    with pytest.raises(RuntimeError, match="reports success for writes"):
-        await VerifiedContent(client).create_block(  # type: ignore[arg-type]
-            graph.page["uuid"], "Never created")
+    result = await VerifiedContent(client).create_block(  # type: ignore[arg-type]
+        graph.page["uuid"], "Never created")
+
+    assert result.verified is False
+    assert graph.children(graph.page["id"]) == []
 
 
 async def test_remove_block_deletes_the_whole_subtree(graph, content):
@@ -272,14 +310,17 @@ async def test_create_many_blocks_creates_all_of_them(graph, content):
     assert len(graph.children(graph.page["id"])) == 3
 
 
-async def test_batch_rejects_duplicate_titles_under_one_parent(graph, content):
-    """Two identical siblings cannot be told apart by read-back, so this is a
-    real ambiguity rather than an arbitrary restriction."""
-    with pytest.raises(ValueError, match="under the same parent"):
-        await content.create_many_blocks([
-            {"parent_uuid": graph.page["uuid"], "title": "Notes"},
-            {"parent_uuid": graph.page["uuid"], "title": "Notes"},
-        ])
+async def test_batch_allows_duplicate_titles_under_one_parent(graph, content):
+    """Previously rejected, because verification identified new blocks by
+    title. insertBatchBlock returns the created entities, so identical
+    siblings are no longer ambiguous."""
+    result = await content.create_many_blocks([
+        {"parent_uuid": graph.page["uuid"], "title": "Notes"},
+        {"parent_uuid": graph.page["uuid"], "title": "Notes"},
+    ])
+
+    assert len(result.verified_entities) == 2
+    assert len({e["uuid"] for e in result.verified_entities}) == 2
 
 
 async def test_batch_allows_the_same_title_under_different_parents(graph, content):
@@ -360,7 +401,9 @@ async def test_outline_dry_run_writes_nothing(graph, content):
 
     assert result["dry_run"] is True
     assert result["levels"] == 2
-    assert result["estimated_calls"] == 3
+    # One call per parent that has children, not 2d-1: the batch response
+    # carries the created entities, so there is no read-back cycle.
+    assert result["estimated_calls"] == 2
     assert graph.children(graph.page["id"]) == []
 
 
@@ -374,7 +417,8 @@ async def test_dry_run_validates_without_writing(graph, content):
     assert result.verified_entities == ()
     assert graph.children(graph.page["id"]) == []
     assert result.validation is not None
-    assert "not the transaction" in (result.diagnostic or "")
+    assert result.verified is False
+    assert "nothing was written" in (result.diagnostic or "")
 
 
 # ------------------------------------------------------------- write scope
@@ -563,3 +607,62 @@ async def test_find_orphans_is_quiet_on_a_healthy_page(graph, content):
 
     assert report["orphans"] == []
     assert "Every block" in report["diagnostic"]
+
+
+# ------------------------------------------- ownership after nested creation
+
+async def test_nested_create_sets_parent_and_page_independently(graph, content):
+    """The bug this route change exists to fix. upsertNodes wrote its single
+    `page-id` into both attributes, so a block parent produced a child owned
+    by its parent rather than by the page."""
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+
+    child = (await content.create_block(
+        parent["uuid"], "Child")).verified_entities[0]
+
+    assert child["parent"]["id"] == parent["id"]
+    assert child["page"]["id"] == graph.page["id"]      # NOT parent["id"]
+
+
+async def test_creation_is_rejected_when_ownership_is_wrong(graph):
+    """Verifying the parent alone is what let the bug go unnoticed: the block
+    appeared under the right parent while belonging to the wrong page."""
+    class WrongPageClient(FakeClient):
+        def _insert_block(self, target_uuid, title, options=None):
+            target = self.graph.entities[target_uuid]
+            # Deliberately wrong: ownership follows the parent.
+            return dict(self.graph.add(title, target["id"], target["id"]))
+
+    client = WrongPageClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    parent = (await verified.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+
+    result = await verified.create_block(parent["uuid"], "Child")
+
+    assert result.verified is False
+    assert "owning page is wrong" in (result.diagnostic or "")
+
+
+async def test_outline_costs_one_call_per_parent(graph, content):
+    """Read-backs are gone: the batch response carries each created entity,
+    so a parent's UUID is known before its children are inserted."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+
+    await verified.create_page_of_blocks(
+        graph.page["uuid"], "A\n    A1\n    A2\nB\n    B1\n")
+
+    inserts = [m for m, _ in client.calls if m == "logseq.DB.insertBatchBlock"]
+    # One for the top level, one for A's children, one for B's.
+    assert len(inserts) == 3
+
+
+async def test_outline_children_belong_to_the_page_at_every_depth(graph, content):
+    await content.create_page_of_blocks(
+        graph.page["uuid"], "A\n    A1\n        A1a\n")
+
+    for block in graph.entities.values():
+        if block.get("title") in {"A", "A1", "A1a"}:
+            assert block["page"]["id"] == graph.page["id"]

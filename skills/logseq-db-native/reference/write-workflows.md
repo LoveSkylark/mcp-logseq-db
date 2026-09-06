@@ -80,22 +80,23 @@ createBlock(parent_uuid, title)
 ```
 
 `parent_uuid` may be a **page** UUID (top-level block) or a **block** UUID
-(nested child). The underlying field is called `page-id` but behaves as a
-parent pointer. It will not resolve a page title — passing one returns success
-and creates nothing.
+(nested child). It will not resolve a page title.
 
-Only `title` can be set. Tags, order, and position are rejected at creation and
-must be follow-up calls. The new UUID is assigned by Logseq and **not
-returned**; read it back if you need it.
+Only `title` can be set; tags and position are follow-up calls.
+
+Verification checks **both** `:block/parent` and `:block/page`. Those are
+separate facts — parent is the tree link, page is ownership at any depth — and
+a block can have the first right and the second wrong. Such a block is a real
+child that no page-scoped query can see, which is why checking the parent alone
+is not enough.
 
 ```
 createManyBlocks([{parent_uuid, title}, ...])
 ```
 
-One batched call. Each item may target a different parent. Titles must be
-unique **among siblings** — two blocks may share a title under different
-parents, but not under the same one, because verification finds a new block
-among its parent's children.
+Items are grouped by parent and one call is made per distinct parent. Duplicate
+titles are fine, including among siblings: the response carries each created
+entity, so nothing has to identify them by title afterwards.
 
 Whether a batch applies atomically is untested. On failure, read back rather
 than assuming all-or-nothing.
@@ -110,12 +111,12 @@ confirm the write will succeed.
 createPageofBlocks(page_uuid, outline)
 ```
 
-Indented text in, tree out. Costs 2d−1 calls for depth *d*, independent of
-width: create a level, read back the UUIDs Logseq assigned, create the next.
+Indented text in, tree out. Costs one call per parent that has children.
 
-The read-back between levels is structural, not defensive. Creation returns no
-UUIDs and no field resolves a title, so children have no way to name their
-parents until the level above exists.
+Creation returns the entities it made, so a parent's UUID is known before its
+own children are inserted — there is no read-back cycle. Duplicate titles among
+siblings are fine for the same reason: nothing has to identify a new block by
+its title.
 
 Indent width is taken from the first indented line, so 2-space and 4-space both
 work if consistent. Skipping a level raises.

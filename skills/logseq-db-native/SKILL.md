@@ -106,10 +106,15 @@ Prefer the narrowest tool that answers the question.
    `page`, `blocks`, `tags`, `properties`, `declared`, or `all`.
 2. `getBlockUUID(page_uuid)` lists every block on a page at any depth.
    `getBlock(uuid)` reads one; `getBlockTree(uuid)` reads a subtree and reports
-   `truncated` when a bound stopped it.
-3. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
-   this?" — run either before deleting the thing.
-4. The `list*` tools take no arguments and return a whole kind.
+   `truncated` when a bound stopped it. Both walk `:block/parent`, so a block
+   whose `:block/page` is wrong still appears.
+3. `findOrphans(page_uuid)` reports blocks whose `:block/parent` and
+   `:block/page` disagree — real children that no page-scoped query can see.
+   Use it to audit damage from earlier builds; new writes are verified against
+   both attributes, so it should come back empty.
+4. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
+   this?" — run either before deleting, and report the count to the user.
+5. The `list*` tools take no arguments and return a whole kind.
 
 Keep `uuid` and `ident` in the working plan. Do not reduce an entity to its
 display text; titles are not unique and are not identifiers.
@@ -158,12 +163,14 @@ delete, so it is slow on a large page.
 `createBlock(parent_uuid, title)` — the parent may be a **page** UUID for a
 top-level block or a **block** UUID to nest. It will not resolve a title.
 
-Only the title can be set at creation. Tags and position are follow-up calls,
-and the new UUID is assigned by Logseq rather than returned.
+Only the title can be set at creation; tags and position are follow-up calls.
+The write is verified against **both** `:block/parent` and `:block/page`,
+because a block can end up under the right parent while belonging to the wrong
+page — a real child that no page-scoped query can see.
 
-`createManyBlocks` batches. `createPageofBlocks` builds an indented outline,
-alternating create and read-back per level — titles must be unique among
-siblings, not across the whole outline.
+`createManyBlocks` batches by parent, one call per distinct parent.
+`createPageofBlocks` builds an indented outline at one call per parent that has
+children. Duplicate titles among siblings are fine.
 
 `removeBlock` deletes the subtree and verifies every descendant is gone.
 
@@ -184,25 +191,37 @@ name. The ident is assigned by Logseq; retain the one returned.
 > do not look for a workaround, and tell the user plainly.
 
 Reference-typed properties (`node`, `page`, `class`, `property`) take an entity
-id, not a literal. `Status` and `Priority` are closed enums; call
-`listClosedValues` and pass one of those entities.
+id, not a literal — a string is accepted by Logseq and mints a value entity
+named after it, which reads back as success while pointing at nothing. The
+tool refuses that before the call.
+
+Cardinality-many properties accumulate rather than replace, so writing the
+same value twice would add a duplicate. The tool detects that and skips the
+write.
 
 `deleteProperty` removes the definition graph-wide and takes every value with
-it. Recreating mints a new entity — the old values do not return.
+it. Recreating mints a new entity — the old values do not return. It requires
+`acknowledge_value_loss` when anything holds a value, and sweeps the value
+blocks the removal orphans.
 
 ### Tags
 
-A tag must exist before it can be attached. `creatTag(title)` creates one; its
-ident carries a random suffix, so it cannot be predicted from the title.
+A tag must exist before it can be attached. `creatTag(title)` creates one. Its
+ident is deterministic — `:plugin.class.<caller>/<Title>`, spaces stripped — so
+it need not be read back. Tags made in the Logseq UI land under `user.class/*`
+and DO carry a random suffix.
+
+Tags and pages share one title space, so `creatTag` refuses a title an existing
+page holds, and `createPage` refuses one a tag holds.
 
 `addTag(target, tag)` and `removeTag(target, tag)` take two UUIDs, **target
 first**. Removal affects that one relation only.
 
-`deleteTag` reads back like every other write. What is unconfirmed is the
-route beneath it: it goes through `deletePage`, which has never been observed
-deleting a tag, and whose identifier type is unknown. Expect `verified: false`
-until a live run proves otherwise — and treat that as the tool working
-correctly, not failing silently.
+`deleteTag` works and cascades cleanly: `:block/tags` and `:block/refs` are
+cleared on everything that carried the tag. Because that touches many entities
+and cannot be undone, it requires `acknowledge_detach` when anything holds the
+tag, and `acknowledge_child_reparent` when child tags would move. Run
+`getTagUsers` first and report what will be affected.
 
 ## Constraints worth stating to the user
 
@@ -215,6 +234,24 @@ not rewritten.
 sorts lexicographically. Sort by it — pull does not guarantee order. There is
 no reindex operation and none is needed.
 
+**Property values are blocks.** Reference-typed values are materialized as
+blocks on the holder's page, so they appear in block listings. `clearPage`
+identifies and preserves them; nothing else should assume every block on a page
+is content.
+
+**`[[Page]]` written through the API stays inert.** It is stored as literal
+text with no `:block/refs` entry, so it does not appear as a reference or a
+backlink. Say so rather than promising a link.
+
+**`listClosedValues` returns nothing on this build.** No closed-value
+relationship exists in the graph — `Status` reports type `default` with a
+`:logseq.property/default-value` and no permitted set. It is a built-in and
+outside the sandbox anyway, so it cannot be written.
+
+**A dry run is not a write.** `dry_run` returns `verified: false` by design.
+It validates the payload, not the transaction: a graph carrying invalid
+entities passes validation and still rejects the real write.
+
 **Deleting a page recycles it.** `deletePage` does not destroy the entity: the
 page keeps its UUID, tags, refs and blocks, and stops appearing in
 `listPages`. Inbound references are **not** rewritten, so anything linking to
@@ -222,14 +259,15 @@ it keeps pointing at a page the user can no longer find. `deletePage` refuses
 until `acknowledge_reference_rewrite` is set when references exist — surface
 that to the user rather than setting it reflexively.
 
-**Moving a block has no route at all.** Not unavailable in this server —
-unavailable, full stop.
+**Moving a block has no confirmed route.** `moveBlock` exists and returns
+null, which on this API means both "worked" and "did nothing" — it has never
+been observed changing anything. No tool exposes it.
 
 ## Tools
 
 **Reads** — `capabilities`, `getPageUUID`, `getPage`, `getBlockUUID`,
-`getBlock`, `getBlockTree`, `getTagUUID`, `getTag`, `getTagUsers`,
-`getPropertyIndent`, `getProperyUsers`
+`getBlock`, `getBlockTree`, `findOrphans`, `getTagUUID`, `getTag`,
+`getTagUsers`, `getPropertyIndent`, `getProperyUsers`
 
 **Lists** (no arguments) — `listPages`, `listJournals`, `listTags`,
 `listProperties`, `listClosedValues`, `listOrphanTags`,
@@ -239,6 +277,12 @@ unavailable, full stop.
 `createBlock`, `createManyBlocks`, `createPageofBlocks`, `updateBlock`,
 `removeBlock`, `creatTag`, `deleteTag`, `addTag`, `removeTag`,
 `createProperty`, `deleteProperty`, `addProperty`, `removeProperty`
+
+Destructive tools require an acknowledgement when anything is affected:
+`deletePage` (`acknowledge_reference_rewrite`), `deleteTag`
+(`acknowledge_detach`, `acknowledge_child_reparent`), `deleteProperty`
+(`acknowledge_value_loss`). Report what will be affected and let the user
+decide — do not set these on their behalf.
 
 Call only these names. Never emit a raw `logseq.*` method. If tools such as
 `upsert_nodes`, `insert_block`, `move_block`, `add_page_tag`, or

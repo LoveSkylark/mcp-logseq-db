@@ -1,27 +1,5 @@
 """Tag and property mutations with exact resolution and mandatory read-back.
 
-WHAT CHANGED, AND WHY
----------------------
-The page/block method pairs are gone. `add_page_tag`/`add_block_tag` and
-`upsert_page_property`/`upsert_block_property` did the same thing through the
-same API method -- a page IS a block in the DB, so the target is uniform.
-Exposing both forced a caller to choose between identical operations. There is
-now one `add_tag` and one `set_property`, each taking a target UUID that may be
-either.
-
-The graph-worker CLI tag paths are gone. `addBlockTag` and `removeBlockTag`
-work over HTTP; the CLI fallback existed on the strength of a capability list
-that turned out to be wrong.
-
-Dropped entirely, having no tool in the current surface: `rename_tag`
-(routed through `renamePage`), `add_tag_property`, `remove_tag_property`,
-`set_tag_parent`, `remove_tag_extends`, `set_block_icon`, `remove_block_icon`.
-None of their API methods are in the client allowlist any more.
-
-`getTag` and `getProperty` are likewise gone as routes -- entities are resolved
-through Datascript, which is the only read this surface relies on beyond a
-handful of dedicated methods.
-
 IDENTIFIER DISCIPLINE
 ---------------------
 Tags are keyed by UUID for relation operations. Properties are keyed by
@@ -274,10 +252,7 @@ class VerifiedMutations(VerifiedWriteHelpers):
         Detach one tag from a page or a block.
 
         Removes that relation only. Other tags on the target are untouched and
-        the tag entity survives. There is no `upsertNodes` route for this --
-        `operation` offers only `add` and `edit`, with no retraction verb, so a
-        removal expressed as an upsert would mean overwriting the whole tag set
-        and risking the loss of `:logseq.class/Page`.
+        the tag entity survives. Both arguments are UUIDs; the target comes first. 
         """
         return await self._update_tag(target_uuid, tag_uuid, remove=True)
 
@@ -375,7 +350,7 @@ class VerifiedMutations(VerifiedWriteHelpers):
                 if isinstance(r, list) and len(r) == 2]
 
         # Reference-typed values come back as entity ids; resolve those and
-        # leave literals alone.
+        # leave literals alone. The value is NOT pulled.
         resolved = await self._resolve_entities(
             {r[1] for r in rows
              if isinstance(r[1], int) and not isinstance(r[1], bool)})

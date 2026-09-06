@@ -60,8 +60,9 @@ _READ_METHODS = frozenset({
 })
 
 WRITE_METHODS = frozenset({
-    "logseq.DB.upsertNodes",            # createBlock, createManyBlocks,
-                                        # createPageofBlocks
+    "logseq.DB.upsertNodes",            # createPage
+    "logseq.DB.insertBlock",            # createBlock
+    "logseq.DB.insertBatchBlock",       # createManyBlocks, createPageofBlocks
     "logseq.DB.updateBlock",            # updateBlock
     "logseq.DB.removeBlock",            # removeBlock
     "logseq.DB.createTag",              # creatTag

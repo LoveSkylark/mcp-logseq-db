@@ -314,8 +314,16 @@ class VerifiedContent(VerifiedWriteHelpers):
         is the attribute that stays correct, and `{:block/_parent ...}` walks
         its reverse to arbitrary depth in one call.
         """
+        # The pull pattern must name the attributes it wants. `...` recurses
+        # the WHOLE pattern, so listing them once gives them at every level;
+        # a pattern of only `{:block/_parent ...}` returns nodes carrying no
+        # id, uuid or title, which is useless to every caller and reads as an
+        # empty page.
         query = (
-            "[:find (pull ?root [{:block/_parent ...}]) . :where "
+            "[:find (pull ?root [:db/id :block/uuid :block/title :block/order "
+            "{:block/parent [:db/id :block/uuid]} "
+            "{:block/page [:db/id :block/uuid]} "
+            "{:block/_parent ...}]) . :where "
             f"[?root :block/uuid #uuid \"{root_uuid}\"]]"
         )
         root = await self._client.call(
@@ -407,6 +415,12 @@ class VerifiedContent(VerifiedWriteHelpers):
         # :block/page is wrong is a real child and must appear in the tree;
         # the page-scoped form reported `children: []` over exactly those.
         descendants = await self._descendants_by_parent(block_uuid)
+        if descendants and not any(
+                isinstance(e.get("id"), int) for e in descendants):
+            raise RuntimeError(
+                "Subtree traversal returned nodes with no :db/id. The pull "
+                "pattern is not requesting attributes -- this would otherwise "
+                "surface as an empty page rather than an error.")
 
         by_parent: dict[int, list[dict[str, Any]]] = {}
         for entity in descendants:
@@ -736,6 +750,7 @@ class VerifiedContent(VerifiedWriteHelpers):
 
     # ---------------------------------------------------------- block writes
 
+    @serialized_write
     async def create_block(
         self,
         parent_uuid: str,
@@ -746,13 +761,122 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         Create one block under a page or another block.
 
-        `parent_uuid` may be either. Passing a page UUID produces a top-level
-        block; passing a block UUID nests. The API field is called `page-id`
-        but behaves as a parent pointer.
-        """
-        return await self.create_many_blocks(
-            [{"parent_uuid": parent_uuid, "title": title}], dry_run=dry_run)
+        Routed through `insertBlock`, which sets :block/parent and :block/page
+        independently. `upsertNodes` cannot: its `page-id` is written to both,
+        so a block parent produced a child whose owning page was the parent
+        block -- a real child, invisible to every page-scoped query.
 
+        `insertBlock` also returns the created entity, so the UUID Logseq
+        assigned is known without a follow-up read.
+        """
+        parent_uuid = self._require_entity(self._validated_uuid(parent_uuid))
+        self._validate_title(title)
+        parent = await self._entity_by_uuid(parent_uuid)
+
+        if dry_run:
+            return ContentResult(
+                validation={"parent": parent, "title": title},
+                response=None, verified_entities=(), verified=False,
+                diagnostic=(
+                    "Dry run: nothing was written, so verified is false by "
+                    "design. The parent exists and the title is usable."))
+
+        response: Any = None
+        timed_out = False
+        try:
+            # sibling: false means "child of the target" rather than "next to
+            # it". The target may be a page or a block.
+            response = await self._client.call(
+                "logseq.DB.insertBlock",
+                [parent_uuid, title, {"sibling": False}])
+        except httpx.TimeoutException:
+            timed_out = True
+
+        created = self._created_uuid(response)
+        if created is None:
+            # No usable identity came back, so fall back to finding it among
+            # the parent's children.
+            match = [c for c in await self._children_of(parent_uuid)
+                     if c.get("title") == title]
+            created = match[-1].get("uuid") if match else None
+        if created is None:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic="The block was not observed under the requested parent",
+                previous_entities=(parent,))
+
+        return await self._verify_created(
+            created, parent, response, timed_out)
+
+    async def _verify_created(
+        self, block_uuid: str, parent: dict[str, Any],
+        response: Any, timed_out: bool,
+    ) -> ContentResult:
+        """
+        Confirm the new block's parent AND owning page.
+
+        Checking the parent alone is what let the ownership bug go unnoticed:
+        the block appeared under the right parent while belonging to the wrong
+        page.
+        """
+        block = await poll_readback(
+            self._client,
+            lambda: self._optional_entity_by_uuid(block_uuid),
+            lambda value: value is not None)
+        if block is None:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic="The created block could not be read back",
+                previous_entities=(parent,))
+
+        expected_page = (parent["id"] if parent.get("name")
+                         else self._reference_id(parent.get("page")))
+        actual_parent = self._reference_id(block.get("parent"))
+        actual_page = self._reference_id(block.get("page"))
+
+        if actual_parent != parent["id"]:
+            return ContentResult(
+                validation=None, response=response,
+                verified_entities=(block,),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic="The block was created under the wrong parent",
+                previous_entities=(parent,), observed_entities=(block,))
+        if actual_page != expected_page:
+            return ContentResult(
+                validation=None, response=response,
+                verified_entities=(block,),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "The block's owning page is wrong. It is a real child but "
+                    "belongs to the wrong page, so it is invisible to every "
+                    "page-scoped query -- run findOrphans and remove it."),
+                previous_entities=(parent,), observed_entities=(block,))
+
+        return ContentResult(
+            validation=None, response=response, verified_entities=(block,),
+            recovered_after_timeout=timed_out, previous_entities=(parent,))
+
+    @staticmethod
+    def _created_uuid(response: Any) -> str | None:
+        """Pull a block UUID out of an insert response, which returns the
+        created entity rather than nothing."""
+        if isinstance(response, list):
+            response = response[0] if response else None
+        if isinstance(response, dict):
+            value = response.get("uuid")
+            if isinstance(value, str):
+                return value
+        return None
+
+    @staticmethod
+    def _created_uuids(response: Any) -> list[str]:
+        entries = response if isinstance(response, list) else [response]
+        return [e["uuid"] for e in entries
+                if isinstance(e, dict) and isinstance(e.get("uuid"), str)]
+
+    @serialized_write
     async def create_many_blocks(
         self,
         blocks: list[dict[str, str]],
@@ -760,15 +884,18 @@ class VerifiedContent(VerifiedWriteHelpers):
         dry_run: bool = False,
     ) -> ContentResult:
         """
-        Create several blocks in one batched call.
+        Create several blocks, batching by parent.
 
-        Whether a batch applies atomically is untested, so verification checks
-        each block individually rather than assuming all-or-nothing.
+        `insertBatchBlock` inserts a list of blocks under ONE target, so items
+        are grouped and one call is made per distinct parent. Duplicate titles
+        are fine now -- the response carries each created entity, so nothing
+        has to identify them by title afterwards.
         """
         if not isinstance(blocks, list) or not 1 <= len(blocks) <= MAX_BATCH_OPERATIONS:
             raise ValueError(
                 f"blocks must contain between 1 and {MAX_BATCH_OPERATIONS} items")
-        operations = []
+
+        grouped: dict[str, list[str]] = {}
         for index, block in enumerate(blocks):
             if not isinstance(block, dict):
                 raise ValueError(f"block {index} must be an object")
@@ -777,17 +904,66 @@ class VerifiedContent(VerifiedWriteHelpers):
             title = block.get("title")
             if not isinstance(title, str) or not title.strip():
                 raise ValueError(f"block {index} requires a non-empty title")
-            # Block content, not a named entity -- no title scope. See
-            # VerifiedWriteHelpers._validate_title.
             self._validate_title(title)
-            operations.append({
-                "operation": "add",
-                "entityType": "block",
-                # Only these two keys are permitted; `data` is a closed
-                # allowlist and rejects anything else outright.
-                "data": {"page-id": parent, "title": title},
-            })
-        return await self.upsert_nodes(operations, dry_run=dry_run)
+            grouped.setdefault(parent, []).append(title)
+
+        if dry_run:
+            return ContentResult(
+                validation={"parents": len(grouped), "blocks": len(blocks)},
+                response=None, verified_entities=(), verified=False,
+                diagnostic=(
+                    "Dry run: nothing was written, so verified is false by "
+                    f"design. Would make {len(grouped)} call(s)."))
+
+        verified: list[dict[str, Any]] = []
+        problems: list[dict[str, Any]] = []
+        response: Any = None
+        timed_out = False
+
+        for parent_uuid, titles in grouped.items():
+            parent = await self._entity_by_uuid(parent_uuid)
+            try:
+                response = await self._client.call(
+                    "logseq.DB.insertBatchBlock",
+                    [parent_uuid,
+                     [{"content": title} for title in titles],
+                     {"sibling": False}])
+            except httpx.TimeoutException:
+                timed_out = True
+                response = None
+
+            created = self._created_uuids(response)
+            if len(created) != len(titles):
+                # Fall back to reading the parent's children rather than
+                # trusting a partial response.
+                children = await self._children_of(parent_uuid)
+                created = [c["uuid"] for c in children
+                           if c.get("title") in set(titles)]
+
+            for block_uuid in created:
+                result = await self._verify_created(
+                    block_uuid, parent, response, timed_out)
+                if result.verified:
+                    verified.extend(result.verified_entities)
+                else:
+                    problems.extend(result.observed_entities
+                                    or result.verified_entities)
+
+        if problems or len(verified) != len(blocks):
+            return ContentResult(
+                validation=None, response=response,
+                verified_entities=tuple(verified),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    f"Expected {len(blocks)} blocks, verified {len(verified)}"
+                    + (f"; {len(problems)} were created incorrectly"
+                       if problems else "")),
+                observed_entities=tuple(problems))
+
+        return ContentResult(
+            validation=None, response=response,
+            verified_entities=tuple(verified),
+            recovered_after_timeout=timed_out)
 
     async def update_block(
         self,
@@ -922,12 +1098,16 @@ class VerifiedContent(VerifiedWriteHelpers):
             raise ValueError("Outline is empty")
 
         depth_max = max(len(path) for path, _ in entries) - 1
+        # One call per parent that has children. The read-back cycle is gone:
+        # insertBatchBlock returns the created entities, so each parent's UUID
+        # is known before its own children are inserted.
+        parent_count = len({path[:-1] for path, _ in entries})
         if dry_run:
             return {
                 "dry_run": True,
                 "levels": depth_max + 1,
                 "block_count": len(entries),
-                "estimated_calls": 2 * (depth_max + 1) - 1,
+                "estimated_calls": parent_count,
             }
 
         parents: dict[tuple[int, ...], str] = {(): page_uuid}
@@ -937,26 +1117,42 @@ class VerifiedContent(VerifiedWriteHelpers):
             level = [(p, t) for p, t in entries if len(p) == depth + 1]
             if not level:
                 continue
-            await self.create_many_blocks([
-                {"parent_uuid": parents[path[:-1]], "title": title}
-                for path, title in level
-            ])
+            # Group by parent so siblings go in one call, preserving the order
+            # they were written in.
+            by_parent: dict[tuple[int, ...], list[tuple[tuple[int, ...], str]]] = {}
             for path, title in level:
-                parent_uuid = parents[path[:-1]]
-                siblings = await self._children_of(parent_uuid)
-                match = [s for s in siblings if s.get("title") == title]
-                if not match:
+                by_parent.setdefault(path[:-1], []).append((path, title))
+
+            for parent_path, items in by_parent.items():
+                parent_uuid = parents[parent_path]
+                parent = await self._entity_by_uuid(parent_uuid)
+                response = await self._client.call(
+                    "logseq.DB.insertBatchBlock",
+                    [parent_uuid,
+                     [{"content": title} for _, title in items],
+                     {"sibling": False}])
+
+                uuids = self._created_uuids(response)
+                if len(uuids) != len(items):
                     raise RuntimeError(
-                        f"Outline level {depth} reported success but {title!r} "
-                        f"is not present under {parent_uuid}"
-                    )
-                parents[path] = match[-1]["uuid"]
-                created.append(match[-1])
+                        f"Outline level {depth} under {parent_uuid} returned "
+                        f"{len(uuids)} blocks for {len(items)} requested; the "
+                        "tree is partially built and needs findOrphans.")
+
+                for (path, title), block_uuid in zip(items, uuids):
+                    result = await self._verify_created(
+                        block_uuid, parent, response, False)
+                    if not result.verified:
+                        raise RuntimeError(
+                            f"{title!r} was created but {result.diagnostic}")
+                    parents[path] = block_uuid
+                    created.extend(result.verified_entities)
 
         return {
             "verified": True,
             "page_uuid": page_uuid,
             "levels": depth_max + 1,
+            "calls": parent_count,
             "created": created,
         }
 
