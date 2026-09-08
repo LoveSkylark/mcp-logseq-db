@@ -103,12 +103,17 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     # Blocks
     "getBlockUUID":         ("logseq.DB.datascriptQuery",),
     "findOrphans":          ("logseq.DB.datascriptQuery",),
+    "findBacklinks":        ("logseq.DB.datascriptQuery",),
+    "pageStats":            ("logseq.DB.datascriptQuery",),
+    "importPage":           ("logseq.DB.insertBatchBlock",
+                             "logseq.DB.datascriptQuery"),
+    "repairLinks":          ("logseq.DB.updateBlock",
+                             "logseq.DB.datascriptQuery"),
     "getBlock":             ("logseq.DB.getBlock",),
     "createBlock":          ("logseq.DB.insertBlock",),
     "updateBlock":          ("logseq.DB.updateBlock",),
     "removeBlock":          ("logseq.DB.removeBlock",),
     "moveBlock":            ("logseq.DB.moveBlock",),
-    "createManyBlocks":     ("logseq.DB.insertBatchBlock",),
     "createPageofBlocks":   ("logseq.DB.insertBatchBlock",
                              "logseq.DB.datascriptQuery"),
     # Pages
@@ -149,11 +154,13 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "addProperty": (
         "Only properties in this plugin's own namespace can be written. "
         "Properties created in the Logseq UI live under user.property/* and "
-        "are readable but not writable.",
-        "Reference-typed properties (node, page, class, property) take an "
-        "entity id, not a literal.",
-        "Status and Priority are closed enums; the value must be one of the "
-        "entities returned by listClosedValues.",
+        "are readable but not writable. Tags are NOT restricted this way -- "
+        "the sandbox covers properties only.",
+        "node, page, class and property types take an entity id. A literal is "
+        "refused, because Logseq would mint a value entity named after it.",
+        "A default property with cardinality many is also ref-typed but takes "
+        "LITERALS, which Logseq materializes into value entities. The two "
+        "conventions look identical in the schema.",
     ),
     "removeProperty": (
         "Same namespace limit as addProperty.",
@@ -181,32 +188,69 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "child that no page-scoped query can see.",
     ),
     "moveBlock": (
-        "moveBlock returns null whether it moved the block or did nothing, so "
-        "the result is established by reading back rather than from the "
-        "response.",
+        "Confirmed working on all placements. The API returns null whether it "
+        "moved the block or did nothing, so the result is established by "
+        "reading back rather than from the response.",
         "Verified on three counts: the new parent, the owning page, and that "
         "descendants followed. A block whose page did not follow is a real "
         "child of the target that no page-scoped query can see.",
         "placement is child, before or after. A page has no siblings, so a "
         "page target requires child.",
     ),
-    "createManyBlocks": (
-        "Whether a batch applies atomically is untested. On failure, check "
-        "what landed rather than assuming all-or-nothing.",
-    ),
     "createPageofBlocks": (
-        "Costs 2d-1 calls for depth d: each level is read back before its "
-        "children can reference it.",
+        "Costs one call per parent that has children -- not 2d-1. Creation "
+        "returns the entities it made, so there is no read-back cycle.",
+        "Structure comes from INDENTATION ONLY. A leading markdown bullet is "
+        "stripped; any other prefix becomes part of the title.",
+        "The whole outline is validated before the first write, so a "
+        "malformed one commits nothing. An API failure mid-batch could still "
+        "leave earlier levels in place.",
     ),
     "getBlockUUID": (
         "Returns every block on the page at any depth, not a single UUID.",
         "Walks :block/parent rather than :block/page, so it still sees blocks "
         "whose :block/page is wrong.",
     ),
+    "findBacklinks": (
+        "Reports three mechanisms separately: :block/refs (what the UI counts "
+        "as a backlink), :block/tags, and property values pointing at the "
+        "target.",
+        "A property value is a reference in the DB but does not appear in the "
+        "UI's backlink panel, so the totals will not match what Logseq shows.",
+        "References are never rewritten by a delete or recycle, so run this "
+        "before removing anything.",
+    ),
     "findOrphans": (
-        "Reports blocks whose :block/parent and :block/page disagree. Such "
-        "blocks are invisible to page-scoped queries; this is the only way to "
-        "audit a page after a nested write fails.",
+        "Reports blocks whose owning page differs from their nearest ancestor "
+        "page. Such blocks are invisible to page-scoped queries.",
+        "Nested pages are reported separately as structure, not damage: blocks "
+        "beneath a sub-page correctly belong to that page rather than to this "
+        "one.",
+    ),
+    "importPage": (
+        "References are escaped, not written live: Logseq mints a page or tag "
+        "for any [[link]] or #tag it parses, so an unescaped import creates a "
+        "stub for every target that does not yet exist.",
+        "Markdown headings are passed through and converted by Logseq into "
+        "native heading properties.",
+        "Page properties (key:: value) are parsed and reported but NOT "
+        "applied — they are outside the writable namespace.",
+        "Appends by default. replace=true clears the page first, which "
+        "destroys block UUIDs and any references to them.",
+    ),
+    "repairLinks": (
+        "Idempotent: a resolved reference is rewritten to [[uuid]] and no "
+        "longer matches a placeholder, so re-running after further imports is "
+        "safe.",
+        "Ambiguous names are skipped rather than guessed — repairing a link "
+        "to the wrong page is silent damage.",
+        "Creating missing pages requires two arguments and is capped, because "
+        "a typo or a rename looks identical to a genuinely new page.",
+    ),
+    "pageStats": (
+        "Counts only. Every other read returns payload proportional to page "
+        "size, which makes a full-graph audit expensive; this returns six "
+        "integers regardless of how large the page is.",
     ),
     "getPage": (
         "The detail selector matters: a page's own tags and its blocks' tags "

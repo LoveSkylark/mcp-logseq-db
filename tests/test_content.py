@@ -225,6 +225,53 @@ class FakeClient:
             return [e["id"] for e in self.graph.entities.values()
                     if e.get("page", {}).get("id") == params[0]
                     and e.get(":logseq.property/created-from-property")]
+        if "(count ?b)" in query and "block/page" in query:
+            return len([e for e in self.graph.entities.values()
+                        if e.get("page", {}).get("id") == params[0]])
+        if "(count ?e)" in query and ":block/refs ?target" in query:
+            return len([e for e in self.graph.entities.values()
+                        if any(r.get("id") == params[0]
+                               for r in e.get("refs", []))])
+        if "(count ?e)" in query and ":block/tags ?target" in query:
+            return len([e for e in self.graph.entities.values()
+                        if any(t.get("id") == params[0]
+                               for t in e.get("tags", []))])
+        if "(count ?e)" in query and "?e ?attr ?target" in query:
+            total = 0
+            for prop in self.graph.entities.values():
+                ident = prop.get("ident")
+                if not ident or not any(
+                        t.get("id") == params[1] for t in prop.get("tags", [])):
+                    continue
+                for holder in self.graph.entities.values():
+                    held = holder.get(ident)
+                    ids = held if isinstance(held, list) else [held]
+                    if any(isinstance(i, dict) and i.get("id") == params[0]
+                           for i in ids):
+                        total += 1
+            return total
+        if "[?e :block/refs ?target]" in query:
+            return [e for e in self.graph.entities.values()
+                    if any(r.get("id") == params[0]
+                           for r in e.get("refs", []))]
+        if "[?e :block/tags ?target]" in query:
+            return [e for e in self.graph.entities.values()
+                    if any(t.get("id") == params[0]
+                           for t in e.get("tags", []))]
+        if "[?e ?attr ?target]" in query:
+            out = []
+            for prop in self.graph.entities.values():
+                ident = prop.get("ident")
+                if not ident or not any(
+                        t.get("id") == params[1] for t in prop.get("tags", [])):
+                    continue
+                for holder in self.graph.entities.values():
+                    held = holder.get(ident)
+                    ids = held if isinstance(held, list) else [held]
+                    if any(isinstance(i, dict) and i.get("id") == params[0]
+                           for i in ids):
+                        out.append([holder, prop])
+            return out
         if "[?block :block/page ?page]" in query:
             return [e for e in self.graph.entities.values()
                     if e.get("page", {}).get("id") == params[0]]
@@ -319,44 +366,8 @@ async def test_update_block_verifies_the_new_title(graph, content):
 
 # ---------------------------------------------------------------- batching
 
-async def test_create_many_blocks_creates_all_of_them(graph, content):
-    result = await content.create_many_blocks([
-        {"parent_uuid": graph.page["uuid"], "title": f"Block {n}"}
-        for n in range(3)
-    ])
-
-    assert len(result.verified_entities) == 3
-    assert len(graph.children(graph.page["id"])) == 3
 
 
-async def test_batch_allows_duplicate_titles_under_one_parent(graph, content):
-    """Previously rejected, because verification identified new blocks by
-    title. insertBatchBlock returns the created entities, so identical
-    siblings are no longer ambiguous."""
-    result = await content.create_many_blocks([
-        {"parent_uuid": graph.page["uuid"], "title": "Notes"},
-        {"parent_uuid": graph.page["uuid"], "title": "Notes"},
-    ])
-
-    assert len(result.verified_entities) == 2
-    assert len({e["uuid"] for e in result.verified_entities}) == 2
-
-
-async def test_batch_allows_the_same_title_under_different_parents(graph, content):
-    """The common outline shape: two sections each with a child called Notes."""
-    first = (await content.create_block(
-        graph.page["uuid"], "Section 1")).verified_entities[0]
-    second = (await content.create_block(
-        graph.page["uuid"], "Section 2")).verified_entities[0]
-
-    result = await content.create_many_blocks([
-        {"parent_uuid": first["uuid"], "title": "Notes"},
-        {"parent_uuid": second["uuid"], "title": "Notes"},
-    ])
-
-    assert len(result.verified_entities) == 2
-    parents = {e["parent"]["id"] for e in result.verified_entities}
-    assert parents == {first["id"], second["id"]}
 
 
 # ---------------------------------------------------------------- outlines
@@ -616,7 +627,7 @@ async def test_find_orphans_reports_the_disagreement(graph, content):
 
     assert len(report["orphans"]) == 1
     assert report["orphans"][0]["title"] == "Orphaned child"
-    assert report["reachable_by_parent"] > report["reachable_by_page"]
+    assert report["nested_pages"] == []
 
 
 async def test_find_orphans_is_quiet_on_a_healthy_page(graph, content):
@@ -776,3 +787,145 @@ async def test_move_refuses_a_page_target_for_sibling_placement(graph, content):
     with pytest.raises(ValueError, match="page has no siblings"):
         await content.move_block(
             block["uuid"], graph.page["uuid"], placement="after")
+
+
+# --------------------------------------------- outline is the batching path
+
+async def test_outline_allows_duplicate_titles_across_branches(graph, content):
+    """createManyBlocks was removed because batching across arbitrary parents
+    can commit partially. The outline builder keeps the batch benefit while
+    knowing what it is building."""
+    await content.create_page_of_blocks(
+        graph.page["uuid"], "A\n    Notes\nB\n    Notes\n")
+
+    sections = {e["title"]: e for e in graph.children(graph.page["id"])}
+    for section in sections.values():
+        assert [c["title"] for c in graph.children(section["id"])] == ["Notes"]
+
+
+async def test_outline_resolves_every_parent_before_writing(graph, content):
+    """A parent resolved mid-run meant an early level committed before a later
+    failure -- reported as a validation error, which reads as 'nothing was
+    written'."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+
+    await verified.create_page_of_blocks(graph.page["uuid"], "A\n    A1\n")
+
+    inserts = [m for m, _ in client.calls if m == "logseq.DB.insertBatchBlock"]
+    assert len(inserts) == 2
+
+
+# --------------------------------------------------------------- backlinks
+
+async def test_find_backlinks_reports_nothing_for_an_unreferenced_block(
+        graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], "Lonely")).verified_entities[0]
+
+    result = await content.find_backlinks(block["uuid"])
+
+    assert result["total"] == 0
+    assert "Nothing refers" in result["diagnostic"]
+
+
+async def test_find_backlinks_separates_the_three_mechanisms(graph, content):
+    """A property value is a reference in the DB but does not appear in the
+    UI's backlink panel, so the three cannot be merged into one count."""
+    target = (await content.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+
+    referrer = graph.add("Refers to it", graph.page["id"], graph.page["id"])
+    referrer["refs"] = [{"id": target["id"]}]
+
+    tagger = graph.add("Tagged with it", graph.page["id"], graph.page["id"])
+    tagger["tags"] = [{"id": target["id"]}]
+
+    prop = graph.add("Related", None, None,
+                     ident=":plugin.property._test_plugin/Related",
+                     tags=[PROPERTY_CLASS_ID])
+    holder = graph.add("Points at it", graph.page["id"], graph.page["id"])
+    holder[":plugin.property._test_plugin/Related"] = {"id": target["id"]}
+
+    result = await content.find_backlinks(target["uuid"])
+
+    assert result["total"] == 3
+    assert [r["title"] for r in result["refs"]] == ["Refers to it"]
+    assert [t["title"] for t in result["tagged"]] == ["Tagged with it"]
+    assert result["property_values"][0]["holder"]["title"] == "Points at it"
+    assert result["property_values"][0]["property"]["ident"] == prop["ident"]
+
+
+async def test_find_backlinks_warns_that_deletes_do_not_rewrite(graph, content):
+    target = (await content.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+    referrer = graph.add("Refers", graph.page["id"], graph.page["id"])
+    referrer["refs"] = [{"id": target["id"]}]
+
+    result = await content.find_backlinks(target["uuid"])
+
+    assert "does not rewrite" in result["diagnostic"]
+
+
+# ------------------------------------------- nested pages are not damage
+
+async def test_nested_page_is_structure_not_damage(graph, content):
+    """A page nested under another page is a legitimate page boundary. Blocks
+    beneath it correctly belong to it, and reporting them as orphans invites
+    repair of correct structure."""
+    sub = graph.add("SUBPAGE", graph.page["id"], None,
+                    name="subpage", tags=[PAGE_CLASS_ID])
+    graph.add("child of subpage", sub["id"], sub["id"])
+
+    report = await content.find_orphans(graph.page["uuid"])
+
+    assert report["orphans"] == []
+    assert len(report["nested_pages"]) == 1
+    assert "No damage" in report["diagnostic"]
+    assert "nested write" not in report["diagnostic"]
+
+
+async def test_a_real_orphan_is_still_reported(graph, content):
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    graph.add("Orphaned", parent["id"], parent["id"])
+
+    report = await content.find_orphans(graph.page["uuid"])
+
+    assert len(report["orphans"]) == 1
+    assert "invisible to any page-scoped query" in report["diagnostic"]
+
+
+async def test_page_stats_returns_counts_not_payload(graph, content):
+    """The point of the tool: six integers regardless of page size."""
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    await content.create_block(parent["uuid"], "Child")
+    sub = graph.add("SUBPAGE", graph.page["id"], None,
+                    name="subpage", tags=[PAGE_CLASS_ID])
+    graph.add("under the subpage", sub["id"], sub["id"])
+
+    stats = await content.page_stats(graph.page["uuid"])
+
+    assert stats["own_blocks"] == 2
+    assert stats["nested_pages"] == 1
+    assert stats["true_orphans"] == 0
+    # No block payload anywhere in the result.
+    assert not any(isinstance(v, list) for v in stats.values())
+
+
+# ------------------------------------------------------- outline formatting
+
+def test_outline_strips_a_leading_bullet():
+    """Keeping it produced blocks literally titled "- A" -- silent, and a
+    structurally correct tree full of garbage."""
+    assert _parse_outline("- A\n    - A1\n") == [((0,), "A"), ((0, 0), "A1")]
+
+
+def test_outline_keeps_other_prefixes():
+    """Only a markdown bullet is decoration; anything else is content."""
+    assert _parse_outline("1. A\n> B\n") == [((0,), "1. A"), ((1,), "> B")]
+
+
+def test_outline_mixes_bulleted_and_plain_lines():
+    assert _parse_outline("A\n    - A1\n") == [((0,), "A"), ((0, 0), "A1")]

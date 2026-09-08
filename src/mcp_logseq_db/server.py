@@ -44,6 +44,7 @@ from .client import (
 )
 from .content import VerifiedContent
 from .identifiers import require_uuid
+from .importer import VerifiedImport
 from .mutations import MutationVerificationError, VerifiedMutations
 from .settings import Settings
 
@@ -106,6 +107,7 @@ def create_server(
 
     content = lambda: VerifiedContent(client)          # noqa: E731
     mutations = lambda: VerifiedMutations(client)      # noqa: E731
+    importer = lambda: VerifiedImport(client)          # noqa: E731
 
     async def query(q: str, *params: Any) -> Any:
         return await client.call("logseq.DB.datascriptQuery", [q, *params])
@@ -174,6 +176,38 @@ def create_server(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return (await content().clear_page(page_uuid)).to_dict()
 
+    @server.tool(name="importPage", structured_output=True)
+    async def import_page(
+        target: str,
+        markdown: str,
+        replace: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Build a whole page from Logseq markdown in one call. target is either a page UUID (write into it) or a title (create it). Indentation gives structure and every block line must start with '- '. Markdown headings convert to native Logseq headings automatically. [[links]] and #tags are ESCAPED to {{link:X}} and {{tag:X}} rather than written live, because Logseq mints a page or tag for any reference it parses — run repairLinks afterwards to convert them once their targets exist. Existing content is appended to unless replace=true, which clears the page first and destroys its block UUIDs."""
+        return (await importer().import_page(
+            target, markdown, replace=replace, dry_run=dry_run)).to_dict()
+
+    @server.tool(name="repairLinks", structured_output=True)
+    async def repair_links(
+        page_uuid: str | None = None,
+        create_missing: bool = False,
+        acknowledge_page_creation: bool = False,
+        max_pages_to_create: int = 5,
+        include_tags: bool = False,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Convert {{link:X}} and {{tag:X}} placeholders left by importPage back to live references. Omit page_uuid to scan every page, which is the usual case since links resolve only once their targets have been imported. Names that match no page are skipped and reported with near-miss suggestions; names matching several pages are skipped rather than guessed. Creating the missing pages needs BOTH create_missing and acknowledge_page_creation, and is capped — accidental page creation is how a graph fills with stubs. Tags are opt-in via include_tags. Safe to re-run."""
+        if page_uuid is not None:
+            page_uuid = require_uuid(
+                page_uuid, role="page_uuid", hint="getPageUUID")
+        return await importer().repair_links(
+            page_uuid,
+            create_missing=create_missing,
+            acknowledge_page_creation=acknowledge_page_creation,
+            max_pages_to_create=max_pages_to_create,
+            include_tags=include_tags,
+            dry_run=dry_run)
+
     # ------------------------------------------------------------ blocks
 
     @server.tool(name="getBlockUUID", structured_output=True)
@@ -186,9 +220,24 @@ def create_server(
         """Read one exact block. A missing UUID returns found=false rather than raising."""
         return await content().find_block(block_uuid)
 
+    @server.tool(name="pageStats", structured_output=True)
+    async def page_stats(page_uuid: str) -> dict[str, Any]:
+        """Counts for one page: own blocks, subtree blocks, nested pages, true orphans, and inbound refs, tag holders and property values. Returns integers only, so a full-graph audit costs a fixed payload per page rather than one proportional to page size."""
+        page_uuid = require_uuid(
+            page_uuid, role="page_uuid", hint="getPageUUID")
+        return await content().page_stats(page_uuid)
+
+    @server.tool(name="findBacklinks", structured_output=True)
+    async def find_backlinks(target_uuid: str) -> dict[str, Any]:
+        """Everything referring to a page, block or tag. Reports three mechanisms separately: refs (what Logseq's backlink panel counts), tags, and property values pointing at the target. Property values are references in the DB but do not appear in the UI panel. Nothing rewrites these on delete, so run this before removing anything."""
+        target_uuid = require_uuid(
+            target_uuid, role="target_uuid",
+            hint="getPageUUID, getBlockUUID or getTagUUID")
+        return await content().find_backlinks(target_uuid)
+
     @server.tool(name="findOrphans", structured_output=True)
     async def find_orphans(page_uuid: str) -> dict[str, Any]:
-        """List blocks whose :block/parent and :block/page disagree. Such blocks are real children but are invisible to every page-scoped query, which is the signature of a failed nested write. Run this to audit a page after a nested create fails."""
+        """List blocks whose owning page differs from their nearest ancestor page -- real children that are invisible to every page-scoped query. Nested pages are reported separately as structure rather than damage, since blocks beneath a sub-page correctly belong to that sub-page."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return await content().find_orphans(page_uuid)
@@ -209,19 +258,11 @@ def create_server(
         return (await content().create_block(
             parent_uuid, title, dry_run=dry_run)).to_dict()
 
-    @server.tool(name="createManyBlocks", structured_output=True)
-    async def create_many_blocks(
-        blocks: list[dict[str, str]], dry_run: bool = False
-    ) -> dict[str, Any]:
-        """Create several blocks in one batched call. Each item takes parent_uuid and title. Titles must be unique within the batch, since verification identifies new blocks by title."""
-        return (await content().create_many_blocks(
-            blocks, dry_run=dry_run)).to_dict()
-
     @server.tool(name="createPageofBlocks", structured_output=True)
     async def create_page_of_blocks(
         page_uuid: str, outline: str, dry_run: bool = False
     ) -> dict[str, Any]:
-        """Build an indented outline on a page. Each level is created, read back to learn the UUIDs Logseq assigned, then used as the parent for the next -- creation does not return UUIDs and parents cannot be named by title."""
+        """Build an indented outline on a page. Structure comes from INDENTATION ONLY -- a leading markdown bullet is stripped, anything else becomes part of the title. Costs one call per parent that has children. The whole outline is validated before the first write, so a malformed one commits nothing."""
         return await content().create_page_of_blocks(
             page_uuid, outline, dry_run=dry_run)
 
@@ -239,7 +280,7 @@ def create_server(
         target_uuid: str,
         placement: Literal["child", "before", "after"] = "child",
     ) -> dict[str, Any]:
-        """Move a block and its subtree relative to a target. placement=child puts it under the target (a page target moves it to the page's top level); before and after place it as a sibling. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed."""
+        """Move a block and its subtree relative to a target. placement=child puts it under the target (a page target moves it to the page's top level); before and after place it as a sibling. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed -- all three confirmed working, including across pages."""
         block_uuid = require_uuid(
             block_uuid, role="block_uuid", hint="getBlockUUID")
         target_uuid = require_uuid(
@@ -276,7 +317,7 @@ def create_server(
     async def creat_tag(
         title: str, options: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Create a tag. Its ident carries a random suffix assigned by Logseq, so it cannot be predicted from the title and is read back."""
+        """Create a tag. The ident is deterministic -- :plugin.class.<caller>/<Title> with spaces stripped -- and is returned. Tags and pages share one title space, so a title an existing page holds is refused."""
         return (await mutations().create_tag(title, options)).to_dict()
 
     @server.tool(name="deleteTag", structured_output=True)
@@ -331,7 +372,7 @@ def create_server(
         schema: dict[str, Any],
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Create a property definition. Pass a plain title, never a namespaced ident. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen."""
+        """Create a property definition. Pass a plain title, never a namespaced ident -- spaces are stripped from it, so "MCPT Check" becomes MCPTCheck. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen. The stored type is verified against the requested one."""
         return (await mutations().create_property(
             title, schema, options)).to_dict()
 
@@ -396,7 +437,7 @@ def create_server(
 
     @server.tool(name="listClosedValues")
     async def list_closed_values() -> Any:
-        """List every enum property with its permitted values. Required before setting Status, Priority, or any closed property -- the value must be one of these entities."""
+        """List every enum property with its permitted values. Returns empty on current builds: no closed-value relationship exists in the graph, and Status reports type default with a default-value rather than a permitted set."""
         # The relationship is stored on the VALUE, pointing back at its
         # property, under a bare unnamespaced ident. Querying the property
         # side for a `closed-values` attribute finds nothing, because no such
@@ -500,6 +541,19 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "rewritten."
         ),
         "clear_page": "Pass an exact page UUID, not a block UUID.",
+        "import_page": (
+            "Pass a page UUID or a page title, then the markdown. Every block "
+            "line must begin with '- '; indentation alone creates nothing."
+        ),
+        "repair_links": (
+            "Omit page_uuid to scan the whole graph. To create missing pages "
+            "you must pass create_missing AND acknowledge_page_creation."
+        ),
+        "page_stats": "Pass an exact page UUID, not a block UUID.",
+        "find_backlinks": (
+            "Pass the UUID of the entity being referred to -- a page, block "
+            "or tag."
+        ),
         "get_block_uuid": "Pass an exact page UUID, not a block UUID.",
         "get_block": "Pass an exact block UUID.",
         "get_block_tree": (
@@ -509,10 +563,6 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "Pass an exact parent UUID -- a page UUID for a top-level block or "
             "a block UUID to nest -- and a non-empty title. A page title will "
             "not resolve."
-        ),
-        "create_many_blocks": (
-            "Pass a list of objects with parent_uuid and title. Titles must be "
-            "unique within the batch."
         ),
         "create_page_of_blocks": (
             "Pass an exact page UUID and an outline whose indentation is "

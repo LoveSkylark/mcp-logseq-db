@@ -21,11 +21,13 @@ from mcp_logseq_db.server import create_server
 EXPECTED_TOOLS = {
     "capabilities",
     # Pages
-    "getPageUUID", "getPage", "createPage", "renamePage", "deletePage",
+    "getPageUUID", "getPage", "pageStats", "createPage", "renamePage",
+    "deletePage",
     "clearPage",
     # Blocks
-    "getBlockUUID", "getBlock", "getBlockTree", "findOrphans", "createBlock",
-    "createManyBlocks", "createPageofBlocks", "updateBlock", "removeBlock",
+    "getBlockUUID", "getBlock", "getBlockTree", "findOrphans", "findBacklinks", "createBlock",
+    "createPageofBlocks", "importPage", "repairLinks", "updateBlock",
+    "removeBlock",
     "moveBlock",
     # Tags
     "getTagUUID", "getTag", "getTagUsers", "creatTag", "deleteTag",
@@ -42,6 +44,7 @@ EXPECTED_TOOLS = {
 # Removed in the rewrite. Each is listed with why, so a future reader does not
 # restore one by assuming it was an oversight.
 REMOVED_TOOLS = {
+    "createManyBlocks":        "batched across arbitrary parents, so a failure could commit partially; createPageofBlocks covers the useful case",
     "insert_block":            "no verified route; nesting is createBlock",
     "create_top_level_block":  "createBlock covers page and block parents",
     "add_page_tag":            "a page is a block; addTag takes either",

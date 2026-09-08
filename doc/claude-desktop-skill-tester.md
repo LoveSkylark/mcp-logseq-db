@@ -24,16 +24,19 @@ the second question.
 4. Verify every write with an independent read. **An envelope reporting
    `verified: true` is necessary but not sufficient** — the server's read-back
    and your verification can share a wrong assumption.
-5. **On any error, do not retry.** Read actual state first: a failed response
-   does not imply a failed write, and a successful one does not imply a
-   completed write. Record whether the mutation committed.
+5. **On any error, do not retry.** A failed response does not imply a failed
+   write, and a successful one does not imply a completed write. Record
+   whether the mutation committed.
 6. Prefer attribute patterns and `#uuid` literals in verification queries.
    Predicate functions are used by the server in one place (`listAssets`) but
-   have hung the DB worker before — see T-705.
+   have hung the DB worker before — see T-706.
 7. Destructive steps require explicit confirmation: `deleteTag`,
    `deleteProperty`, `deletePage`, `clearPage`, and `removeBlock` on anything
    with children.
-8. Tear down fixtures at the end of the run.
+8. Use `pageStats` for triage rather than `getPage` or `findOrphans`. Its
+   response is a fixed size; theirs scale with page content, and a container
+   page can exhaust the context in one call.
+9. Tear down fixtures at the end of the run.
 
 ### Standard verification query
 
@@ -66,18 +69,21 @@ ID | verdict | observed | notes
 
 ## Suite 0 — Regressions
 
-Run first. Each of these was broken and fixed; a failure here means the fix did
-not hold or the build changed underneath it.
+Run first. Each was broken and fixed; a failure here means the fix did not hold
+or the build changed underneath it.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-001 | `createBlock` on a page | Succeeds. Previously failed with "The Imported EDN has 4 validation error(s)" because `upsertNodes` was sent a second options argument. |
-| T-002 | `createManyBlocks`, `createPageofBlocks`, `updateBlock` | All succeed. Same single route as T-001 — one failure means all four. |
+| T-001 | `createBlock` on a page | Succeeds. Block creation now routes through `insertBlock`, not `upsertNodes` — the latter wrote its single `page-id` into both `:block/parent` and `:block/page`. |
+| T-002 | `createBlock` with a **block** parent | `:block/parent` is the block, `:block/page` is the **page**. These are separate facts and the old route conflated them. |
 | T-003 | `getPage` with `detail=properties` | Returns rows. Previously 500'd: `(pull ?value ...)` received scalars such as `:block/order` strings. |
 | T-004 | `getPage` with `detail=all` | Returns; recovers with T-003. |
 | T-005 | `getPageUUID` with the lowercase form of a mixed-case title | Resolves via the normalized name fallback. |
-| T-006 | `getPageUUID` for a title also used by a tag | Resolves to the page. Tags carry `:block/name` too; the Page-class filter should separate them. |
-| T-007 | `createBlock` with `dry_run: true`, then the same call for real | Dry run states it is local-only and is **not** evidence. Compare the two outcomes. |
+| T-006 | `getPageUUID` for a title also used by a tag | Resolves to the page. Tags carry `:block/name` too; the Page-class filter separates them. |
+| T-007 | `getBlockUUID` on a page with nested blocks | Every block at any depth, and none duplicated. Reads walk `:block/parent`, and the raw `_parent` key is stripped once the tree is built. |
+| T-008 | `findOrphans` on a page containing a **nested page** | `orphans: []`, `nested_pages` populated, diagnostic says "No damage". A nested page is a page boundary — flagging its blocks invites repair of correct structure. |
+| T-009 | `deleteProperty` on a property with a `checkbox` or `datetime` value | Succeeds. The usage query pulled the value, which 500'd on inline literals and left such properties undeletable. |
+| T-010 | `clearPage` on a page holding property values | Content blocks gone, property-value blocks preserved and counted in the diagnostic. |
 
 ---
 
@@ -85,19 +91,19 @@ not hold or the build changed underneath it.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-101 | `createPage` | Page returned with a UUID; readable by that UUID; carries `:logseq.class/Page` |
-| T-102 | `createPage` with an existing title | Rejected before writing, not duplicated |
-| T-103 | `getPageUUID` on an ambiguous title | `found: false` with candidates; no guess |
-| T-104 | `renamePage` | Title changes, **UUID stable**, `:block/name` updated, still a page |
-| T-105 | `renamePage` onto an existing title | Rejected |
-| T-106 | `deletePage` on a page with no inbound refs | Recycled: `:logseq.property/deleted-at` set, UUID and tags retained |
-| T-107 | `deletePage` on a page **with** inbound refs, no acknowledgement | Refused, referring entities listed |
-| T-108 | Same with `acknowledge_reference_rewrite: true` | Proceeds; **check whether the inbound refs still point at it** |
-| T-109 | `listPages` after T-106 | Recycled page absent |
-| T-110 | `listRecycled` after T-106 | Recycled page present |
-| T-111 | Which identifier `deletePage` accepts | The envelope reports `via its uuid` or `via its name`. **Record which** — this also settles `deleteTag`. |
-| T-112 | `clearPage` on a page with nested blocks | All blocks gone; page, its tags and its property values intact |
-| T-113 | `getPage` at each `detail` value | `page`, `blocks`, `tags`, `properties`, `declared`, `all` each return their own shape |
+| T-101 | `createPage` | Page returned with a UUID; readable by it; carries `:logseq.class/Page` |
+| T-102 | `createPage` with an existing title | Rejected **before** writing, not duplicated |
+| T-103 | `renamePage` | Title changes, **UUID stable**, `:block/name` updated, still a page |
+| T-104 | `renamePage` onto an existing title | Rejected |
+| T-105 | `deletePage` with no inbound refs | Recycled: `:logseq.property/deleted-at` set, UUID and tags retained |
+| T-106 | `deletePage` **with** inbound refs, no acknowledgement | Refused, referring entities listed |
+| T-107 | Same with `acknowledge_reference_rewrite: true` | Proceeds; **confirm the inbound refs still point at it** |
+| T-108 | `listPages` after T-105 | Recycled page absent |
+| T-109 | `listRecycled` after T-105 | Recycled page present |
+| T-110 | `clearPage` on a page with nested blocks | All content blocks gone; page, tags and property values intact |
+| T-111 | `getPage` at each `detail` value | `page`, `blocks`, `tags`, `properties`, `declared`, `all` each return their own shape |
+| T-112 | `pageStats` on a leaf page | Counts only, no block payload. Compare `own_blocks` against `getBlockUUID` length. |
+| T-113 | `pageStats` on a container page with sub-pages | `nested_pages > 0`, `true_orphans: 0`, `own_blocks` counts only the container's own. Response stays small. |
 
 ---
 
@@ -105,23 +111,36 @@ not hold or the build changed underneath it.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-201 | `createBlock` with a page parent | Top-level block; `:block/parent` and `:block/page` both the page |
-| T-202 | `createBlock` with a **block** parent | Nested; `:block/parent` the block, `:block/page` still the page |
+| T-201 | `createBlock` with a page parent | Top-level; `:block/parent` and `:block/page` both the page |
+| T-202 | `createBlock` with a **block** parent | Nested; parent is the block, page is the page |
 | T-203 | Depth 3 via T-202 twice | `:block/parent` chains; `:block/page` unchanged at every level |
-| T-204 | `createManyBlocks`, 3 blocks | All three created; `:block/order` ascending |
-| T-205 | `createManyBlocks` with two identical titles under one parent | Rejected before writing |
-| T-206 | Same title under two different parents | Both created |
-| T-207 | `createPageofBlocks`, 3 levels | Tree correct; count the calls — expect 2d−1 |
-| T-208 | `createPageofBlocks` with a repeated title in different branches | Both created under the right parents |
-| T-209 | `updateBlock` | Title changes; UUID stable |
-| T-210 | `removeBlock` on a childless block | Gone; verified absent |
-| T-211 | `removeBlock` on a block with descendants | Whole subtree gone; no orphan with a dangling `:block/parent` |
-| T-212 | `getBlockUUID` on a page with nested blocks | Returns **every** block at any depth, ordered |
-| T-213 | `getBlockUUID` on an empty page | `[]`, not an error |
-| T-214 | `getBlock` on a deleted UUID | `found: false`, distinguishable from a transport failure |
-| T-215 | `getBlockTree` with `max_nodes: 1` | `truncated: true`, accurate `node_count` |
-| T-216 | `getBlockTree` with `max_depth: 1` | Root plus one generation — depth counts generations **below** the root |
-| T-217 | A batch where one operation is invalid | Record whether the valid ones landed. **Batch atomicity is untested.** |
+| T-204 | `updateBlock` | Title changes; UUID stable; `previous_entities` carries the **old title** |
+| T-205 | `removeBlock` on a childless block | Gone; verified absent |
+| T-206 | `removeBlock` on a block with descendants | Whole subtree gone; no orphan with a dangling `:block/parent` |
+| T-207 | `getBlockUUID` on an empty page | `[]`, not an error |
+| T-208 | `getBlock` on a deleted UUID | `found: false`, distinguishable from a transport failure |
+| T-209 | `getBlockTree` with `max_nodes: 1` | `truncated: true`, accurate `node_count` |
+| T-210 | `getBlockTree` with `max_depth: 1` | Root plus one generation — depth counts generations **below** the root |
+| T-211 | `getBlockTree` payload | Each node carries `children` only. The raw `_parent` key must not also be present — it duplicated whole subtrees. |
+| T-212 | `createPageofBlocks`, 3 levels | Tree correct. `calls` equals **one per parent that has children** — the read-back cycle is gone. |
+| T-213 | `createPageofBlocks` with a repeated title in different branches | Both created under the right parents |
+| T-214 | `createPageofBlocks` where one level fails | **Batches are not atomic.** Earlier levels stay committed. Confirm the result names the failing level and does not imply a clean rollback. |
+| T-215 | `findOrphans` after T-214 | Reports what was left, so the partial write is auditable |
+
+### Moving
+
+`moveBlock`'s underlying route has never been observed changing anything. The
+tool verifies by reading back, so a no-op returns `verified: false` with a
+diagnostic saying so. **Treat that as the tool working correctly.**
+
+| ID | Test | Expected |
+|---|---|---|
+| T-216 | `moveBlock` to another block on the same page, `placement=child` | Parent changes, page unchanged. Or `verified: false` with "silent no-op". |
+| T-217 | `moveBlock` to a block on a **different page** | Parent changes **and** `:block/page` follows. A page that does not follow leaves an invisible child. |
+| T-218 | `moveBlock` on a block with descendants | Descendants' `:block/page` follows too |
+| T-219 | `moveBlock` with a page target, `placement=child` | Moves to the page's top level |
+| T-220 | `moveBlock` with a page target, `placement=after` | Refused — a page has no siblings |
+| T-221 | `moveBlock` into the block's own subtree | Refused before the call |
 
 ---
 
@@ -129,44 +148,44 @@ not hold or the build changed underneath it.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-301 | `creatTag` | Created; ident carries a random suffix; **record the ident** |
-| T-302 | `addTag` to a block | `:block/tags` updated |
-| T-303 | `addTag` to a page | Same tool, same result — the target is uniform |
-| T-304 | `addTag` twice with the same tag | Record whether it is idempotent |
-| T-305 | `removeTag` with two tags present | Only the named relation removed; the other survives |
-| T-306 | `removeTag` from a page | Page still has `:logseq.class/Page` and is still a page |
-| T-307 | `getTagUsers` on a tag applied to a page and a block | Both returned; pages distinguishable by `:block/name` |
-| T-308 | `getTagUUID` on an ambiguous title | `found: false` with candidates |
-| T-309 | `deleteTag` on an unused tag | **Unverified route.** Record the verdict and which identifier worked. |
-| T-310 | `deleteTag` on a tag in use | `getTagUsers` first; check every `:block/tags` and `:block/refs` entry is cleared |
-| T-311 | `listOrphanTags` after T-305 | The now-unused tag appears |
+| T-301 | `creatTag` | Created. The ident is **deterministic**: `:plugin.class.<caller>/<Title>`, spaces stripped. Record it and confirm no random suffix. |
+| T-302 | `creatTag` with a title an existing page holds | Refused — tags and pages share one title space |
+| T-303 | `addTag` to a block | `:block/tags` updated |
+| T-304 | `addTag` to a page | Same tool, same result — the target is uniform |
+| T-305 | `addTag` twice with the same tag | Record whether it is idempotent |
+| T-306 | `removeTag` with two tags present | Only the named relation removed; the other survives |
+| T-307 | `removeTag` from a page | Page keeps `:logseq.class/Page` and is still a page |
+| T-308 | `getTagUsers` on a tag applied to a page and a block | Both returned; pages distinguishable by `:block/name` |
+| T-309 | `deleteTag` on an unused tag | Succeeds. Record which identifier the route accepted. |
+| T-310 | `deleteTag` on a tag in use, no acknowledgement | Refused, holders listed |
+| T-311 | Same with `acknowledge_detach: true` | Proceeds; every `:block/tags` and `:block/refs` entry cleared |
+| T-312 | `listOrphanTags` after T-306 | The now-unused tag appears |
 
 ---
 
 ## Suite 4 — Properties
 
-The sandbox limits writes to `plugin.property.<caller>/*`. Tests that expect a
+The sandbox limits writes to `plugin.property.<caller>/*`. Tests expecting a
 refusal are testing the guard, not looking for a workaround.
 
 | ID | Test | Expected |
 |---|---|---|
 | T-401 | `createProperty` with type `default` | Created; **record the assigned ident** |
 | T-402 | `createProperty` with a namespaced title | Rejected — Logseq treats it as a page name and refuses the `/` |
-| T-403 | `createProperty` for each type: `number`, `checkbox`, `url`, `datetime`, `node` | Each accepted; record the stored `:logseq.property/type` |
+| T-403 | `createProperty` for `number`, `checkbox`, `url`, `datetime`, `node` | Each accepted, and the **stored type matches the requested type**. A mismatch now fails rather than passing. |
 | T-404 | Value storage audit | Set a value of each type; dump every attribute of the target and of the value entity. **Record which attribute each type writes.** |
-| T-405 | `addProperty` on a page | Set and verified |
+| T-405 | `addProperty` on a page | Set, and the **stored value matches** what was requested |
 | T-406 | `addProperty` on a block | Same tool, same result |
 | T-407 | `addProperty` with a `user.property/*` ident | Refused **before** the API call |
 | T-408 | `addProperty` with a `:logseq.property/*` built-in | Refused the same way |
-| T-409 | `addProperty` on a `node` property, passing a literal | Record whether it is rejected or silently stored wrong |
-| T-410 | `addProperty` twice with the same value on a cardinality-many property | Exactly one value retained |
+| T-409 | `addProperty` on a `node` property, passing a literal | Refused before the call. Logseq would mint a value entity named after the string and read back as success. |
+| T-410 | `addProperty` twice with the same value on a cardinality-many property | Second write skipped, diagnostic says duplicate |
 | T-411 | Two distinct values on a cardinality-many property | Both retained |
-| T-412 | `listClosedValues`, then set `Status` to one of them | Record whether the built-in is writable at all |
-| T-413 | `removeProperty` (value) | Attribute, `:block/refs` entry, and value entity all cleared |
-| T-414 | `deleteProperty` (definition) with no users | **Unverified route.** Record the verdict. |
-| T-415 | `deleteProperty` on a definition still in use | `getProperyUsers` first; check the value is cleared everywhere |
-| T-416 | `getPropertyIndent` on a title shared with a tag | Resolves to the property, not the tag |
-| T-417 | `getProperyUsers` on a property set on both a page and a block | Both returned, with raw and resolved values |
+| T-412 | `removeProperty` (value) | Attribute, `:block/refs` entry, and value entity all cleared |
+| T-413 | `deleteProperty` with values, no acknowledgement | Refused, holder count reported |
+| T-414 | Same with `acknowledge_value_loss: true` | Definition gone, values gone, and **orphaned value blocks swept** — the diagnostic reports how many |
+| T-415 | `getProperyUsers` on a property set on both a page and a block | Both returned, with raw and resolved values |
+| T-416 | `getProperyUsers` on a `checkbox` property | Returns rows. The value is a literal, not a ref — pulling it used to 500. |
 
 ---
 
@@ -174,11 +193,10 @@ refusal are testing the guard, not looking for a workaround.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-501 | `getPage` `detail=declared` on a page tagged `Task` | Status, Priority, Deadline, Scheduled listed as declared |
-| T-502 | Same page, `detail=properties` | Only properties **with values**; the declared-but-unset ones absent |
-| T-503 | Set one declared property, re-run both | It moves from declared-only into properties |
-| T-504 | `listClosedValues` | `Status` and `Priority` return their permitted entities |
-| T-505 | A page's own tags vs its blocks' tags | `getPage detail=tags` covers both; confirm each holder is identified |
+| T-501 | `getPage detail=declared` on a page tagged `Task` | Status, Priority, Deadline, Scheduled listed as declared |
+| T-502 | Same page, `detail=properties` | Only properties **with values**; declared-but-unset ones absent |
+| T-503 | A page's own tags vs its blocks' tags | `getPage detail=tags` covers both; confirm each holder is identified |
+| T-504 | `listClosedValues` | **Expected empty on current builds.** No closed-value relationship exists: `Status` reports type `default` with a `:logseq.property/default-value` and no permitted set. Record if that changes. |
 
 ---
 
@@ -186,11 +204,12 @@ refusal are testing the guard, not looking for a workaround.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-601 | Write `[[Target]]` into a block title via `createBlock` | Record whether `:block/refs` gains an entry |
-| T-602 | Edit that block in the Logseq UI | Record whether a user edit materializes the ref |
-| T-603 | Point a `node` property at a page | Target appears in `:block/refs`; check the UI backlink count |
-| T-604 | Query `:block/refs` against a target UUID | Referring blocks returned with their pages |
-| T-605 | `deletePage` on a referenced page, then T-604 | **References are not rewritten** — confirm they still point at the recycled page |
+| T-601 | Write `[[Target]]` into a block title via `createBlock` | **No `:block/refs` entry.** Links written through the API stay inert text. |
+| T-602 | Edit that block in the Logseq UI | Record whether a user edit materializes the ref. Needs a human. |
+| T-603 | Point a `node` property at a page, then `findBacklinks` on the page | Appears under `property_values`, **not** under `refs` |
+| T-604 | `findBacklinks` on a page with refs, tag holders and property values | All three reported separately. The total exceeds Logseq's backlink panel, which counts only `refs`. |
+| T-605 | `deletePage` on a referenced page, then `findBacklinks` | **References are not rewritten** — they still point at the recycled page |
+| T-606 | `pageStats` reference counts vs `findBacklinks` lengths | The integers agree with the lists |
 
 ---
 
@@ -201,11 +220,12 @@ refusal are testing the guard, not looking for a workaround.
 | T-701 | Any tool with a malformed UUID | Clean `validation` failure naming the argument; no mutation |
 | T-702 | A tag tool given the tag's **ident** instead of its UUID | Rejected at the boundary, diagnosed as an ident |
 | T-703 | A property tool given a **UUID** instead of an ident | Rejected; this is the silent no-op the guard exists for |
-| T-704 | `createBlock` with a page **name** as the parent | Rejected at the boundary. Bypassing the tool, the raw API reports success and writes nothing. |
+| T-704 | `createBlock` with a page **name** as the parent | Rejected at the boundary |
 | T-705 | A normal call immediately after a failed one | Succeeds — no session poisoning |
-| T-706 | A query with a `clojure.string/*` predicate, in an isolated session | Record whether it errors cleanly or wedges the worker. **Run last; may require restarting Logseq.** |
+| T-706 | A query with a `clojure.string/*` predicate, isolated session | Record whether it errors cleanly or wedges the worker. **Run last; may need a Logseq restart.** |
 | T-707 | After any timeout: re-probe, re-read the target | Establish committed state; check `recovered_after_timeout` and whether `capabilities` reports `writes_disabled` |
 | T-708 | Recovery from an open write circuit | Reads still work; writes refused until Logseq is restarted and the MCP reconnected |
+| T-709 | Every write failing with "The Imported EDN has N validation error(s)" | **A graph-level fault, not a payload fault.** A dry run still succeeds. Re-index the graph or test on a fresh one; nothing in the request will fix it. |
 
 ---
 
@@ -215,24 +235,47 @@ Fill in from envelopes captured during earlier suites.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-801 | `deleteTag` envelope | `verified_state` null; `previous_state` populated with the tag and its holders |
+| T-801 | `deleteTag` envelope | `verified_state` null; `previous_state` carries the tag and its holders |
 | T-802 | `deleteProperty` envelope | Compare with T-801; flag inconsistencies |
 | T-803 | `removeBlock` envelope | `verified_entities` empty; `previous_entities` carries the whole subtree |
 | T-804 | `deletePage` envelope | `previous_entities` carries page and blocks; `observed_entities` carries inbound refs |
-| T-805 | Create and edit envelopes | `previous_entities` behaviour on non-deletes |
+| T-805 | `updateBlock` envelope | `previous_entities` carries the prior title — an edit is otherwise unrecoverable from its own result |
 | T-806 | A cascade delete diagnostic | Does it cover descendants or only the target UUID? |
 | T-807 | Any `verified: false` result | `previous_state` and `observed_state` both present, and distinguishable |
+| T-808 | Any `dry_run: true` call | `verified: false`, empty `verified_entities`. A dry run is not a write. |
+| T-809 | A partial batch failure (T-214) | The committed blocks appear in `verified_entities` and the diagnostic says batches are not atomic |
 
 ---
 
-## Not covered, because no tool exists
+## Unconstructable with the current toolset
 
-Moving a block. No route has been found — `insertBatchBlock` and
-`prependBlockInPage` are untested and would be the place to look.
+Record as such rather than leaving them perpetually BLOCKED.
+
+**Ambiguous-title tests.** `createPage` refuses a title a tag holds, and
+`creatTag` refuses a title a page holds, so an ambiguous title cannot be
+created through the tools. `getPageUUID`, `getTagUUID` and `getPropertyIndent`
+all have ambiguity guards that can only be exercised against pre-existing
+damage.
+
+**Setting a declared built-in.** Every `Task`-declared property is a
+`:logseq.property/*` built-in, outside the sandbox. There is no way to set one
+and watch it move from `declared` to `properties`.
+
+**Closed-value enforcement.** No closed-value relationship exists on current
+builds, so "set an allowed value" and "reject a disallowed one" have nothing to
+enforce against.
+
+---
+
+## No tool exists
 
 Tag inheritance (`extends`), tag-level property declaration, block icons, and
-page aliases. All have working API methods and no tool. If any becomes a tool,
+page aliases. All have working API methods and no tool. If any becomes one,
 this spec needs a suite.
+
+Assigning or freeing a UUID. `:block/uuid` cannot be written, and recycling
+does not release an identity. This is what makes split-identity damage
+unrepairable by reassignment.
 
 ---
 
@@ -245,4 +288,5 @@ envelopes already captured. Suite 7 last, and T-706 last of all.
 
 After the run, update `scripts/live_reliability.py` with any assumption that
 turned out to be wrong. A finding recorded only in a run log gets rediscovered
-the expensive way.
+the expensive way — several in this spec were rediscovered twice before being
+written down.

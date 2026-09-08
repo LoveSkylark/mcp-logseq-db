@@ -566,3 +566,63 @@ async def test_create_property_reports_storage_shape(graph, mutations):
 
     assert result.verified is True
     assert "cardinality" in (result.diagnostic or "")
+
+
+# ------------------------------- pointing a property at an existing entity
+
+async def test_ref_property_pointing_at_an_existing_entity_verifies(graph):
+    """The FALSE-ERROR case. Writing an entity id to a ref-typed property
+    landed correctly and was reported as a failure: the check resolved the
+    held id to the entity's TITLE and compared that against the requested
+    integer. It fired precisely when pointing at something that already
+    exists, which is what node/page/class types are for."""
+    class RefClient(FakeClient):
+        def _upsertBlockProperty(self, target, ident, value, options=None):
+            # Logseq stores a pointer to the entity that was named.
+            entity_id = value.get("db/id", value.get("id")) \
+                if isinstance(value, dict) else value
+            self.graph.entities[target][ident] = {"id": entity_id}
+            return None
+
+    existing = graph.add("An Existing Page", name="an existing page")
+    client = RefClient(graph)
+
+    result = await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
+        graph.page["uuid"], NODE_PROP, existing["id"])
+
+    assert result.verified is True
+
+
+async def test_ref_property_still_verifies_a_literal(graph):
+    """The other convention: a literal is materialized into a value entity
+    named after it, so the comparison is against the resolved literal. Both
+    must work without the caller declaring which they used."""
+    class MintingClient(FakeClient):
+        def _upsertBlockProperty(self, target, ident, value, options=None):
+            entity = self.graph.add(
+                str(value), extra={":logseq.property/value": value})
+            self.graph.entities[target][ident] = {"id": entity["id"]}
+            return None
+
+    client = MintingClient(graph)
+
+    result = await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
+        graph.page["uuid"], MANY_PROP, "alpha")
+
+    assert result.verified is True
+
+
+async def test_a_genuinely_wrong_value_is_still_caught(graph):
+    """The looser comparison must not make the check toothless."""
+    class WrongClient(FakeClient):
+        def _upsertBlockProperty(self, target, ident, value, options=None):
+            other = self.graph.add("not what was asked for")
+            self.graph.entities[target][ident] = {"id": other["id"]}
+            return None
+
+    existing = graph.add("Intended target", name="intended target")
+    client = WrongClient(graph)
+
+    with pytest.raises(MutationVerificationError, match="not "):
+        await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
+            graph.page["uuid"], NODE_PROP, existing["id"])

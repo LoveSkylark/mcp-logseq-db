@@ -23,9 +23,9 @@ still true.
 
 **Reads**
 
-`capabilities` · `getPageUUID` · `getPage` · `getBlockUUID` · `getBlock` ·
-`getBlockTree` · `findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
-`getPropertyIndent` · `getProperyUsers`
+`capabilities` · `getPageUUID` · `getPage` · `pageStats` · `getBlockUUID` ·
+`getBlock` · `getBlockTree` · `findBacklinks` · `findOrphans` · `getTagUUID` ·
+`getTag` · `getTagUsers` · `getPropertyIndent` · `getProperyUsers`
 
 **Lists** — no arguments, each returns a whole kind
 
@@ -35,8 +35,9 @@ still true.
 
 **Writes** — each verifies by read-back
 
-`createPage` · `renamePage` · `deletePage` · `clearPage` · `createBlock` ·
-`createManyBlocks` · `createPageofBlocks` · `updateBlock` · `removeBlock` ·
+`importPage` · `repairLinks` · `createPage` · `renamePage` · `deletePage` ·
+`clearPage` · `createBlock` · `createPageofBlocks` · `updateBlock` ·
+`moveBlock` · `removeBlock` ·
 `creatTag` · `deleteTag` · `addTag` · `removeTag` · `createProperty` ·
 `deleteProperty` · `addProperty` · `removeProperty`
 
@@ -49,6 +50,10 @@ between. The same applies to `addProperty`.
 blocks' tags live in different places, and properties that a page *declares*
 through its classes have no datoms at all — they appear in no other query.
 
+`pageStats` is the one read whose response size does not depend on the page.
+Every other read returns payload proportional to content, which makes auditing
+many pages expensive; this returns seven integers regardless.
+
 ## Limits worth knowing up front
 
 **Property writes are sandboxed.** Only `plugin.property.<caller-id>/*` is
@@ -60,8 +65,19 @@ is Logseq's restriction, not this server's.
 blocks on the holder's page. `clearPage` identifies and preserves them; other
 tools should not assume every block on a page is content.
 
-**No block move.** `moveBlock` exists but has never been observed changing
-anything, and no tool exposes it.
+**Logseq parses content on write.** A markdown heading becomes a native
+heading, but `[[X]]` mints a page and `#X` mints a tag — so `importPage`
+escapes both to `{{link:X}}` and `{{tag:X}}` rather than creating a stub for
+every unresolved target. `repairLinks` converts them once the targets exist,
+and creating missing pages needs two explicit arguments plus a cap.
+
+**Batches are not atomic.** `createPageofBlocks` makes one call per parent, so
+a failure partway leaves earlier levels committed. The result names the level
+that failed; audit with `findOrphans` rather than retrying.
+
+**`moveBlock`'s route is unproven.** The API returns nothing on a move, so the
+tool verifies by reading back — a silent no-op comes back as `verified: false`
+rather than a false success.
 
 **Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
 `deleteProperty` refuse until you confirm, listing what would be affected.

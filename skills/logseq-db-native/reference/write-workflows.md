@@ -90,16 +90,25 @@ a block can have the first right and the second wrong. Such a block is a real
 child that no page-scoped query can see, which is why checking the parent alone
 is not enough.
 
+### Moving
+
 ```
-createManyBlocks([{parent_uuid, title}, ...])
+moveBlock(block_uuid, target_uuid, placement="child")
 ```
 
-Items are grouped by parent and one call is made per distinct parent. Duplicate
-titles are fine, including among siblings: the response carries each created
-entity, so nothing has to identify them by title afterwards.
+`child` puts the block under the target; a page target moves it to that page's
+top level. `before` and `after` place it as a sibling, so they need a block
+target — a page has no siblings.
 
-Whether a batch applies atomically is untested. On failure, read back rather
-than assuming all-or-nothing.
+The API returns nothing, so three things are verified by reading back: the new
+parent, the owning page, and that descendants followed. Each is a distinct
+failure. A block whose parent did not change is a silent no-op. A block whose
+owning page did not follow is a real child of the target that no page-scoped
+query can see. Descendants left pointing at the old page are the same failure
+one level down.
+
+Two moves are refused before the call: a target inside the block's own subtree,
+which would detach it from the graph, and sibling placement against a page.
 
 `dry_run` on any of these validates locally and does not call the API. It
 confirms the arguments are well formed and the targets exist; it cannot

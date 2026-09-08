@@ -108,13 +108,24 @@ Prefer the narrowest tool that answers the question.
    `getBlock(uuid)` reads one; `getBlockTree(uuid)` reads a subtree and reports
    `truncated` when a bound stopped it. Both walk `:block/parent`, so a block
    whose `:block/page` is wrong still appears.
-3. `findOrphans(page_uuid)` reports blocks whose `:block/parent` and
-   `:block/page` disagree — real children that no page-scoped query can see.
-   Use it to audit damage from earlier builds; new writes are verified against
-   both attributes, so it should come back empty.
-4. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
+3. `findBacklinks(uuid)` answers "what refers to this?" for a page, block or
+   tag. It reports three mechanisms separately: `refs` (what Logseq's backlink
+   panel counts), `tagged`, and `property_values`. A property value is a
+   reference in the DB but does **not** appear in the UI panel, so the totals
+   will not match what the user sees. Run it before deleting anything —
+   nothing rewrites references on delete.
+4. `findOrphans(page_uuid)` reports blocks whose owning page differs from
+   their nearest ancestor page — real children that no page-scoped query can
+   see. **A nested page is a page boundary, not damage**: blocks beneath a
+   sub-page correctly belong to it, and are reported separately under
+   `nested_pages`.
+5. `pageStats(page_uuid)` returns counts only — own blocks, subtree blocks,
+   nested pages, true orphans, refs, tag holders, property values. Prefer it
+   for triage: every other read returns payload proportional to page size, so
+   auditing many pages with them is expensive and this is not.
+6. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
    this?" — run either before deleting, and report the count to the user.
-5. The `list*` tools take no arguments and return a whole kind.
+7. The `list*` tools take no arguments and return a whole kind.
 
 Keep `uuid` and `ident` in the working plan. Do not reduce an entity to its
 display text; titles are not unique and are not identifiers.
@@ -168,9 +179,49 @@ The write is verified against **both** `:block/parent` and `:block/page`,
 because a block can end up under the right parent while belonging to the wrong
 page — a real child that no page-scoped query can see.
 
-`createManyBlocks` batches by parent, one call per distinct parent.
-`createPageofBlocks` builds an indented outline at one call per parent that has
-children. Duplicate titles among siblings are fine.
+`createPageofBlocks` builds an indented outline at one call per parent that
+has children. Duplicate titles among siblings are fine.
+
+### Importing a whole page
+
+`importPage(target, markdown)` is the right tool when you have page content in
+Logseq markdown. `target` is a page UUID to write into, or a title to create.
+One call carries the whole page, so a 68-block page costs one tool call rather
+than 68.
+
+> **Logseq parses content on write.** `## X` becomes a native heading — which
+> is wanted — but `[[X]]` MINTS A PAGE and `#X` MINTS A TAG, rewriting the text
+> to point at the new entity. An import whose links point at pages that do not
+> exist yet would create a stub for every one.
+>
+> So `importPage` escapes them: `[[X]]` → `{{link:X}}` and `#X` → `{{tag:X}}`.
+> The content is inert until repaired. **Tell the user this** — the links they
+> wrote will not work until the second step.
+
+`repairLinks()` is that second step. Omit the page UUID to scan the whole
+graph, which is usually right: links resolve only once their targets have been
+imported, so the natural order is import everything, then repair once.
+
+It is safe to re-run. Names that match no page are skipped and reported with
+near-miss suggestions; names matching several pages are skipped rather than
+guessed. **Creating the missing pages needs both `create_missing` and
+`acknowledge_page_creation`** and is capped — report what would be created and
+let the user decide, because a typo and a genuinely new page look identical
+from here. Tags are opt-in via `include_tags`.
+
+Page properties (`key:: value` above the first block) are parsed and reported
+but not applied: they are outside the writable namespace.
+
+**Batches are not atomic.** An outline several levels deep is several calls, so
+a failure partway leaves earlier levels committed. The result names the level
+that failed; treat it as a partial write and audit with `findOrphans` rather
+than retrying, which would duplicate what already landed.
+
+`moveBlock(block_uuid, target_uuid, placement)` relocates a block and its
+subtree — `child`, `before` or `after`. The API returns nothing on a move, so
+the tool verifies the new parent, the owning page, and that descendants
+followed. A move whose page did not follow leaves a real child that no
+page-scoped query can see.
 
 `removeBlock` deletes the subtree and verifies every descendant is gone.
 
@@ -259,22 +310,25 @@ it keeps pointing at a page the user can no longer find. `deletePage` refuses
 until `acknowledge_reference_rewrite` is set when references exist — surface
 that to the user rather than setting it reflexively.
 
-**Moving a block has no confirmed route.** `moveBlock` exists and returns
-null, which on this API means both "worked" and "did nothing" — it has never
-been observed changing anything. No tool exposes it.
+**`moveBlock` is exposed but its underlying route is unproven.** The API
+returns null whether it moved the block or did nothing, and no live run has yet
+observed it changing anything. The tool verifies by reading back, so a silent
+no-op comes back as `verified: false` with a diagnostic saying so — report that
+rather than assuming the move happened.
 
 ## Tools
 
-**Reads** — `capabilities`, `getPageUUID`, `getPage`, `getBlockUUID`,
-`getBlock`, `getBlockTree`, `findOrphans`, `getTagUUID`, `getTag`,
-`getTagUsers`, `getPropertyIndent`, `getProperyUsers`
+**Reads** — `capabilities`, `getPageUUID`, `getPage`, `pageStats`,
+`getBlockUUID`, `getBlock`, `getBlockTree`, `findBacklinks`, `findOrphans`,
+`getTagUUID`, `getTag`, `getTagUsers`, `getPropertyIndent`, `getProperyUsers`
 
 **Lists** (no arguments) — `listPages`, `listJournals`, `listTags`,
 `listProperties`, `listClosedValues`, `listOrphanTags`,
 `listOrphanProperties`, `listAssets`, `listStatus`, `listRecycled`
 
-**Writes** — `createPage`, `renamePage`, `deletePage`, `clearPage`,
-`createBlock`, `createManyBlocks`, `createPageofBlocks`, `updateBlock`,
+**Writes** — `importPage`, `repairLinks`, `createPage`, `renamePage`,
+`deletePage`, `clearPage`, `createBlock`, `createPageofBlocks`, `updateBlock`,
+`moveBlock`,
 `removeBlock`, `creatTag`, `deleteTag`, `addTag`, `removeTag`,
 `createProperty`, `deleteProperty`, `addProperty`, `removeProperty`
 

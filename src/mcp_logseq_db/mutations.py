@@ -822,11 +822,20 @@ class VerifiedMutations(VerifiedWriteHelpers):
 
     async def _resolved_values(self, held: Any) -> list[Any]:
         """
-        Flatten a property's current value(s) into comparable literals.
+        Flatten a property's current value(s) into comparable forms.
 
-        Reference-typed values are entity ids pointing at minted value
-        entities; the literal lives inside them under
-        :logseq.property/value or as the title.
+        Two things can be written to a reference-typed property, and they are
+        compared differently:
+
+          a literal    -- Logseq mints a value entity holding it, so the
+                          comparison is against the resolved literal
+          an entity id -- the property points at something that already
+                          exists, so the comparison is against the id
+
+        Returning both means a caller does not have to know which was used.
+        Resolving only to the literal made every entity-id write report a
+        false mismatch: the request was 197 and the resolved title was the
+        entity's name.
         """
         if held is None:
             return []
@@ -845,12 +854,16 @@ class VerifiedMutations(VerifiedWriteHelpers):
         out: list[Any] = []
         for item in items:
             key = key_of(item)
+            # The raw id, so an entity-id write matches.
+            if key is not None:
+                out.append(key)
             entity = entities.get(key) if isinstance(key, int) else None
             if entity is not None:
-                out.append(entity.get(":logseq.property/value",
-                                      entity.get("title", key)))
-            else:
-                out.append(key)
+                # And the literal it holds, so a literal write matches.
+                literal = entity.get(":logseq.property/value",
+                                     entity.get("title"))
+                if literal is not None and literal != key:
+                    out.append(literal)
         return out
 
     @staticmethod

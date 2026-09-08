@@ -196,6 +196,11 @@ class VerifiedContent(VerifiedWriteHelpers):
             "(or-join [?page ?holder] "
             "[(identity ?page) ?holder] [?holder :block/page ?page]) "
             "[?prop :block/tags ?class] [?prop :db/ident ?attr] "
+            "[(str ?attr) ?s] "
+            # Exclude :block/* -- parent, page, order and title are
+            # Property-class entities but are node structure, not properties.
+            "[(clojure.string/starts-with? ?s \":block/\") ?structural] "
+            "[(not ?structural)] "
             "[?holder ?attr ?value]]"
         )
         rows = await self._query_list(
@@ -320,7 +325,8 @@ class VerifiedContent(VerifiedWriteHelpers):
         # id, uuid or title, which is useless to every caller and reads as an
         # empty page.
         query = (
-            "[:find (pull ?root [:db/id :block/uuid :block/title :block/order "
+            "[:find (pull ?root [:db/id :block/uuid :block/title :block/name "
+            ":block/order "
             "{:block/parent [:db/id :block/uuid]} "
             "{:block/page [:db/id :block/uuid]} "
             "{:block/_parent ...}]) . :where "
@@ -341,43 +347,156 @@ class VerifiedContent(VerifiedWriteHelpers):
                 walk(child)
 
         walk(root)
-        return flat
+        # Strip the raw reverse-pull key. Callers get one authoritative view
+        # of structure rather than the same subtree repeated under two keys.
+        return [{k: v for k, v in node.items() if k != "_parent"}
+                for node in flat]
+
+    async def _classify_subtree(
+        self, page_uuid: str
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        """
+        Walk the tree tracking which page each node SHOULD belong to.
+
+        A nested page is a legitimate page boundary: blocks beneath it
+        correctly carry the sub-page as their :block/page, not the root. The
+        earlier version assumed a single boundary and so flagged every block
+        under a nested page as damage -- on a container page that meant
+        hundreds of correct blocks reported as corruption, with a diagnostic
+        asserting a cause.
+
+        Returns (own_blocks, nested_pages, true_orphans).
+        """
+        root = await self._entity_by_uuid(page_uuid)
+        query = (
+            "[:find (pull ?root [:db/id :block/uuid :block/title :block/name "
+            "{:block/page [:db/id]} {:block/_parent ...}]) . :where "
+            f"[?root :block/uuid #uuid \"{page_uuid}\"]]"
+        )
+        tree = await self._client.call("logseq.DB.datascriptQuery", [query])
+        if not isinstance(tree, dict):
+            return [], [], []
+
+        own: list[dict[str, Any]] = []
+        nested: list[dict[str, Any]] = []
+        orphans: list[dict[str, Any]] = []
+
+        def walk(node: dict[str, Any], expected_page: int) -> None:
+            for child in node.get("_parent", []) or []:
+                if not isinstance(child, dict):
+                    continue
+                entry = {k: v for k, v in child.items() if k != "_parent"}
+                if child.get("name"):
+                    # A page. Its own subtree is measured against itself.
+                    nested.append(entry)
+                    walk(child, child["id"])
+                    continue
+                if self._reference_id(child.get("page")) != expected_page:
+                    orphans.append(entry)
+                else:
+                    own.append(entry)
+                walk(child, expected_page)
+
+        walk(tree, root["id"])
+        return own, nested, orphans
 
     async def find_orphans(self, page_uuid: str) -> dict[str, Any]:
         """
-        Blocks whose :block/parent and :block/page disagree.
+        Blocks whose :block/parent and :block/page disagree with no page
+        boundary between them.
 
-        This is the signature of a failed nested write, and until now nothing
-        could see it: the page-scoped reads miss exactly the blocks that are
-        wrong. Compare the two views and report the difference.
+        Nested pages are reported separately as structure. Only a block whose
+        owning page differs from its nearest ancestor page is damage -- that
+        is a real child no page-scoped query can see.
         """
         page_uuid = self._validated_uuid(page_uuid)
         page = await self._entity_by_uuid(page_uuid)
         if not page.get("name"):
             raise ValueError("UUID identifies a block, not a page")
 
-        by_parent = await self._descendants_by_parent(page_uuid)
-        by_page = await self._query_list(
-            "[:find [(pull ?block [:db/id :block/uuid :block/title "
-            "{:block/page [:db/id]}]) ...] :in $ ?page :where "
-            "[?block :block/page ?page]]",
-            "Page block lookup", page["id"])
+        own, nested, orphans = await self._classify_subtree(page_uuid)
 
-        page_ids = {b["id"] for b in by_page if isinstance(b.get("id"), int)}
-        orphans = [b for b in by_parent
-                   if isinstance(b.get("id"), int) and b["id"] not in page_ids]
+        if orphans:
+            diagnostic = (
+                f"{len(orphans)} block(s) have an owning page that differs "
+                "from their nearest ancestor page. They are invisible to any "
+                "page-scoped query. If they were created by a nested write on "
+                "an older build, removeBlock is the repair."
+            )
+        elif nested:
+            diagnostic = (
+                f"No damage. {len(nested)} nested page(s) were found; blocks "
+                "beneath them correctly belong to those pages rather than to "
+                "this one, which is ordinary structure."
+            )
+        else:
+            diagnostic = "No damage. Every block belongs to this page."
 
         return {
             "page_uuid": page_uuid,
-            "reachable_by_parent": len(by_parent),
-            "reachable_by_page": len(by_page),
+            "own_blocks": len(own),
+            "nested_pages": nested,
             "orphans": orphans,
+            "diagnostic": diagnostic,
+        }
+
+    async def page_stats(self, page_uuid: str) -> dict[str, Any]:
+        """
+        Counts only, for triage across many pages.
+
+        Every other read returns payload proportional to page size, so asking
+        "is this page empty, does anything point at it" cost an unbounded
+        response -- one container page returned 216 full blocks to communicate
+        two integers. This returns six.
+        """
+        page_uuid = self._validated_uuid(page_uuid)
+        page = await self._entity_by_uuid(page_uuid)
+        if not page.get("name"):
+            raise ValueError("UUID identifies a block, not a page")
+        page_id = page["id"]
+
+        own, nested, orphans = await self._classify_subtree(page_uuid)
+
+        # Counted in the query rather than returned and measured, so the
+        # response size does not depend on the reference count.
+        async def count(query: str, *params: Any) -> int:
+            value = await self._client.call(
+                "logseq.DB.datascriptQuery", [query, *params])
+            return value if isinstance(value, int) else 0
+
+        by_page = await count(
+            "[:find (count ?b) . :in $ ?page :where "
+            "[?b :block/page ?page]]", page_id)
+        refs = await count(
+            "[:find (count ?e) . :in $ ?target :where "
+            "[?e :block/refs ?target]]", page_id)
+        tag_holders = await count(
+            "[:find (count ?e) . :in $ ?target :where "
+            "[?e :block/tags ?target]]", page_id)
+        # Counted as (holder, property) pairs so the figure agrees with
+        # findBacklinks, which lists one row per pair. Counting distinct
+        # holders made the two disagree whenever a block held the target
+        # under more than one property.
+        property_values = await count(
+            "[:find (count ?pair) . :in $ ?target ?class :where "
+            "[?prop :block/tags ?class] [?prop :db/ident ?attr] "
+            "[?e ?attr ?target] [(vector ?e ?prop) ?pair]]",
+            page_id, await self._class_id(PROPERTY_CLASS))
+
+        return {
+            "page_uuid": page_uuid,
+            "title": page.get("title"),
+            "own_blocks": by_page,
+            "subtree_blocks": len(own) + len(nested) + len(orphans),
+            "nested_pages": len(nested),
+            "true_orphans": len(orphans),
+            "refs": refs,
+            "tag_holders": tag_holders,
+            "property_values": property_values,
             "diagnostic": (
-                f"{len(orphans)} block(s) are children of this page's tree but "
-                "their :block/page points elsewhere. They are invisible to any "
-                "page-scoped query and were likely created by a nested write."
-                if orphans else
-                "Every block reachable by parent is also reachable by page."),
+                f"{by_page} own block(s), {len(nested)} nested page(s), "
+                f"{refs + tag_holders + property_values} inbound reference(s)"
+                + (f", {len(orphans)} ORPHANED block(s)" if orphans else "")),
         }
 
     async def find_block_tree(
@@ -443,7 +562,7 @@ class VerifiedContent(VerifiedWriteHelpers):
                 raise RuntimeError("Block hierarchy contains a cycle")
             visited.add(entity_id)
             node_count += 1
-            result = dict(entity)
+            result = {k: v for k, v in entity.items() if k != "_parent"}
             descendants = by_parent.get(entity_id, [])
             if descendants and (depth >= max_depth or node_count >= max_nodes):
                 truncated = True
@@ -740,6 +859,78 @@ class VerifiedContent(VerifiedWriteHelpers):
             query, "Property value block lookup", page_id)
         return {value for value in found if isinstance(value, int)}
 
+    async def find_backlinks(self, target_uuid: str) -> dict[str, Any]:
+        """
+        Everything referring to an entity, by any mechanism.
+
+        `deletePage` already computes this internally to decide whether it
+        needs an acknowledgement, but nothing exposed it -- so "what links
+        here" was unanswerable, and the reference count was only visible as a
+        side effect of trying to delete something.
+
+        Three mechanisms are reported separately because they behave
+        differently:
+
+          refs   -- :block/refs, what Logseq counts as a backlink
+          tags   -- :block/tags, present when the target is a tag
+          values -- a property whose value points at the target
+
+        A property value is a reference in the DB but does not appear in the
+        UI's backlink panel, so a caller auditing "what depends on this" needs
+        all three and a caller reproducing the UI needs only the first.
+        """
+        target_uuid = self._validated_uuid(target_uuid)
+        target = await self._entity_by_uuid(target_uuid)
+        target_id = target["id"]
+
+        holder = (
+            "[:db/id :block/uuid :block/title :block/name "
+            "{:block/page [:db/id :block/uuid :block/title]}]"
+        )
+
+        refs = await self._query_list(
+            f"[:find [(pull ?e {holder}) ...] :in $ ?target :where "
+            "[?e :block/refs ?target]]",
+            "Backlink lookup", target_id)
+
+        tagged = await self._query_list(
+            f"[:find [(pull ?e {holder}) ...] :in $ ?target :where "
+            "[?e :block/tags ?target]]",
+            "Tag holder lookup", target_id)
+
+        # Property values pointing at the target. The attribute varies per
+        # property, so the property entity is joined in and its ident used as
+        # the attribute -- the same variable-attribute form the property
+        # readers use.
+        property_class = await self._class_id(PROPERTY_CLASS)
+        valued = await self._query_list(
+            "[:find (pull ?e " + holder + ") "
+            "(pull ?prop [:db/id :db/ident :block/title]) "
+            ":in $ ?target ?class :where "
+            "[?prop :block/tags ?class] [?prop :db/ident ?attr] "
+            "[?e ?attr ?target]]",
+            "Property reference lookup", target_id, property_class)
+
+        by_property = [
+            {"holder": row[0], "property": row[1]}
+            for row in valued if isinstance(row, list) and len(row) == 2
+        ]
+
+        total = len(refs) + len(tagged) + len(by_property)
+        return {
+            "target_uuid": target_uuid,
+            "target": target,
+            "total": total,
+            "refs": refs,
+            "tagged": tagged,
+            "property_values": by_property,
+            "diagnostic": (
+                f"{len(refs)} reference(s), {len(tagged)} tag holder(s), "
+                f"{len(by_property)} property value(s). Deleting or recycling "
+                "the target does not rewrite any of them."
+                if total else "Nothing refers to this entity."),
+        }
+
     async def _inbound_references(self, page_id: int) -> list[dict[str, Any]]:
         query = (
             "[:find [(pull ?entity [:db/id :block/uuid :block/title "
@@ -875,95 +1066,6 @@ class VerifiedContent(VerifiedWriteHelpers):
         entries = response if isinstance(response, list) else [response]
         return [e["uuid"] for e in entries
                 if isinstance(e, dict) and isinstance(e.get("uuid"), str)]
-
-    @serialized_write
-    async def create_many_blocks(
-        self,
-        blocks: list[dict[str, str]],
-        *,
-        dry_run: bool = False,
-    ) -> ContentResult:
-        """
-        Create several blocks, batching by parent.
-
-        `insertBatchBlock` inserts a list of blocks under ONE target, so items
-        are grouped and one call is made per distinct parent. Duplicate titles
-        are fine now -- the response carries each created entity, so nothing
-        has to identify them by title afterwards.
-        """
-        if not isinstance(blocks, list) or not 1 <= len(blocks) <= MAX_BATCH_OPERATIONS:
-            raise ValueError(
-                f"blocks must contain between 1 and {MAX_BATCH_OPERATIONS} items")
-
-        grouped: dict[str, list[str]] = {}
-        for index, block in enumerate(blocks):
-            if not isinstance(block, dict):
-                raise ValueError(f"block {index} must be an object")
-            parent = self._require_entity(
-                self._validated_uuid(block.get("parent_uuid")))
-            title = block.get("title")
-            if not isinstance(title, str) or not title.strip():
-                raise ValueError(f"block {index} requires a non-empty title")
-            self._validate_title(title)
-            grouped.setdefault(parent, []).append(title)
-
-        if dry_run:
-            return ContentResult(
-                validation={"parents": len(grouped), "blocks": len(blocks)},
-                response=None, verified_entities=(), verified=False,
-                diagnostic=(
-                    "Dry run: nothing was written, so verified is false by "
-                    f"design. Would make {len(grouped)} call(s)."))
-
-        verified: list[dict[str, Any]] = []
-        problems: list[dict[str, Any]] = []
-        response: Any = None
-        timed_out = False
-
-        for parent_uuid, titles in grouped.items():
-            parent = await self._entity_by_uuid(parent_uuid)
-            try:
-                response = await self._client.call(
-                    "logseq.DB.insertBatchBlock",
-                    [parent_uuid,
-                     [{"content": title} for title in titles],
-                     {"sibling": False}])
-            except httpx.TimeoutException:
-                timed_out = True
-                response = None
-
-            created = self._created_uuids(response)
-            if len(created) != len(titles):
-                # Fall back to reading the parent's children rather than
-                # trusting a partial response.
-                children = await self._children_of(parent_uuid)
-                created = [c["uuid"] for c in children
-                           if c.get("title") in set(titles)]
-
-            for block_uuid in created:
-                result = await self._verify_created(
-                    block_uuid, parent, response, timed_out)
-                if result.verified:
-                    verified.extend(result.verified_entities)
-                else:
-                    problems.extend(result.observed_entities
-                                    or result.verified_entities)
-
-        if problems or len(verified) != len(blocks):
-            return ContentResult(
-                validation=None, response=response,
-                verified_entities=tuple(verified),
-                recovered_after_timeout=timed_out, verified=False,
-                diagnostic=(
-                    f"Expected {len(blocks)} blocks, verified {len(verified)}"
-                    + (f"; {len(problems)} were created incorrectly"
-                       if problems else "")),
-                observed_entities=tuple(problems))
-
-        return ContentResult(
-            validation=None, response=response,
-            verified_entities=tuple(verified),
-            recovered_after_timeout=timed_out)
 
     async def update_block(
         self,
@@ -1655,9 +1757,15 @@ def _parse_outline(text: str) -> list[tuple[tuple[int, ...], str]]:
         if not raw.strip():
             continue
         expanded = raw.replace("\t", "    ")
-        lines.append((lineno,
-                      len(expanded) - len(expanded.lstrip(" ")),
-                      raw.strip()))
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        title = raw.strip()
+        # Strip a leading markdown bullet. Structure comes from indentation
+        # alone, so a bullet is decoration -- but keeping it produced blocks
+        # literally titled "- A", which is silent and looks correct.
+        stripped = re.sub(r"^[-*+]\s+", "", title)
+        if stripped:
+            title = stripped
+        lines.append((lineno, indent, title))
     if not lines:
         return []
 

@@ -18,9 +18,13 @@ allowlist, so the list doubles as a dependency inventory.
 | `getTagsByName` | `getTagUUID` |
 | `getAllTags` | `listTags` |
 | `getAllProperties` | `listProperties` |
-| `upsertNodes` | `createBlock`, `createManyBlocks`, `createPageofBlocks` |
-| `updateBlock` | `updateBlock` |
-| `removeBlock` | `removeBlock` |
+| `upsertNodes` | `createPage` |
+| `insertBlock` | `createBlock` |
+| `insertBatchBlock` | `createPageofBlocks`, `importPage` |
+| `moveBlock` | `moveBlock` |
+| `updateBlock` | `updateBlock`, `repairLinks` |
+| `removeBlock` | `removeBlock`, `clearPage` |
+| `renamePage` | `renamePage` |
 | `createTag` | `creatTag` |
 | `deletePage` | `deleteTag` |
 | `addBlockTag` / `removeBlockTag` | `addTag` / `removeTag` |
@@ -45,17 +49,48 @@ limited to build a safe contract on. `exportEdn` returns the whole graph
 unbounded; `importEdn` replaces it. `setFileContent` writes raw files, which
 sidesteps every guarantee this server makes.
 
-**Untested, so unexposed.** `insertBatchBlock`, `prependBlockInPage`,
-`addPropertyValueChoices`, `newBlockUUID`. These may work. `insertBatchBlock`
-and `prependBlockInPage` are the two most worth probing, since between them
-they might give block movement a route — the one operation with no route at
-all.
+**Untested, so unexposed.** `prependBlockInPage`, `addPropertyValueChoices`,
+`newBlockUUID`.
+
+`insertBlock`, `insertBatchBlock` and `moveBlock` were once in this section —
+all three now back the tool surface. `insertBlock` in particular was removed
+from the allowlist on the strength of the wrong capability list, which is how
+nested block creation ended up broken: `upsertNodes` writes its single
+`page-id` into both `:block/parent` and `:block/page`, while `insertBlock`
+sets them independently.
 
 **No tool needs them.** `setBlockIcon`, `removeBlockIcon`, `addTagProperty`,
 `removeTagProperty`, `addTagExtends`, `removeTagExtends`, `renamePage`. All
 verified working at some point; none has a tool. `renamePage` in particular is
 a gap rather than a decision — page rename has a working route and no way to
 call it.
+
+## Content is parsed on write
+
+Not a method list, but the most consequential thing learned about this API and
+the reason `importPage` exists.
+
+Block content is interpreted when written, by `insertBlock`, `insertBatchBlock`
+and `updateBlock` alike:
+
+| Written | Stored as | Side effect |
+| --- | --- | --- |
+| `## X` | `X` | `:logseq.property/heading 2` set |
+| `[[X]]` | `[[uuid]]` | **a page is created** if X does not exist |
+| `#X` | `#[[uuid]]` | **a tag is created**, and the block is tagged |
+| `**bold**`, `—` | unchanged | none |
+| `{{query …}}` | unchanged | none |
+
+The heading conversion is why `importPage` passes markdown through rather than
+stripping markers. The other two are why it escapes references instead.
+
+Note the tag ident from an inline `#X` carries a random suffix
+(`:user.class/tag-rymz5vkR`) while `createTag` produces a deterministic
+`:plugin.class.<caller>/X`. Both are true; they are different creation paths.
+
+`updateBlock` parses identically, which is what makes `repairLinks` possible —
+and it does NOT guard against a page UUID, so a page's title can be rewritten
+through it. The tool layer refuses that; the raw method does not.
 
 ## A caution about lists like this
 
