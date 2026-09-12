@@ -25,7 +25,8 @@ EXPECTED_TOOLS = {
     "deletePage",
     "clearPage",
     # Blocks
-    "getBlockUUID", "getBlock", "getBlockTree", "findOrphans", "findBacklinks", "createBlock",
+    "getBlockUUID", "getBlock", "getBlockTree", "findOrphans",
+    "repairOrphans", "findBacklinks", "createBlock",
     "createPageofBlocks", "importPage", "repairLinks", "updateBlock",
     "removeBlock",
     "moveBlock",

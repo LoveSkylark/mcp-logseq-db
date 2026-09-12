@@ -23,6 +23,7 @@ from mcp_logseq_db.client import (
     LogseqProtocolError,
     UnverifiedWriteError,
     WriteCircuitOpenError,
+    serialized_write,
 )
 
 
@@ -316,6 +317,47 @@ async def test_readback_polling_accepts_delayed_state() -> None:
 
     result = await client.poll_readback(reader, lambda value: value is not None)
     assert result == {"committed": True}
+
+
+async def test_write_scope_is_reentrant_within_one_task() -> None:
+    """A composite write calls smaller ones -- importPage creates a page,
+    repairLinks creates pages -- and those are themselves serialized. With a
+    plain lock the outer call held it while the inner waited, so the request
+    hung to the hard deadline and surfaced as a bare failure with no
+    envelope."""
+    client = LogseqDBClient("http://127.0.0.1:12315", "token")
+
+    class Composite:
+        def __init__(self) -> None:
+            self._client = client
+
+        @serialized_write
+        async def inner(self) -> str:
+            return "inner ran"
+
+        @serialized_write
+        async def outer(self) -> str:
+            return await self.inner()
+
+    result = await asyncio.wait_for(Composite().outer(), timeout=2)
+    assert result == "inner ran"
+
+
+async def test_write_scope_releases_fully_after_nesting() -> None:
+    """The depth counter must unwind, or the lock stays owned and the next
+    caller from another task blocks forever."""
+    client = LogseqDBClient("http://127.0.0.1:12315", "token")
+
+    async with client.write_scope():
+        async with client.write_scope():
+            pass
+
+    async def other() -> str:
+        async with client.write_scope():
+            return "acquired"
+
+    assert await asyncio.wait_for(
+        asyncio.create_task(other()), timeout=2) == "acquired"
 
 
 async def test_write_scope_serializes_concurrent_mutations() -> None:

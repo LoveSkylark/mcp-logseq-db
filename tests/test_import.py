@@ -263,7 +263,15 @@ class FakeClient:
                     node["_parent"] = [build(k) for k in kids]
                 return node
             return build(root)
-        if "{{link:" in query:
+        if "{{link:" in query or "{{tag:" in query:
+            prefix = "{{link:" if "{{link:" in query else "{{tag:"
+            pages = set()
+            for e in self.graph.entities.values():
+                if prefix in (e.get("title") or "") and e.get("page"):
+                    pages.add(next(u for u, x in self.graph.entities.items()
+                                   if x["id"] == e["page"]["id"]))
+            return sorted(pages)
+        if False:
             return [e["page"] and self.graph.entities[
                 next(u for u, x in self.graph.entities.items()
                      if x["id"] == e["page"]["id"])]["uuid"]
@@ -483,3 +491,18 @@ async def test_repair_is_idempotent(graph):
 
     assert first["blocks_updated"] == 1
     assert second["blocks_updated"] == 0
+
+
+async def test_graph_wide_scan_reaches_tag_only_pages(graph):
+    """Matching only "{{link:" meant a page whose sole placeholders were tags
+    was unreachable graph-wide, so include_tags silently did nothing there."""
+    client = FakeClient(graph)
+    verified = VerifiedImport(client)  # type: ignore[arg-type]
+    block = graph.add("Marked {{tag:fix}}", graph.page["id"], graph.page["id"])
+
+    without = await verified.repair_links(dry_run=True)
+    assert without["pages_scanned"] == 0
+
+    with_tags = await verified.repair_links(include_tags=True, dry_run=True)
+    assert with_tags["pages_scanned"] == 1
+    assert with_tags["tags"] == ["fix"]

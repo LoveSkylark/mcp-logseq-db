@@ -196,18 +196,20 @@ class VerifiedContent(VerifiedWriteHelpers):
             "(or-join [?page ?holder] "
             "[(identity ?page) ?holder] [?holder :block/page ?page]) "
             "[?prop :block/tags ?class] [?prop :db/ident ?attr] "
-            "[(str ?attr) ?s] "
-            # Exclude :block/* -- parent, page, order and title are
-            # Property-class entities but are node structure, not properties.
-            "[(clojure.string/starts-with? ?s \":block/\") ?structural] "
-            "[(not ?structural)] "
             "[?holder ?attr ?value]]"
         )
         rows = await self._query_list(
             query, "Page property lookup", page_id,
             await self._class_id(PROPERTY_CLASS))
 
-        parsed = [row for row in rows if isinstance(row, list) and len(row) == 3]
+        # Structural attributes are excluded in Python rather than in the
+        # query. :block/parent, :block/page and :block/order are themselves
+        # Property-class entities, so the class filter does not remove them --
+        # but Datascript has no clean negation for a string predicate, and
+        # predicates have wedged the DB worker before.
+        parsed = [row for row in rows
+                  if isinstance(row, list) and len(row) == 3
+                  and not _is_structural(row[0])]
         # Reference-typed values arrive as integer entity ids. Resolve them in
         # one extra query rather than per row; scalars are left as they are.
         resolved = await self._resolve_entities(
@@ -477,11 +479,20 @@ class VerifiedContent(VerifiedWriteHelpers):
         # findBacklinks, which lists one row per pair. Counting distinct
         # holders made the two disagree whenever a block held the target
         # under more than one property.
-        property_values = await count(
-            "[:find (count ?pair) . :in $ ?target ?class :where "
+        # Counted from the rows rather than with (count …), because the
+        # structural attributes have to be filtered out and Datascript cannot
+        # negate a string predicate cleanly. One row per property value, so
+        # the payload stays small.
+        value_rows = await self._query_list(
+            "[:find (pull ?prop [:db/ident]) ?e :in $ ?target ?class :where "
             "[?prop :block/tags ?class] [?prop :db/ident ?attr] "
-            "[?e ?attr ?target] [(vector ?e ?prop) ?pair]]",
-            page_id, await self._class_id(PROPERTY_CLASS))
+            "[?e ?attr ?target]]",
+            "Property reference count", page_id,
+            await self._class_id(PROPERTY_CLASS))
+        property_values = sum(
+            1 for row in value_rows
+            if isinstance(row, list) and len(row) == 2
+            and not _is_structural(row[0]))
 
         return {
             "page_uuid": page_uuid,
@@ -1222,6 +1233,170 @@ class VerifiedContent(VerifiedWriteHelpers):
             recovered_after_timeout=timed_out, previous_entities=(block,))
 
     @serialized_write
+    async def repair_orphans(
+        self,
+        page_uuid: str,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Re-attach blocks whose owning page is wrong.
+
+        The damage: `:block/parent` is correct but `:block/page` points at an
+        ancestor BLOCK instead of the page. Such blocks are real children that
+        no page-scoped query can see, so they are invisible in the UI. The
+        cause is the old creation route writing its single `page-id` into both
+        attributes; the current `insertBlock` route cannot produce it.
+
+        Three facts about `moveBlock` shape the repair, all established by
+        hand before this was written:
+
+          - It NO-OPS when the position would not change. Moving a block to
+            the parent it already has does nothing, so one move cannot fix
+            ownership in place. Each repair is two moves: out to the page,
+            then back.
+          - `placement=child` PREPENDS. Repairing siblings left to right with
+            `child` reverses them, so only a first-born uses `child` and the
+            rest go `after` the sibling before them.
+          - A move carries the subtree and the descendants' `:block/page`
+            follows. So a nested chain of orphans is repaired by moving only
+            the topmost one, which is why this costs far fewer than two calls
+            per orphan.
+        """
+        page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+        page = await self._page_by_uuid(page_uuid)
+        page_id = page.get("id")
+
+        tree = await self._ordered_tree(page_uuid)
+        if tree is None:
+            return {"page_uuid": page_uuid, "repaired": 0,
+                    "diagnostic": "The page has no blocks."}
+
+        # The topmost orphan in each broken branch, with what is needed to put
+        # it back: its parent, and the sibling it should follow.
+        plan: list[dict[str, Any]] = []
+
+        def walk(node: dict[str, Any], expected_page: Any) -> None:
+            children = node.get("children", [])
+            for index, child in enumerate(children):
+                if child.get("name"):
+                    # A nested page is its own boundary, not damage.
+                    walk(child, child.get("id"))
+                    continue
+                if self._reference_id(child.get("page")) != expected_page:
+                    plan.append({
+                        "uuid": child["uuid"],
+                        "title": (child.get("title") or "")[:60],
+                        "parent_uuid": node["uuid"],
+                        "after_uuid": (children[index - 1]["uuid"]
+                                       if index else None),
+                        "descendants": _count_descendants(child),
+                    })
+                    # Descendants follow the move; do not plan them too.
+                    continue
+                walk(child, expected_page)
+
+        walk(tree, page_id)
+
+        if not plan:
+            return {"page_uuid": page_uuid, "title": page.get("title"),
+                    "repaired": 0, "moves": 0,
+                    "diagnostic": "No orphaned blocks; nothing to repair."}
+
+        covered = len(plan) + sum(p["descendants"] for p in plan)
+        if dry_run:
+            return {
+                "page_uuid": page_uuid,
+                "title": page.get("title"),
+                "dry_run": True,
+                "branches": len(plan),
+                "blocks_covered": covered,
+                "moves": len(plan) * 2,
+                "plan": plan,
+                "diagnostic": (
+                    f"{len(plan)} broken branch(es) covering {covered} "
+                    f"block(s); {len(plan) * 2} moves. Nothing was written."),
+            }
+
+        repaired = 0
+        moves = 0
+        failures: list[dict[str, Any]] = []
+
+        for step in plan:
+            # Out to the page. This is what rewrites :block/page, and it
+            # changes position so the move is not skipped.
+            first = await self.move_block(
+                step["uuid"], page_uuid, placement="child")
+            moves += 1
+            if not first.verified:
+                failures.append({**step, "stage": "detach",
+                                 "diagnostic": first.diagnostic})
+                continue
+
+            # Back where it belongs, preserving sibling order.
+            if step["after_uuid"]:
+                second = await self.move_block(
+                    step["uuid"], step["after_uuid"], placement="after")
+            else:
+                second = await self.move_block(
+                    step["uuid"], step["parent_uuid"], placement="child")
+            moves += 1
+            if not second.verified:
+                # The block is now top-level on the correct page: visible, but
+                # not under its heading. Reported rather than hidden.
+                failures.append({**step, "stage": "reattach",
+                                 "diagnostic": second.diagnostic})
+                continue
+            repaired += 1
+
+        remaining = len((await self._classify_subtree(page_uuid))[2])
+
+        return {
+            "page_uuid": page_uuid,
+            "title": page.get("title"),
+            "verified": remaining == 0 and not failures,
+            "branches_repaired": repaired,
+            "blocks_covered": covered,
+            "moves": moves,
+            "orphans_remaining": remaining,
+            "failures": failures,
+            "diagnostic": (
+                f"Repaired {repaired} branch(es) in {moves} move(s); "
+                f"{covered} block(s) now belong to the page."
+                if remaining == 0 and not failures else
+                f"Repaired {repaired} of {len(plan)} branch(es); "
+                f"{remaining} orphan(s) remain. Re-run to continue -- the "
+                "operation is idempotent."),
+        }
+
+    async def _ordered_tree(self, page_uuid: str) -> dict[str, Any] | None:
+        """
+        The page's subtree with children sorted into document order.
+
+        Order matters more here than for a read: repairs walk siblings left to
+        right and place each after the previous, so a wrong order in is a
+        wrong order out.
+        """
+        query = (
+            "[:find (pull ?root [:db/id :block/uuid :block/title :block/name "
+            ":block/order {:block/page [:db/id]} {:block/_parent ...}]) . "
+            f":where [?root :block/uuid #uuid \"{page_uuid}\"]]"
+        )
+        root = await self._client.call("logseq.DB.datascriptQuery", [query])
+        if not isinstance(root, dict):
+            return None
+
+        def normalise(node: dict[str, Any]) -> dict[str, Any]:
+            children = [normalise(c) for c in (node.get("_parent") or [])
+                        if isinstance(c, dict)]
+            children.sort(key=lambda c: str(c.get("order", "")))
+            out = {k: v for k, v in node.items() if k != "_parent"}
+            out["children"] = children
+            return out
+
+        return normalise(root)
+
+    @serialized_write
     async def remove_block(self, block_uuid: str) -> ContentResult:
         """
         Delete one block and its subtree, then verify the whole subtree is gone.
@@ -1743,6 +1918,45 @@ class VerifiedContent(VerifiedWriteHelpers):
                 known.add(value.lower())
         if not referenced <= known:
             raise RuntimeError("Block title UUID reference verification failed")
+
+
+# Node-structure attributes that are also Property-class entities, so a filter
+# on the Property class does not exclude them. Named explicitly rather than
+# matched by shape: the API strips `:block/` and `:db/` when serialising, so
+# these arrive bare -- but so do `tags` and `alias`, which ARE real properties
+# a user can set, and `alias` points at pages so it is a reference worth
+# counting. Excluding every bare ident would discard both.
+STRUCTURAL_IDENTS = frozenset({
+    "parent", "page", "order", "title", "name", "uuid", "ident",
+    "content", "full-title", "raw-title", "refs", "path-refs",
+    "tx-id", "created-at", "updated-at", "format", "collapsed?",
+    "journal-day", "journal?", "left",
+})
+
+
+def _count_descendants(node: dict[str, Any]) -> int:
+    return sum(1 + _count_descendants(c) for c in node.get("children", []))
+
+
+def _is_structural(prop: Any) -> bool:
+    """
+    Is this property entity a node attribute rather than a real property?
+
+    :block/parent, :block/page, :block/order and :block/title are all
+    Property-class entities, so filtering on the Property class does not
+    exclude them. Counting them as property values made a page with none
+    report 29 -- one per block's `page`, plus one per top-level block's
+    `parent`.
+    """
+    if not isinstance(prop, dict):
+        return False
+    ident = prop.get("ident") or prop.get(":db/ident")
+    if not isinstance(ident, str):
+        return False
+    bare = ident.lstrip(":")
+    if bare.startswith("block/") or bare.startswith("db/"):
+        return True
+    return "/" not in bare and bare in STRUCTURAL_IDENTS
 
 
 def _parse_outline(text: str) -> list[tuple[tuple[int, ...], str]]:

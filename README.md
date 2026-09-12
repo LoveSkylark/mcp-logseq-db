@@ -75,17 +75,17 @@ and creating missing pages needs two explicit arguments plus a cap.
 a failure partway leaves earlier levels committed. The result names the level
 that failed; audit with `findOrphans` rather than retrying.
 
-**`moveBlock`'s route is unproven.** The API returns nothing on a move, so the
-tool verifies by reading back — a silent no-op comes back as `verified: false`
-rather than a false success.
+**`moveBlock` is exposed but its route is unproven.** The API returns nothing
+on a move, so the tool verifies by reading back — a silent no-op comes back as
+`verified: false` rather than a false success.
 
 **Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
 `deleteProperty` refuse until you confirm, listing what would be affected.
 
-**Some Logseq behaviours are absent on recent builds.** `[[Page]]` written
-through the API stays inert — stored as text with no reference. And
-`listClosedValues` returns nothing, because no closed-value relationship
-exists in the graph.
+**`listClosedValues` depends on the graph.** `Status` and `Priority` carry
+`:property/closed-values` on a mature graph but not on a freshly created one,
+so an empty result means this graph has no enums rather than that the feature
+is missing.
 
 **Recycled pages survive deletion**, keeping their UUID, tags, and blocks, so
 `listPages` excludes them explicitly and `listRecycled` shows them. Inbound

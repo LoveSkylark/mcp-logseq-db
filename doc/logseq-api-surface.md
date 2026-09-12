@@ -2,8 +2,8 @@
 
 What the plugin API offers, and why this server reaches so little of it.
 
-Nineteen methods are in the client allowlist. The rest are unreachable, and
-each falls into one of a few categories — none of which is "we ran out of
+Twenty-three methods are in the client allowlist. The rest are unreachable,
+and each falls into one of a few categories — none of which is "we ran out of
 time".
 
 ## Reachable
@@ -26,7 +26,7 @@ allowlist, so the list doubles as a dependency inventory.
 | `removeBlock` | `removeBlock`, `clearPage` |
 | `renamePage` | `renamePage` |
 | `createTag` | `creatTag` |
-| `deletePage` | `deleteTag` |
+| `deletePage` | `deleteTag`, `deletePage` |
 | `addBlockTag` / `removeBlockTag` | `addTag` / `removeTag` |
 | `upsertProperty` / `removeProperty` | `createProperty` / `deleteProperty` |
 | `upsertBlockProperty` / `removeBlockProperty` | `addProperty` / `removeProperty` |
@@ -60,10 +60,10 @@ nested block creation ended up broken: `upsertNodes` writes its single
 sets them independently.
 
 **No tool needs them.** `setBlockIcon`, `removeBlockIcon`, `addTagProperty`,
-`removeTagProperty`, `addTagExtends`, `removeTagExtends`, `renamePage`. All
-verified working at some point; none has a tool. `renamePage` in particular is
-a gap rather than a decision — page rename has a working route and no way to
-call it.
+`removeTagProperty`, `addTagExtends`, `removeTagExtends`. All verified working
+at some point; none has a tool. Tag inheritance and tag-level property
+declaration are the notable gaps — both have working routes and no way to call
+them.
 
 ## Content is parsed on write
 
@@ -91,6 +91,52 @@ Note the tag ident from an inline `#X` carries a random suffix
 `updateBlock` parses identically, which is what makes `repairLinks` possible —
 and it does NOT guard against a page UUID, so a page's title can be rewritten
 through it. The tool layer refuses that; the raw method does not.
+
+## Responses do not name queryable attributes
+
+The most expensive lesson in this project, because it looks like the opposite
+of a problem: a response shows you an attribute, you query it, nothing
+matches.
+
+Two transformations happen on the way out.
+
+**Namespaces are stripped.** `:block/` and `:db/` prefixes are dropped when
+attribute names are serialised. A raw datom dump of `:logseq.property/status`
+returns nineteen attributes, of which `tags`, `ident`, `uuid`, `title`,
+`name`, `order`, `created-at` and `tx-id` are all bare. They are really
+`:block/tags`, `:db/ident`, `:block/uuid` and so on. Prefixes that are neither
+`:block/` nor `:db/` survive intact, which is why `:logseq.property/type` sits
+alongside bare `title` in the same result.
+
+**Some fields are synthesised.** `getAllProperties` reports
+`:property/closed-values` on `Status` with a list of six entity ids. **No such
+datom exists.** It is derived from the reverse of
+`:block/closed-value-property`, which lives on each value pointing back at its
+property. A query for `:property/closed-values` matches nothing, on any graph.
+
+Both caught me on the same tool. `listClosedValues` was written against the
+synthesised name, then changed to the stripped name, then finally to
+`:block/closed-value-property` — three attempts, each reading a response as if
+it described the schema.
+
+The same stripping caused a second bug elsewhere. `pageStats` filters
+node-structure attributes out of its property-value count by checking for a
+`block/` prefix; since those arrive bare, the filter never fired and a page
+with no property values reported 29 — one per block's `page`, plus one per
+top-level block's `parent`.
+
+**So: confirm against a raw datom dump before building a query on an attribute
+name.**
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find ?a ?v :where [?e :db/ident :logseq.property/status] [?e ?a ?v]]"]}
+```
+
+That shows what is actually stored. Anything visible only through
+`getAllProperties`, `getAllTags` or a pull spec may be a view rather than a
+fact. And note the filtering corollary: a bare ident is usually structure, but
+`tags` and `alias` are bare AND are real user-settable properties, so "has no
+namespace" is not a safe test for "is not a property".
 
 ## A caution about lists like this
 

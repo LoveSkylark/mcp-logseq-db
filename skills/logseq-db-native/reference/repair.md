@@ -94,16 +94,39 @@ user on a blank page while the real material sits elsewhere under the same
 title. Identical creation timestamps across many such pairs indicate one bad
 import rather than user error.
 
-Two routes.
+Three routes.
 
-**Repoint** — rewrite each referencing block so its `[[uuid]]` names A, then
-recycle B.
+**Repoint via placeholders** — the usual choice. De-resolve each reference to
+`{{link:A-title}}`, recycle B, then let `repairLinks` resolve them against A.
 
-- Cost: one `updateBlock` per referencing block, plus one `deletePage`.
-- Lossless. A is never touched: same blocks, same block UUIDs, same tags, same
-  structure.
-- Canonical identity becomes A's UUID. Anything outside the graph holding B's
-  UUID goes stale; nothing inside the graph breaks.
+- Cost: one `updateBlock` per referencing block, one `deletePage`, one
+  `repairLinks`.
+- Lossless, and A is never touched.
+- Safer than writing `[[A-uuid]]` by hand: you name the page by title and the
+  tool resolves it, verifying `:block/refs` actually gained A's id.
+
+The sequence matters:
+
+1. `findBacklinks(B)` — the blocks to rewrite.
+2. For each, `getBlock` then `updateBlock`, replacing `[[<B-uuid>]]` with
+   `{{link:A-title}}`. **The stored text holds B's UUID, not its title** —
+   Logseq rewrites a reference to the target's UUID when it resolves, so
+   searching for the title finds nothing.
+3. `findBacklinks(B)` again — `refs` should be empty.
+4. `deletePage(B)`. **Before repairing, not after.** A and B share a title, and
+   `repairLinks` resolves by title: with both pages present it reports the name
+   as ambiguous and skips it. This works only because `getPageUUID` excludes
+   recycled pages, so the recycled B is not a candidate.
+5. `repairLinks(dry_run=true)` to confirm A resolves and nothing is ambiguous,
+   then `repairLinks()`. Leave `create_missing` off — if A does not resolve,
+   step 2 or 3 was incomplete and creating a third page makes it worse.
+
+**Repoint directly** — rewrite each referencing block so its `[[uuid]]` names
+A, then recycle B.
+
+- Same cost, minus the `repairLinks` call.
+- Requires writing A's UUID into the text by hand, with no verification that
+  the reference resolved. Prefer the placeholder route unless B must survive.
 
 **Rebuild** — recreate A's outline on B, then recycle A.
 
@@ -117,7 +140,7 @@ recycle B.
 **Choose by comparing reference count against block count**, not by instinct:
 
 ```
-repoint  ≈ refs + 1 calls, lossless
+repoint  ≈ refs + 2 calls, lossless
 rebuild  ≈ parents-with-children + 1 calls, lossy
 ```
 
@@ -126,6 +149,12 @@ wins on both axes — two edits beat reconstructing 163 blocks. Prefer rebuild
 only when references clearly outnumber blocks and no block-level references
 exist. When the two are close, prefer repoint: it is lossless, and that
 outranks a small call saving.
+
+**Direction matters more than route.** Both repoint options move canonical
+identity to A, so anything outside the graph holding B's UUID goes stale.
+Rebuild keeps B's identity instead. Choose by which side is referenced: move
+references toward the identity that has content, or move content toward the
+identity that is referenced.
 
 Before rebuilding, always run `findBacklinks` against the **content** page to
 check for block-level references. If any exist, rebuild will break them and

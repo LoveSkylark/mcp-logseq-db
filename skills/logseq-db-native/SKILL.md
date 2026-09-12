@@ -290,14 +290,19 @@ blocks on the holder's page, so they appear in block listings. `clearPage`
 identifies and preserves them; nothing else should assume every block on a page
 is content.
 
-**`[[Page]]` written through the API stays inert.** It is stored as literal
-text with no `:block/refs` entry, so it does not appear as a reference or a
-backlink. Say so rather than promising a link.
+**`[[Page]]` written through the API is NOT inert.** Logseq parses content on
+write: `[[X]]` creates a page if X does not exist, rewrites the stored text to
+`[[uuid]]`, and adds a `:block/refs` entry. `#X` does the same for a tag and
+tags the block as well. This is why `importPage` escapes both — an import
+whose links point at pages that do not exist yet would create a stub for every
+one of them.
 
-**`listClosedValues` returns nothing on this build.** No closed-value
-relationship exists in the graph — `Status` reports type `default` with a
-`:logseq.property/default-value` and no permitted set. It is a built-in and
-outside the sandbox anyway, so it cannot be written.
+**`listClosedValues` depends on the graph, not the build.** `Status` and
+`Priority` carry `:property/closed-values` on a mature graph — six and four
+permitted entities respectively — but a freshly created graph has none, so the
+tool returns empty there. An empty result means this graph has no enums, not
+that the feature is absent. Both are built-ins and outside the sandbox, so
+they remain read-only either way.
 
 **A dry run is not a write.** `dry_run` returns `verified: false` by design.
 It validates the payload, not the transaction: a graph carrying invalid

@@ -235,7 +235,8 @@ class VerifiedImport(VerifiedWriteHelpers):
         since links usually resolve only after several pages are imported.
         """
         targets = ([page_uuid] if page_uuid
-                   else await self._pages_with_placeholders())
+                   else await self._pages_with_placeholders(
+                       include_tags=include_tags))
 
         wanted_links: set[str] = set()
         wanted_tags: set[str] = set()
@@ -326,18 +327,30 @@ class VerifiedImport(VerifiedWriteHelpers):
                    "were skipped rather than guessed." if ambiguous else "")),
         }
 
-    async def _pages_with_placeholders(self) -> list[str]:
-        """Pages holding at least one placeholder, so a graph-wide repair does
-        not read every page in full."""
-        query = (
-            '[:find [?uuid ...] :where '
-            '[?block :block/title ?title] '
-            '[(clojure.string/includes? ?title "{{link:")] '
-            '[?block :block/page ?page] [?page :block/uuid ?uuid]]'
-        )
-        found = await self._client.call(
-            "logseq.DB.datascriptQuery", [query]) or []
-        return [str(u) for u in found if u]
+    async def _pages_with_placeholders(
+        self, *, include_tags: bool = False
+    ) -> list[str]:
+        """
+        Pages holding at least one placeholder, so a graph-wide repair does
+        not read every page in full.
+
+        Both prefixes are matched when tags are in scope. Matching only
+        "{{link:" meant a page whose sole placeholders were tags was
+        unreachable graph-wide, so include_tags silently did nothing there.
+        """
+        prefixes = ["{{link:"] + (["{{tag:"] if include_tags else [])
+        found: set[str] = set()
+        for prefix in prefixes:
+            query = (
+                '[:find [?uuid ...] :where '
+                '[?block :block/title ?title] '
+                f'[(clojure.string/includes? ?title "{prefix}")] '
+                '[?block :block/page ?page] [?page :block/uuid ?uuid]]'
+            )
+            result = await self._client.call(
+                "logseq.DB.datascriptQuery", [query]) or []
+            found.update(str(u) for u in result if u)
+        return sorted(found)
 
     async def _resolve_names(
         self, names: set[str]

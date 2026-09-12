@@ -175,6 +175,10 @@ class LogseqDBClient:
         self._verify_ssl = verify_ssl
         self._client_factory = client_factory
         self._write_lock = asyncio.Lock()
+        # The task currently inside write_scope, so a nested entry from the
+        # same task can be allowed through. See write_scope.
+        self._write_owner: object | None = None
+        self._write_depth = 0
         self._write_circuit_reason: str | None = None
         self.readback_attempts = max(1, readback_attempts)
         self.readback_delay = max(0.0, readback_delay)
@@ -197,9 +201,37 @@ class LogseqDBClient:
 
     @asynccontextmanager
     async def write_scope(self):
-        """Serialize a mutation and all of its read-back verification."""
+        """
+        Serialize a mutation and all of its read-back verification.
+
+        RE-ENTRANT within one task. A composite write calls smaller ones --
+        importPage creates a page and may clear it, repairLinks creates pages
+        -- and those are themselves serialized. With a plain lock the outer
+        call held it while the inner one waited for it, so the whole request
+        hung until the hard deadline and surfaced as a bare tool failure with
+        no envelope.
+
+        Re-entrancy is per task, so mutual exclusion between concurrent
+        callers is unchanged: a second task still waits.
+        """
+        task = asyncio.current_task()
+
+        if self._write_owner is not None and self._write_owner is task:
+            self._write_depth += 1
+            try:
+                yield
+            finally:
+                self._write_depth -= 1
+            return
+
         async with self._write_lock:
-            yield
+            self._write_owner = task
+            self._write_depth = 1
+            try:
+                yield
+            finally:
+                self._write_depth = 0
+                self._write_owner = None
 
     async def poll_readback(self, reader, predicate):
         """Retry only an idempotent read, never the preceding write."""

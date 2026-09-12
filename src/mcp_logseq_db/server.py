@@ -235,6 +235,15 @@ def create_server(
             hint="getPageUUID, getBlockUUID or getTagUUID")
         return await content().find_backlinks(target_uuid)
 
+    @server.tool(name="repairOrphans", structured_output=True)
+    async def repair_orphans(
+        page_uuid: str, dry_run: bool = False
+    ) -> dict[str, Any]:
+        """Re-attach blocks whose :block/page points at an ancestor block instead of the page. Such blocks are real children that no page-scoped query can see, so they are invisible in the UI -- damage from an older creation route. Each broken branch costs two moves, and a nested chain is fixed by moving only its topmost block, so the cost is far below two per orphan. Sibling order is preserved. Idempotent: re-run to continue after a partial repair. Use dry_run to see the plan first."""
+        page_uuid = require_uuid(
+            page_uuid, role="page_uuid", hint="getPageUUID")
+        return await content().repair_orphans(page_uuid, dry_run=dry_run)
+
     @server.tool(name="findOrphans", structured_output=True)
     async def find_orphans(page_uuid: str) -> dict[str, Any]:
         """List blocks whose owning page differs from their nearest ancestor page -- real children that are invisible to every page-scoped query. Nested pages are reported separately as structure rather than damage, since blocks beneath a sub-page correctly belong to that sub-page."""
@@ -437,16 +446,26 @@ def create_server(
 
     @server.tool(name="listClosedValues")
     async def list_closed_values() -> Any:
-        """List every enum property with its permitted values. Returns empty on current builds: no closed-value relationship exists in the graph, and Status reports type default with a default-value rather than a permitted set."""
-        # The relationship is stored on the VALUE, pointing back at its
-        # property, under a bare unnamespaced ident. Querying the property
-        # side for a `closed-values` attribute finds nothing, because no such
-        # attribute exists on this build.
+        """List every enum property with its permitted values. Required before setting a closed property -- the value must be one of these entities."""
+        # `:block/closed-value-property` lives on the VALUE, pointing back at
+        # its property. Two wrong guesses preceded this one:
+        #
+        #   :property/closed-values   -- what getAllProperties REPORTS on the
+        #                                property, but there is no such datom;
+        #                                it is synthesised from this reverse
+        #                                relationship
+        #   :closed-value-property    -- the name a probe found, but the API
+        #                                strips the :block/ and :db/ prefixes
+        #                                when serialising attribute names
+        #
+        # So a response is not a guide to queryable attribute names. `tags`,
+        # `ident`, `uuid` and `title` all come back bare and are really
+        # :block/tags, :db/ident, :block/uuid and :block/title.
         return await query(
             "[:find (pull ?prop [:db/id :db/ident :block/title]) "
             "(pull ?value [:db/id :db/ident :block/title "
             ":logseq.property/value :block/order]) "
-            ":where [?value :closed-value-property ?prop]]")
+            ":where [?value :block/closed-value-property ?prop]]")
 
     @server.tool(name="listOrphanTags")
     async def list_orphan_tags() -> Any:
@@ -548,6 +567,10 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         "repair_links": (
             "Omit page_uuid to scan the whole graph. To create missing pages "
             "you must pass create_missing AND acknowledge_page_creation."
+        ),
+        "repair_orphans": (
+            "Pass an exact page UUID. Run findOrphans or pageStats first to "
+            "see whether there is anything to repair."
         ),
         "page_stats": "Pass an exact page UUID, not a block UUID.",
         "find_backlinks": (
