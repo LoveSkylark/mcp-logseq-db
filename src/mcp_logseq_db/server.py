@@ -235,18 +235,9 @@ def create_server(
             hint="getPageUUID, getBlockUUID or getTagUUID")
         return await content().find_backlinks(target_uuid)
 
-    @server.tool(name="repairOrphans", structured_output=True)
-    async def repair_orphans(
-        page_uuid: str, dry_run: bool = False
-    ) -> dict[str, Any]:
-        """Re-attach blocks whose :block/page points at an ancestor block instead of the page. Such blocks are real children that no page-scoped query can see, so they are invisible in the UI -- damage from an older creation route. Each broken branch costs two moves, and a nested chain is fixed by moving only its topmost block, so the cost is far below two per orphan. Sibling order is preserved. Idempotent: re-run to continue after a partial repair. Use dry_run to see the plan first."""
-        page_uuid = require_uuid(
-            page_uuid, role="page_uuid", hint="getPageUUID")
-        return await content().repair_orphans(page_uuid, dry_run=dry_run)
-
     @server.tool(name="findOrphans", structured_output=True)
     async def find_orphans(page_uuid: str) -> dict[str, Any]:
-        """List blocks whose owning page differs from their nearest ancestor page -- real children that are invisible to every page-scoped query. Nested pages are reported separately as structure rather than damage, since blocks beneath a sub-page correctly belong to that sub-page."""
+        """Report blocks whose :block/page differs from their nearest ancestor page. THIS IS NOT DAMAGE. Logseq renders the outline from :block/parent, so such blocks display normally and are reachable in the UI; only queries written against :block/page miss them. Use this to understand a surprising query result, not as a repair signal -- there is nothing to repair, and moving these blocks changes their order for no benefit. Nested pages are reported separately as ordinary structure."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return await content().find_orphans(page_uuid)
@@ -568,9 +559,9 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "Omit page_uuid to scan the whole graph. To create missing pages "
             "you must pass create_missing AND acknowledge_page_creation."
         ),
-        "repair_orphans": (
-            "Pass an exact page UUID. Run findOrphans or pageStats first to "
-            "see whether there is anything to repair."
+        "find_orphans": (
+            "Pass an exact page UUID. The result is informational -- the "
+            "condition it reports is cosmetic, not damage."
         ),
         "page_stats": "Pass an exact page UUID, not a block UUID.",
         "find_backlinks": (

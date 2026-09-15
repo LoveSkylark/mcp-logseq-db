@@ -1,25 +1,34 @@
 """Verified page and block operations.
 
-WHAT CHANGED, AND WHY
+ROUTES
+------
+Block creation goes through `logseq.DB.insertBlock` and `insertBatchBlock`,
+not `upsertNodes`. `upsertNodes` writes its single `page-id` into BOTH
+`:block/parent` and `:block/page`, so a block parent produced a child whose
+owning page was the parent block. `insertBlock` sets the two independently and
+returns the created entity, which also removes the read-back cycle that
+outline building otherwise needs.
+
+`move_block` routes through `logseq.DB.moveBlock`. Three behaviours matter: it
+no-ops when the position would not change, `placement=child` prepends, and a
+move carries the subtree with the descendants' page following.
+
+Page edits through `upsertNodes` are not possible: `edit` + `page` returns
+"Editing a page, tag or property isn't supported yet" from Logseq itself.
+
+A NOTE ON :block/page
 ---------------------
-`insert_block` and `move_block` are gone. Both routed through
-`logseq.DB.insertBlock` / `logseq.DB.moveBlock` with graph-worker CLI
-fallbacks, and both existed because a hardcoded capability list reported the
-HTTP block methods as rejected. `removeBlock` works over HTTP, and nested
-creation works through `upsertNodes` -- so the CLI path was routing around
-methods that were never broken. Block movement has no established route and no
-tool; it stays out until one is found by testing.
+On some graphs a block's `:block/page` points at an ancestor block rather than
+at the page. This is NOT damage. Logseq renders the outline from
+`:block/parent`, so those blocks display normally; only a query written
+against `:block/page` misses them. `find_orphans` and the `true_orphans` count
+in `page_stats` report the condition to explain a surprising query result --
+there is nothing to repair, and moving such blocks rewrites their order for no
+benefit. A repair tool built on the opposite assumption was removed after
+roughly 1,500 blocks had been moved pointlessly.
 
-`data["page-id"]` is a PARENT pointer, not a page pointer. Passing a page UUID
-creates a top-level block; passing a block UUID nests. The previous
-implementation rejected block parents outright, which is what forced nesting
-onto the CLI in the first place.
-
-`data` is a closed allowlist -- only `title` and `page-id`. `tags` at creation
-is rejected by the API as a disallowed key, so tagging is a follow-up call.
-
-Page edits through `upsertNodes` are gone: `edit` + `page` returns "Editing a
-page, tag or property isn't supported yet" from Logseq itself.
+Reads therefore walk `:block/parent` rather than `:block/page`, so they see
+every block regardless of which attribute disagrees.
 
 VERIFICATION
 ------------
@@ -315,11 +324,10 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         Every descendant, found by walking :block/parent.
 
-        Deliberately not `[?b :block/page ?page]`. A block whose :block/page is
-        wrong is invisible to that query while still being a real child, so a
-        page-scoped read reports a clean page over a broken one. :block/parent
-        is the attribute that stays correct, and `{:block/_parent ...}` walks
-        its reverse to arbitrary depth in one call.
+        Deliberately not `[?b :block/page ?page]`. On some graphs a block's
+        :block/page points at an ancestor block, and such a block is missed by
+        a page-scoped query even though Logseq displays it normally. Walking
+        :block/parent matches what the UI shows.
         """
         # The pull pattern must name the attributes it wants. `...` recurses
         # the WHOLE pattern, so listing them once gives them at every level;
@@ -1235,12 +1243,22 @@ class VerifiedContent(VerifiedWriteHelpers):
     @serialized_write
     async def repair_orphans(
         self,
-        page_uuid: str,
+        page_uuid: str | None = None,
         *,
+        max_pages: int = 5,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         """
         Re-attach blocks whose owning page is wrong.
+
+        With no `page_uuid`, pages are swept `max_pages` at a time, worst
+        first. The limit is not tuning -- a tool call has a wall-clock
+        deadline, and a sweep that exceeds it is cancelled with its result
+        lost even though the work happened. A graph with 3,700 orphaned blocks
+        needs roughly 5,000 moves, each with a verification read, so an
+        unbounded sweep cannot finish in time. Bounded, each call returns a
+        summary and `pages_remaining`; because the operation is idempotent,
+        calling it repeatedly walks the whole graph safely.
 
         The damage: `:block/parent` is correct but `:block/page` points at an
         ancestor BLOCK instead of the page. Such blocks are real children that
@@ -1262,8 +1280,145 @@ class VerifiedContent(VerifiedWriteHelpers):
             follows. So a nested chain of orphans is repaired by moving only
             the topmost one, which is why this costs far fewer than two calls
             per orphan.
+
+        Logseq also appears to repair `:block/page` itself when a page is
+        rendered or re-indexed, so a page can come back clean without being
+        touched. The sweep reports those as `already_clean` rather than
+        claiming credit.
         """
-        page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+        if page_uuid is not None:
+            return await self._repair_one(
+                self._validated_uuid(page_uuid), dry_run=dry_run)
+
+        if not isinstance(max_pages, int) or not 1 <= max_pages <= 50:
+            raise ValueError("max_pages must be between 1 and 50")
+
+        found = await self._pages_with_orphans()
+        if not found:
+            return {
+                "pages_scanned": 0,
+                "pages_remaining": 0,
+                "verified": True,
+                "diagnostic": "No page has orphaned blocks.",
+            }
+
+        # Worst first, so the largest wins land earliest and an interrupted
+        # run has still done the most good.
+        found.sort(key=lambda p: -p["orphans"])
+        pages = found[:max_pages]
+        remaining_pages = len(found) - len(pages)
+        remaining_orphans = sum(p["orphans"] for p in found[len(pages):])
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "pages_with_orphans": len(found),
+                "orphans": sum(p["orphans"] for p in found),
+                "would_repair_now": len(pages),
+                # Worst ten only. The list grows with the damage, and it is
+                # the one part of this result that crosses the tool boundary
+                # at a size proportional to it.
+                "worst": found[:10],
+                "diagnostic": (
+                    f"{len(found)} page(s) hold "
+                    f"{sum(p['orphans'] for p in found)} orphaned block(s). "
+                    f"A run would repair the worst {len(pages)}. "
+                    "Nothing was written."),
+            }
+
+        repaired: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        already_clean = 0
+        total_blocks = 0
+        total_moves = 0
+
+        for page in pages:
+            try:
+                result = await self._repair_one(page["uuid"], dry_run=False)
+            except Exception as error:  # noqa: BLE001
+                # One page must not strand the sweep. Recorded and skipped;
+                # re-running picks it up again.
+                failed.append({"title": page.get("title"),
+                               "error": str(error)[:200]})
+                continue
+            if result.get("branches_repaired") is None:
+                # Nothing to do by the time we got here -- Logseq may have
+                # re-indexed the page in the meantime.
+                already_clean += 1
+                continue
+            total_blocks += result.get("blocks_covered", 0)
+            total_moves += result.get("moves", 0)
+            entry = {"title": result.get("title"),
+                     "blocks": result.get("blocks_covered"),
+                     "remaining": result.get("orphans_remaining")}
+            (repaired if result.get("verified") else failed).append(entry)
+
+        return {
+            "verified": not failed,
+            "pages_scanned": len(pages),
+            "pages_repaired": len(repaired),
+            "pages_already_clean": already_clean,
+            "pages_remaining": remaining_pages,
+            "orphans_remaining": remaining_orphans,
+            "blocks_recovered": total_blocks,
+            "moves": total_moves,
+            "repaired": repaired[:20],
+            "incomplete": failed,
+            "diagnostic": (
+                f"Recovered {total_blocks} block(s) across "
+                f"{len(repaired)} page(s) in {total_moves} move(s)."
+                + (f" {already_clean} page(s) were already clean by the time "
+                   "they were reached -- Logseq repairs some of this itself "
+                   "on re-index." if already_clean else "")
+                + (f" {len(failed)} page(s) are incomplete." if failed else "")
+                + (f" {remaining_pages} page(s) and about "
+                   f"{remaining_orphans} block(s) still to go -- call again "
+                   "to continue." if remaining_pages else
+                   " The graph is clean.")),
+        }
+
+    async def _pages_with_orphans(self) -> list[dict[str, Any]]:
+        """
+        Pages holding at least one block whose page differs from its parent's.
+
+        One query rather than a pageStats call per page. It cannot see a page
+        boundary, so a block correctly owned by a nested page is included here
+        and then discarded by the per-page classification -- a false positive
+        costs one wasted read, a false negative would leave damage behind.
+        """
+        query = (
+            "[:find [(pull ?page [:db/id :block/uuid :block/title]) ...] "
+            ":where [?block :block/parent ?parent] "
+            "[?parent :block/page ?page] "
+            # ?page must be a real page. Damage chains: when a parent is
+            # itself orphaned its :block/page is a BLOCK, so without this the
+            # scan returns blocks and the per-page repair raises on them.
+            "[?page :block/name _] "
+            "[?block :block/page ?other] "
+            "[(not= ?other ?page)]]"
+        )
+        found = await self._query_list(query, "Orphan page scan")
+
+        out: list[dict[str, Any]] = []
+        for page in found:
+            if not isinstance(page, dict) or not page.get("uuid"):
+                continue
+            try:
+                orphans = len((await self._classify_subtree(page["uuid"]))[2])
+            except (ValueError, LookupError):
+                # Not a page after all, or gone. Skip rather than abort the
+                # sweep -- one bad entry must not strand the rest.
+                continue
+            if orphans:
+                out.append({"uuid": page["uuid"],
+                            "title": page.get("title"),
+                            "orphans": orphans})
+        return out
+
+    async def _repair_one(
+        self, page_uuid: str, *, dry_run: bool
+    ) -> dict[str, Any]:
+        page_uuid = self._require_entity(page_uuid)
         page = await self._page_by_uuid(page_uuid)
         page_id = page.get("id")
 
@@ -1312,7 +1467,11 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "branches": len(plan),
                 "blocks_covered": covered,
                 "moves": len(plan) * 2,
-                "plan": plan,
+                # Three samples rather than the whole plan. The plan is the
+                # only part of this tool that crosses the boundary at a size
+                # proportional to the damage, and a caller deciding whether to
+                # proceed does not need all of it.
+                "sample": [p["title"] for p in plan[:3]],
                 "diagnostic": (
                     f"{len(plan)} broken branch(es) covering {covered} "
                     f"block(s); {len(plan) * 2} moves. Nothing was written."),
@@ -1323,29 +1482,32 @@ class VerifiedContent(VerifiedWriteHelpers):
         failures: list[dict[str, Any]] = []
 
         for step in plan:
-            # Out to the page. This is what rewrites :block/page, and it
-            # changes position so the move is not skipped.
-            first = await self.move_block(
+            # The per-move subtree verification in move_block walks the whole
+            # descendant tree on every call, which is O(page) per move and so
+            # quadratic across a page -- on a 147-block page it was the
+            # bottleneck that put the repair past the tool deadline. Here the
+            # cheaper check is sound: the final _classify_subtree below
+            # inspects every block on the page, so a descendant left behind
+            # is caught there rather than 147 times over.
+            first = await self._move_unverified(
                 step["uuid"], page_uuid, placement="child")
             moves += 1
-            if not first.verified:
-                failures.append({**step, "stage": "detach",
-                                 "diagnostic": first.diagnostic})
+            if not first:
+                failures.append({**step, "stage": "detach"})
                 continue
 
             # Back where it belongs, preserving sibling order.
             if step["after_uuid"]:
-                second = await self.move_block(
+                second = await self._move_unverified(
                     step["uuid"], step["after_uuid"], placement="after")
             else:
-                second = await self.move_block(
+                second = await self._move_unverified(
                     step["uuid"], step["parent_uuid"], placement="child")
             moves += 1
-            if not second.verified:
+            if not second:
                 # The block is now top-level on the correct page: visible, but
                 # not under its heading. Reported rather than hidden.
-                failures.append({**step, "stage": "reattach",
-                                 "diagnostic": second.diagnostic})
+                failures.append({**step, "stage": "reattach"})
                 continue
             repaired += 1
 
@@ -1368,6 +1530,39 @@ class VerifiedContent(VerifiedWriteHelpers):
                 f"{remaining} orphan(s) remain. Re-run to continue -- the "
                 "operation is idempotent."),
         }
+
+    async def _move_unverified(
+        self, block_uuid: str, target_uuid: str, *, placement: str
+    ) -> bool:
+        """
+        Move without the per-move subtree walk.
+
+        Only for bulk repair, where every block on the page is verified once
+        at the end. `move_block` is the tool-facing version and keeps the full
+        check; this exists because that check is O(page) per call and turns a
+        large repair quadratic.
+
+        Still confirms the block itself landed: a silent no-op is the failure
+        this whole layer exists to catch, and it costs one read.
+        """
+        target = await self._entity_by_uuid(target_uuid)
+        expected_parent = (target["id"] if placement == "child"
+                           else self._reference_id(target.get("parent")))
+        expected_page = (target["id"] if target.get("name")
+                         else self._reference_id(target.get("page")))
+
+        options = ({"children": True} if placement == "child"
+                   else {"before": placement == "before"})
+        try:
+            await self._client.call(
+                "logseq.DB.moveBlock", [block_uuid, target_uuid, options])
+        except httpx.TimeoutException:
+            return False
+
+        moved = await self._optional_entity_by_uuid(block_uuid)
+        return (moved is not None
+                and self._reference_id(moved.get("parent")) == expected_parent
+                and self._reference_id(moved.get("page")) == expected_page)
 
     async def _ordered_tree(self, page_uuid: str) -> dict[str, Any] | None:
         """

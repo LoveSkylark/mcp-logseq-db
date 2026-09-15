@@ -77,6 +77,40 @@ that hold a value and properties that are merely *declared* by the page's
 classes — the latter have no datoms and appear in no query over the page.
 `getPage` separates these with its `detail` selector for that reason.
 
+**`:block/page` can disagree with `:block/parent`, and that is harmless.**
+On some graphs a block's `:block/page` points at an ancestor block rather than
+at the page. Logseq renders the outline from `:block/parent`, so such blocks
+appear normally in the UI and nothing is lost. `pageStats` and `findOrphans`
+report the count because it explains why a `:block/page` query returns fewer
+blocks than expected — **not** because anything needs fixing.
+
+Do not offer to repair it, and do not move blocks to "correct" it. Moving a
+block rewrites its `:block/order`, so a bulk repair reorders content for no
+benefit. This was learned the expensive way: a repair tool was built on the
+assumption that these blocks were invisible, and roughly 1,500 blocks were
+moved before anyone opened the page and saw the text rendering fine.
+
+## Cost lives at the tool boundary
+
+What costs you is what crosses in and out — arguments and results — not the
+work a tool does internally. `importPage` on a 68-block page makes 34
+`insertBatchBlock` calls inside the server and returns one summary; building
+the same page with `createBlock` would be 68 requests and 68 responses.
+
+So prefer the tool that loops internally over the loop you write yourself:
+
+- `repairLinks()` with no page over one call per page
+- `importPage` over a `createBlock` per line
+- `pageStats` over `getPage` when you only need counts
+- `clearPage` over a `removeBlock` per block
+
+And when a tool does return something proportional to the damage — a plan, a
+list of orphans — read the summary rather than the list unless you intend to
+act on each item.
+
+This also means slowness is not cost. A sweep that takes a minute of internal
+calls is cheap; the same work as individual tool calls is not.
+
 ## Start with capabilities
 
 Call `capabilities` once near the start. It reports **tools**, not API methods,
@@ -114,18 +148,20 @@ Prefer the narrowest tool that answers the question.
    reference in the DB but does **not** appear in the UI panel, so the totals
    will not match what the user sees. Run it before deleting anything —
    nothing rewrites references on delete.
-4. `findOrphans(page_uuid)` reports blocks whose owning page differs from
-   their nearest ancestor page — real children that no page-scoped query can
-   see. **A nested page is a page boundary, not damage**: blocks beneath a
-   sub-page correctly belong to it, and are reported separately under
-   `nested_pages`.
-5. `pageStats(page_uuid)` returns counts only — own blocks, subtree blocks,
-   nested pages, true orphans, refs, tag holders, property values. Prefer it
-   for triage: every other read returns payload proportional to page size, so
-   auditing many pages with them is expensive and this is not.
-6. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
+4. `findOrphans(page_uuid)` reports blocks whose `:block/page` differs from
+   their nearest ancestor page. **This is not damage.** Logseq renders the
+   outline from `:block/parent`, so those blocks display normally and are
+   reachable in the UI — only a query written against `:block/page` misses
+   them. Treat it as an explanation for a surprising query result, never as a
+   repair signal.
+6. `pageStats(page_uuid)` returns counts only — own blocks, subtree blocks,
+   nested pages, refs, tag holders, property values, and a `true_orphans`
+   count that is informational rather than a fault. Prefer it for triage:
+   every other read returns payload proportional to page size, so auditing
+   many pages with them is expensive and this is not.
+7. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
    this?" — run either before deleting, and report the count to the user.
-7. The `list*` tools take no arguments and return a whole kind.
+8. The `list*` tools take no arguments and return a whole kind.
 
 Keep `uuid` and `ident` in the working plan. Do not reduce an entity to its
 display text; titles are not unique and are not identifiers.
@@ -218,10 +254,21 @@ that failed; treat it as a partial write and audit with `findOrphans` rather
 than retrying, which would duplicate what already landed.
 
 `moveBlock(block_uuid, target_uuid, placement)` relocates a block and its
-subtree — `child`, `before` or `after`. The API returns nothing on a move, so
-the tool verifies the new parent, the owning page, and that descendants
-followed. A move whose page did not follow leaves a real child that no
-page-scoped query can see.
+subtree — `child`, `before` or `after`. Confirmed working on all placements,
+including across pages. The API returns nothing, so the tool verifies the new
+parent, the owning page, and that descendants followed.
+
+Three behaviours matter when using it directly:
+
+- **It no-ops when the position would not change.** Moving a block to the
+  parent it already has does nothing, and comes back `verified: false` with a
+  silent-no-op diagnostic. That is the tool being honest, not failing.
+- **`child` prepends.** Moving several siblings left to right with `child`
+  reverses them. Use `after <previous sibling>` for all but the first.
+- **A move carries the subtree**, and descendants' `:block/page` follows.
+
+Those three are already encoded in `repairOrphans`; you only need them when
+moving blocks by hand.
 
 `removeBlock` deletes the subtree and verifies every descendant is gone.
 
@@ -297,12 +344,11 @@ tags the block as well. This is why `importPage` escapes both — an import
 whose links point at pages that do not exist yet would create a stub for every
 one of them.
 
-**`listClosedValues` depends on the graph, not the build.** `Status` and
-`Priority` carry `:property/closed-values` on a mature graph — six and four
-permitted entities respectively — but a freshly created graph has none, so the
-tool returns empty there. An empty result means this graph has no enums, not
-that the feature is absent. Both are built-ins and outside the sandbox, so
-they remain read-only either way.
+**`listClosedValues` works.** `Status` and `Priority` carry permitted values
+on a mature graph — six and four respectively. A freshly created graph has
+none, so an empty result means this graph has no enums rather than that the
+feature is missing. Both are built-ins and outside the sandbox, so they remain
+read-only.
 
 **A dry run is not a write.** `dry_run` returns `verified: false` by design.
 It validates the payload, not the transaction: a graph carrying invalid
@@ -315,11 +361,10 @@ it keeps pointing at a page the user can no longer find. `deletePage` refuses
 until `acknowledge_reference_rewrite` is set when references exist — surface
 that to the user rather than setting it reflexively.
 
-**`moveBlock` is exposed but its underlying route is unproven.** The API
-returns null whether it moved the block or did nothing, and no live run has yet
-observed it changing anything. The tool verifies by reading back, so a silent
-no-op comes back as `verified: false` with a diagnostic saying so — report that
-rather than assuming the move happened.
+**`moveBlock` is confirmed working** on all placements, including across
+pages. Three behaviours to know when calling it directly: it no-ops when the
+position would not change (reported as `verified: false`, which is correct),
+`placement=child` prepends, and a move carries the subtree.
 
 ## Tools
 

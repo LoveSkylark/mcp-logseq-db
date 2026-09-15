@@ -103,8 +103,6 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     # Blocks
     "getBlockUUID":         ("logseq.DB.datascriptQuery",),
     "findOrphans":          ("logseq.DB.datascriptQuery",),
-    "repairOrphans":        ("logseq.DB.moveBlock",
-                             "logseq.DB.datascriptQuery"),
     "findBacklinks":        ("logseq.DB.datascriptQuery",),
     "pageStats":            ("logseq.DB.datascriptQuery",),
     "importPage":           ("logseq.DB.insertBatchBlock",
@@ -222,20 +220,14 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "References are never rewritten by a delete or recycle, so run this "
         "before removing anything.",
     ),
-    "repairOrphans": (
-        "Each broken branch costs two moves: moveBlock no-ops when the"
-        " position would not change, so ownership cannot be fixed in place.",
-        "A nested chain of orphans is repaired by moving only its topmost"
-        " block, since a move carries the subtree and its page follows.",
-        "Idempotent. A partial repair leaves the moved blocks visible on the"
-        " page and can be continued by re-running.",
-    ),
     "findOrphans": (
-        "Reports blocks whose owning page differs from their nearest ancestor "
-        "page. Such blocks are invisible to page-scoped queries.",
-        "Nested pages are reported separately as structure, not damage: blocks "
-        "beneath a sub-page correctly belong to that page rather than to this "
-        "one.",
+        "Reports blocks whose :block/page differs from their nearest ancestor"
+        " page. NOT damage: Logseq renders from :block/parent, so these blocks"
+        " display normally. Only queries written against :block/page miss"
+        " them.",
+        "Informational only. There is no repair, and moving such blocks"
+        " rewrites their order for no benefit.",
+        "Nested pages are reported separately as ordinary structure.",
     ),
     "importPage": (
         "References are escaped, not written live: Logseq mints a page or tag "

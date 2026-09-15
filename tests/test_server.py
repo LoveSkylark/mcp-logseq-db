@@ -26,7 +26,7 @@ EXPECTED_TOOLS = {
     "clearPage",
     # Blocks
     "getBlockUUID", "getBlock", "getBlockTree", "findOrphans",
-    "repairOrphans", "findBacklinks", "createBlock",
+    "findBacklinks", "createBlock",
     "createPageofBlocks", "importPage", "repairLinks", "updateBlock",
     "removeBlock",
     "moveBlock",
@@ -45,6 +45,7 @@ EXPECTED_TOOLS = {
 # Removed in the rewrite. Each is listed with why, so a future reader does not
 # restore one by assuming it was an oversight.
 REMOVED_TOOLS = {
+    "repairOrphans":           "built on a false premise: blocks whose :block/page points at an ancestor render normally, so there was nothing to repair",
     "createManyBlocks":        "batched across arbitrary parents, so a failure could commit partially; createPageofBlocks covers the useful case",
     "insert_block":            "no verified route; nesting is createBlock",
     "create_top_level_block":  "createBlock covers page and block parents",

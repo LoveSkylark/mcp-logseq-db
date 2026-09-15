@@ -35,9 +35,9 @@ still true.
 
 **Writes** — each verifies by read-back
 
-`importPage` · `repairLinks` · `createPage` · `renamePage` · `deletePage` ·
-`clearPage` · `createBlock` · `createPageofBlocks` · `updateBlock` ·
-`moveBlock` · `removeBlock` ·
+`importPage` · `repairLinks` · `createPage` · `renamePage` ·
+`deletePage` · `clearPage` · `createBlock` · `createPageofBlocks` ·
+`updateBlock` · `moveBlock` · `removeBlock` ·
 `creatTag` · `deleteTag` · `addTag` · `removeTag` · `createProperty` ·
 `deleteProperty` · `addProperty` · `removeProperty`
 
@@ -53,6 +53,22 @@ through its classes have no datoms at all — they appear in no other query.
 `pageStats` is the one read whose response size does not depend on the page.
 Every other read returns payload proportional to content, which makes auditing
 many pages expensive; this returns seven integers regardless.
+
+## Cost lives at the tool boundary
+
+What a caller pays for is what crosses in and out, not the work a tool does
+internally. `importPage` on a 68-block page makes 34 `insertBatchBlock` calls
+inside the server and returns one summary; building the same page with
+`createBlock` would be 68 requests and 68 responses.
+
+So the tools that loop internally are the cheap ones. `repairLinks()` with no
+page argument sweeps the whole graph. `importPage` builds a page from markdown
+in one call. `clearPage` loops `removeBlock` itself. `pageStats` returns counts
+rather than content.
+
+A corollary worth stating, since it is counter-intuitive: **slowness is not
+cost**. A graph-wide sweep may take minutes of internal calls and still be far
+cheaper than doing a fraction of it by hand.
 
 ## Limits worth knowing up front
 
@@ -75,17 +91,26 @@ and creating missing pages needs two explicit arguments plus a cap.
 a failure partway leaves earlier levels committed. The result names the level
 that failed; audit with `findOrphans` rather than retrying.
 
-**`moveBlock` is exposed but its route is unproven.** The API returns nothing
-on a move, so the tool verifies by reading back — a silent no-op comes back as
-`verified: false` rather than a false success.
+**`moveBlock` is confirmed working** on all placements, including across
+pages. It no-ops when the position would not change, which the tool reports as
+`verified: false` rather than a false success — so fixing a block's owning page
+in place takes two moves, out and back. `repairOrphans` does that for you.
 
 **Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
 `deleteProperty` refuse until you confirm, listing what would be affected.
 
 **`listClosedValues` depends on the graph.** `Status` and `Priority` carry
-`:property/closed-values` on a mature graph but not on a freshly created one,
-so an empty result means this graph has no enums rather than that the feature
-is missing.
+permitted values on a mature graph but not on a freshly created one, so an
+empty result means this graph has no enums rather than that the feature is
+missing.
+
+**`:block/page` can disagree with `:block/parent`, and that is harmless.** On
+some graphs a block's `:block/page` points at an ancestor block rather than at
+the page. Logseq renders the outline from `:block/parent`, so the block
+displays normally — only a query written against `:block/page` misses it.
+`pageStats` and `findOrphans` report the count to explain a surprising query
+result, not because anything needs repairing. Moving such blocks rewrites
+their order for no benefit.
 
 **Recycled pages survive deletion**, keeping their UUID, tags, and blocks, so
 `listPages` excludes them explicitly and `listRecycled` shows them. Inbound

@@ -24,19 +24,24 @@ the second question.
 4. Verify every write with an independent read. **An envelope reporting
    `verified: true` is necessary but not sufficient** — the server's read-back
    and your verification can share a wrong assumption.
-5. **On any error, do not retry.** A failed response does not imply a failed
+5. **Confirm a symptom before treating something as damage.** A count is not
+   a symptom. If a metric is computed from the same attribute you suspect is
+   wrong, it cannot be evidence about that attribute — open the page in the
+   Logseq UI and look. A repair tool was once built and thousands of blocks
+   moved on a premise nobody checked this way.
+6. **On any error, do not retry.** A failed response does not imply a failed
    write, and a successful one does not imply a completed write. Record
    whether the mutation committed.
-6. Prefer attribute patterns and `#uuid` literals in verification queries.
+7. Prefer attribute patterns and `#uuid` literals in verification queries.
    Predicate functions are used by the server in one place (`listAssets`) but
    have hung the DB worker before — see T-706.
-7. Destructive steps require explicit confirmation: `deleteTag`,
+8. Destructive steps require explicit confirmation: `deleteTag`,
    `deleteProperty`, `deletePage`, `clearPage`, and `removeBlock` on anything
    with children.
-8. Use `pageStats` for triage rather than `getPage` or `findOrphans`. Its
+9. Use `pageStats` for triage rather than `getPage` or `findOrphans`. Its
    response is a fixed size; theirs scale with page content, and a container
    page can exhaust the context in one call.
-9. Tear down fixtures at the end of the run.
+10. Tear down fixtures at the end of the run.
 
 ### Standard verification query
 

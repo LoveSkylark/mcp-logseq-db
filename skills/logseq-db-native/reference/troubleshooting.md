@@ -19,7 +19,11 @@ being accepted.
 | `"outside this caller's namespace"` | A `user.property/*` or built-in property write. | Not possible over HTTP. Do not look for a workaround. |
 | `deletePage` refuses with a reference count | Entities link to the page and those links are not rewritten. | Report the count to the user; only set `acknowledge_reference_rewrite` once they have decided. |
 | A page "deleted" but still readable by UUID | Expected. Deleting recycles: the entity survives with `:logseq.property/deleted-at`. | Check `listPages` excludes it. Use `listRecycled` to see it. |
-| A dry run succeeded but the real call failed | Expected. `dry_run` validates locally and never calls the API. | Never report a dry run as a completed change. |
+| A dry run succeeded but the real call failed | `dry_run` validates the PAYLOAD; the real call also validates the TRANSACTION. A graph carrying invalid entities passes the first and fails the second. | Never report a dry run as a completed change. |
+| `pageStats` shows `own_blocks` well below `subtree_blocks`, or `true_orphans` above zero | Some blocks' `:block/page` points at an ancestor block. **Not damage** — Logseq renders from `:block/parent`, so they display normally. | Nothing. Do not move blocks to correct it; a move rewrites their order for no benefit. |
+| A user says content is missing from a page | Check the page in the Logseq UI before believing any count. | A count disagreement is not evidence of missing content. Confirm the symptom first. |
+| A tool call returns "no result received after 4 minutes" | The client stopped waiting; the server usually kept working and committed. | Do not retry blindly. Re-read state to see what landed. Bulk operations need a batch limit so each call returns in time. |
+| A large query returns `[]` when a `(count …)` of the same clauses returns thousands | Result size, not the query. Reads can fail silently at scale. | Ask for a scalar with `.`, or narrow the clauses. |
 
 ## The write circuit
 
@@ -121,3 +125,26 @@ working methods as rejected, and block deletion was routed around them for
 months. If something is documented as unavailable and you have reason to doubt
 it, that doubt is worth acting on — `scripts/live_reliability.py` re-checks the
 load-bearing assumptions on demand.
+
+## A count is not a symptom
+
+The worst failure this server has produced was not a bug in a tool. A repair
+tool was built on the belief that blocks whose `:block/page` pointed at an
+ancestor were invisible in the UI. The evidence was a metric — `own_blocks`
+rising after a "repair" — computed from the very attribute that looked wrong.
+It was circular, nobody opened a page to look, and roughly 1,500 blocks were
+reordered before the premise was checked and turned out to be false.
+
+So before repairing anything:
+
+- Confirm the user can see the problem. A number is not a symptom.
+- Check whether the metric depends on the attribute you suspect. If it does,
+  it cannot be evidence about that attribute.
+- Dump a raw entity with `[?e ?a ?v]` rather than trusting a shaped read.
+  Responses strip namespaces and synthesise fields, so they do not describe
+  the schema.
+
+And when a diagnosis is challenged, re-derive it rather than restating it.
+Three separate diagnoses in one session — invisible blocks, a wedged DB
+worker, dangling references — were all wrong, and each survived several turns
+because they were asserted rather than tested.

@@ -1,12 +1,17 @@
 # Repair
 
 Read before repairing a damaged graph: duplicate titles, split identities,
-orphaned blocks, stranded tags and properties.
+stranded tags and properties.
 
 The governing constraint is that **nothing here can be undone cheaply**.
 `deletePage` recycles rather than destroys, references are never rewritten for
 you, and a UUID can be neither assigned nor freed. So repair is triage first
 and writes last, and the triage is what this file is mostly about.
+
+A second constraint, learned expensively: **a count is not a symptom.** Before
+repairing anything, confirm the user can actually see the problem. A metric
+built on the same attribute that looks wrong will happily report a fault that
+does not exist — see the note on `:block/page` under "Other damage".
 
 ## Three facts that determine every repair
 
@@ -36,17 +41,19 @@ tool, and what makes a full-graph audit affordable.
   nested pages**. Using this as a content count will make an empty container
   look populated.
 - `nested_pages` — sub-pages beneath this one. Structure, not damage.
-- `true_orphans` — blocks whose owning page differs from their nearest
-  ancestor page. Real damage, and rare.
+- `true_orphans` — blocks whose `:block/page` differs from their nearest
+  ancestor page. **Not damage.** Logseq renders from `:block/parent`, so these
+  display normally; the count only explains why `own_blocks` is lower than
+  `subtree_blocks`. Never a reason to write.
 - `refs`, `tag_holders`, `property_values` — inbound references by mechanism.
 
 One call gives both halves of the safety check: a block count and a reference
 count. Never treat emptiness alone as grounds to delete.
 
-`findOrphans(page_uuid)` is the follow-up, not the primitive. Reach for it only
-when `pageStats` reports `true_orphans > 0` and you need to see which blocks.
-It returns the orphaned blocks in full, so on a healthy page it is wasted
-payload.
+`findOrphans(page_uuid)` names the blocks behind a `true_orphans` count. It is
+informational — useful for understanding a query result, never a repair
+signal. It returns the blocks in full, so it is wasted payload unless you
+actually need the identities.
 
 `findBacklinks(uuid)` is for when the count is not enough and you need to know
 *what* refers to something. It reports refs, tag holders and property values
@@ -75,7 +82,7 @@ are confirmed for that specific page.
 Class D used to be a trap because `findOrphans` reported every block under a
 nested page as an orphan. It no longer does: a nested page is treated as a page
 boundary, and its blocks are counted against it rather than against the
-container. `pageStats` reports `nested_pages` separately from `true_orphans`.
+container.
 
 A container still looks distinctive — few or zero `own_blocks`, many
 `subtree_blocks`, and `nested_pages` above zero. That combination is ordinary
@@ -188,16 +195,25 @@ the graph is rebuilt.
 
 ## Other damage
 
-**Real orphan blocks.** `pageStats` reports `true_orphans`; `findOrphans` names
-them. These are blocks whose owning page differs from their nearest ancestor
-page, invisible to every page-scoped query, caused by a nested write on an
-older build. New writes cannot produce them: `createBlock` verifies both
-`:block/parent` and `:block/page` and refuses when they disagree.
+**`:block/page` disagreeing with `:block/parent` — NOT damage.** `pageStats`
+reports a `true_orphans` count and `findOrphans` names the blocks. On some
+graphs a block's `:block/page` points at an ancestor block rather than at the
+page.
 
-`moveBlock` now exists and may repair them, but its underlying route has never
-been observed changing anything — expect `verified: false` and treat that as
-the tool being honest rather than broken. If the move does not take, recreate
-the content where it belongs and `removeBlock` the original.
+Leave it alone. Logseq renders the outline from `:block/parent`, so the blocks
+display normally and the user can reach them; only a query written against
+`:block/page` misses them. The count exists to explain a surprising query
+result, not to prompt a repair.
+
+Do not move these blocks to "correct" the attribute. A move rewrites
+`:block/order`, so a bulk pass reorders the user's content for no benefit. A
+tool that did exactly that was removed from this server after roughly 1,500
+blocks had been moved — built on the assumption the blocks were invisible,
+which nobody checked by opening the page until afterwards.
+
+If a user reports content genuinely missing from a page, verify it in the UI
+before believing any count. `own_blocks` disagreeing with `subtree_blocks` is
+not evidence of missing content.
 
 
 **Recycled pages with inbound references.** `listRecycled` shows pages the user
@@ -224,8 +240,8 @@ Stop and report rather than continuing when:
 - Both members of a pair have content (Class C). Merging is a modelling
   decision, not a cleanup.
 - A page that looks like a duplicate turns out to be a container (Class D).
-- A `findOrphans` call returns a large orphan list. Something structural is
-  going on; understand it before writing.
+- A `findOrphans` call returns a large orphan list. That is a query-visibility
+  quirk, not damage — report it and stop. Do not move blocks over it.
 - A write returns `verified: false`. Read `previous_state` and
   `observed_state`; do not retry with the same arguments.
 - The repair would edit prose or pick a canonical identity on the user's
