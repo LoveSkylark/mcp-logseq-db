@@ -117,9 +117,10 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "createPageofBlocks":   ("logseq.DB.insertBatchBlock",
                              "logseq.DB.datascriptQuery"),
     # Pages
-    "getPageUUID":          ("logseq.DB.datascriptQuery",),
-    "getPage":              ("logseq.DB.datascriptQuery",),
-    "createPage":           ("logseq.DB.upsertNodes",),
+    "getPageUUID":          ("logseq.DB.getPage",
+                             "logseq.DB.datascriptQuery"),
+    "inspectPage":          ("logseq.DB.datascriptQuery",),
+    "createPage":           ("logseq.DB.createPage",),
     "renamePage":           ("logseq.DB.renamePage",),
     "deletePage":           ("logseq.DB.deletePage",),
     "clearPage":            ("logseq.DB.removeBlock",),
@@ -396,8 +397,13 @@ PROBE_ARGS: dict[str, list[Any]] = {
     "logseq.DB.datascriptQuery": ["[:find ?e . :where [?e :block/uuid]]"],
     "logseq.DB.getTagsByName": [BAD_ARG],
     "logseq.DB.getBlock": [BAD_ARG],
+    "logseq.DB.getPage": [BAD_ARG],
     # Writes, probed with invalid arguments.
-    "logseq.DB.upsertNodes": [[{}], {"dry-run": True}],
+    # An EMPTY title, not BAD_TITLE. A slash is valid in a page name --
+    # Logseq uses it for hierarchy, as in "City/Dawnspire" -- so BAD_TITLE
+    # would create a real page on every capabilities call. An empty string is
+    # refused, which proves the method exists without writing anything.
+    "logseq.DB.createPage": [""],
     "logseq.DB.insertBlock": [BAD_ARG, BAD_TITLE, {}],
     "logseq.DB.insertBatchBlock": [BAD_ARG, [], {}],
     "logseq.DB.updateBlock": [BAD_ARG, BAD_ARG],
@@ -422,6 +428,7 @@ READ_METHODS = frozenset({
     "logseq.DB.datascriptQuery",
     "logseq.DB.getTagsByName",
     "logseq.DB.getBlock",
+    "logseq.DB.getPage",
 })
 
 

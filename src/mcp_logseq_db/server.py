@@ -132,22 +132,22 @@ def create_server(
 
     @server.tool(name="getPageUUID", structured_output=True)
     async def get_page_uuid(title: str) -> dict[str, Any]:
-        """Resolve a page title to exactly one UUID. Returns found=false with candidates when the title is ambiguous, rather than guessing a write target."""
+        """Resolve a page title to exactly one UUID. Accepts the display title or the lowercased name. Recycled pages do not resolve, and a title held only by a tag resolves to nothing rather than to the tag. Returns found=false with candidates when two live pages share a title, rather than guessing a write target."""
         return await content().get_page_uuid(title)
 
-    @server.tool(name="getPage", structured_output=True)
-    async def get_page(
+    @server.tool(name="inspectPage", structured_output=True)
+    async def inspect_page(
         page_uuid: str,
         detail: Literal[
             "page", "blocks", "tags", "properties", "declared", "all"
         ] = "page",
     ) -> dict[str, Any]:
-        """Read one page. detail=page is the page entity alone; blocks lists every block at any depth; tags covers the page and its blocks; properties returns values that are set; declared returns property slots inherited from the page's classes that have no value yet; all combines them."""
+        """Read one page at a chosen level of detail. detail=page is the page entity alone; blocks lists every block at any depth; tags covers the page and its blocks; properties returns values that are set; declared returns property slots inherited from the page's classes that have no value yet; all combines them. Named inspectPage rather than getPage because it returns far more than a page entity, and because logseq.DB.getPage is a different and much narrower thing."""
         return await content().get_page(page_uuid, detail)
 
     @server.tool(name="createPage", structured_output=True)
     async def create_page(title: str, dry_run: bool = False) -> dict[str, Any]:
-        """Create one page. A title that already exists is rejected rather than duplicated, because the read-back could not then tell the new page from the old one."""
+        """Create one page. Routed through logseq.DB.createPage, which is idempotent on title -- unlike upsertNodes, which fails outright on synced graphs. A title already held by any page, tag or block is rejected, since the three share one title space."""
         return (await content().create_page(title, dry_run=dry_run)).to_dict()
 
     @server.tool(name="renamePage", structured_output=True)

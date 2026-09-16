@@ -23,7 +23,7 @@ still true.
 
 **Reads**
 
-`capabilities` · `getPageUUID` · `getPage` · `pageStats` · `getBlockUUID` ·
+`capabilities` · `getPageUUID` · `inspectPage` · `pageStats` · `getBlockUUID` ·
 `getBlock` · `getBlockTree` · `findBacklinks` · `findOrphans` · `getTagUUID` ·
 `getTag` · `getTagUsers` · `getPropertyIndent` · `getProperyUsers`
 
@@ -45,10 +45,13 @@ There is one `addTag`, not an `addPageTag` and an `addBlockTag` — a page **is*
 a block in the DB, so the target is uniform and there is nothing to choose
 between. The same applies to `addProperty`.
 
-`getPage` takes a `detail` selector: `page`, `blocks`, `tags`, `properties`,
-`declared`, or `all`. These are not interchangeable. A page's own tags and its
-blocks' tags live in different places, and properties that a page *declares*
-through its classes have no datoms at all — they appear in no other query.
+`inspectPage` takes a `detail` selector: `page`, `blocks`, `tags`,
+`properties`, `declared`, or `all`. These are not interchangeable. A page's own
+tags and its blocks' tags live in different places, and properties that a page
+*declares* through its classes have no datoms at all — they appear in no other
+query. It is called `inspectPage` rather than `getPage` because it returns far
+more than a page entity, and because `logseq.DB.getPage` is a different and
+much narrower thing.
 
 `pageStats` is the one read whose response size does not depend on the page.
 Every other read returns payload proportional to content, which makes auditing
@@ -91,10 +94,16 @@ and creating missing pages needs two explicit arguments plus a cap.
 a failure partway leaves earlier levels committed. The result names the level
 that failed; audit with `findOrphans` rather than retrying.
 
+**Page creation avoids `upsertNodes`.** That method fails on synced graphs —
+it returns "The Imported EDN has N validation error(s)" for a write its own dry
+run accepts, while `createPage`, `insertBlock`, `updateBlock` and `createTag`
+all succeed against the same graph. Local graphs are unaffected. Nothing in
+this server routes through it any more.
+
 **`moveBlock` is confirmed working** on all placements, including across
 pages. It no-ops when the position would not change, which the tool reports as
-`verified: false` rather than a false success — so fixing a block's owning page
-in place takes two moves, out and back. `repairOrphans` does that for you.
+`verified: false` rather than a false success — so moving a block to the parent
+it already has takes two moves, out and back.
 
 **Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
 `deleteProperty` refuse until you confirm, listing what would be affected.

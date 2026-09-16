@@ -75,7 +75,7 @@ Three attributes reach different things and are not interchangeable:
 A page's own tags and its blocks' tags are separate queries. So are properties
 that hold a value and properties that are merely *declared* by the page's
 classes — the latter have no datoms and appear in no query over the page.
-`getPage` separates these with its `detail` selector for that reason.
+`inspectPage` separates these with its `detail` selector for that reason.
 
 **`:block/page` can disagree with `:block/parent`, and that is harmless.**
 On some graphs a block's `:block/page` points at an ancestor block rather than
@@ -101,7 +101,7 @@ So prefer the tool that loops internally over the loop you write yourself:
 
 - `repairLinks()` with no page over one call per page
 - `importPage` over a `createBlock` per line
-- `pageStats` over `getPage` when you only need counts
+- `pageStats` over `inspectPage` when you only need counts
 - `clearPage` over a `removeBlock` per block
 
 And when a tool does return something proportional to the damage — a plan, a
@@ -136,8 +136,10 @@ method directly.
 
 Prefer the narrowest tool that answers the question.
 
-1. `getPageUUID(title)` → `getPage(uuid, detail)` where detail is
-   `page`, `blocks`, `tags`, `properties`, `declared`, or `all`.
+1. `getPageUUID(title)` → `inspectPage(uuid, detail)` where detail is
+   `page`, `blocks`, `tags`, `properties`, `declared`, or `all`. It is called
+   `inspectPage` rather than `getPage` because it returns far more than a page
+   entity.
 2. `getBlockUUID(page_uuid)` lists every block on a page at any depth.
    `getBlock(uuid)` reads one; `getBlockTree(uuid)` reads a subtree and reports
    `truncated` when a bound stopped it. Both walk `:block/parent`, so a block
@@ -154,14 +156,14 @@ Prefer the narrowest tool that answers the question.
    reachable in the UI — only a query written against `:block/page` misses
    them. Treat it as an explanation for a surprising query result, never as a
    repair signal.
-6. `pageStats(page_uuid)` returns counts only — own blocks, subtree blocks,
+5. `pageStats(page_uuid)` returns counts only — own blocks, subtree blocks,
    nested pages, refs, tag holders, property values, and a `true_orphans`
    count that is informational rather than a fault. Prefer it for triage:
    every other read returns payload proportional to page size, so auditing
    many pages with them is expensive and this is not.
-7. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
+6. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
    this?" — run either before deleting, and report the count to the user.
-8. The `list*` tools take no arguments and return a whole kind.
+7. The `list*` tools take no arguments and return a whole kind.
 
 Keep `uuid` and `ident` in the working plan. Do not reduce an entity to its
 display text; titles are not unique and are not identifiers.
@@ -185,14 +187,16 @@ After writing, check `verified`. On `verified=false`, read `previous_state` and
 `observed_state`: they distinguish "nothing happened" from "something else
 happened", and the usual cause is an identifier of the wrong type.
 
-`dry_run` validates arguments and target existence **locally**. It does not
-call the API, so it cannot tell you a write will land. Do not report a
+`dry_run` checks arguments and target existence. Most tools validate locally
+only — `createPage` in particular, since its route has no server-side dry run.
+Either way it does not tell you a write will land, so do not report a
 successful dry run as though the change were made.
 
 ### Pages
 
-`createPage(title)` rejects a title that already exists rather than creating a
-second page, because the read-back could not then tell them apart.
+`createPage(title)` rejects a title already held by any page, tag or block —
+the three share one title space. Its route is idempotent on title, so a repeat
+returns the existing page rather than duplicating it.
 
 `renamePage(page_uuid, new_title)` verifies by UUID, not by the new title —
 reading back by title cannot distinguish a rename from Logseq having created a
@@ -368,7 +372,7 @@ position would not change (reported as `verified: false`, which is correct),
 
 ## Tools
 
-**Reads** — `capabilities`, `getPageUUID`, `getPage`, `pageStats`,
+**Reads** — `capabilities`, `getPageUUID`, `inspectPage`, `pageStats`,
 `getBlockUUID`, `getBlock`, `getBlockTree`, `findBacklinks`, `findOrphans`,
 `getTagUUID`, `getTag`, `getTagUsers`, `getPropertyIndent`, `getProperyUsers`
 

@@ -21,7 +21,7 @@ from mcp_logseq_db.server import create_server
 EXPECTED_TOOLS = {
     "capabilities",
     # Pages
-    "getPageUUID", "getPage", "pageStats", "createPage", "renamePage",
+    "getPageUUID", "inspectPage", "pageStats", "createPage", "renamePage",
     "deletePage",
     "clearPage",
     # Blocks
@@ -45,6 +45,7 @@ EXPECTED_TOOLS = {
 # Removed in the rewrite. Each is listed with why, so a future reader does not
 # restore one by assuming it was an oversight.
 REMOVED_TOOLS = {
+    "getPage":                 "renamed to inspectPage -- it returns far more than a page entity, and logseq.DB.getPage is a different, narrower thing",
     "repairOrphans":           "built on a false premise: blocks whose :block/page points at an ancestor render normally, so there was nothing to repair",
     "createManyBlocks":        "batched across arbitrary parents, so a failure could commit partially; createPageofBlocks covers the useful case",
     "insert_block":            "no verified route; nesting is createBlock",

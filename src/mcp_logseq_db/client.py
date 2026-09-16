@@ -11,18 +11,21 @@ WHAT CHANGED, AND WHY
 The graph-worker CLI paths are gone. They existed because a hardcoded
 capability list reported `removeBlock`, `getBlock` and `updateBlock` as
 rejected. All three work over HTTP; `delete_block_via_cli` was routing around
-a method that was never broken. Nested block creation likewise works over HTTP
-via `upsertNodes` (`page-id` accepts a block UUID), so `insert_block_via_cli`
-had no reason to exist either. `move_block_via_cli` supported a tool that the
-current surface does not expose; if block movement returns, it needs a route
-established by testing rather than inherited from the same wrong list.
+a method that was never broken.
 
-`write_and_verify` is new and is the point of this module. This API returns
-success for calls that do nothing -- a wrong identifier type, an unresolvable
-name, or an unsupported combination all produce `null` or a stock
-acknowledgement. A write that is not read back is a write whose outcome is
-unknown, so verification is built into the write path rather than left to each
-caller.
+`upsertNodes` is gone too, and its absence is deliberate. It fails on SYNCED
+graphs -- "The Imported EDN has N validation error(s)" for a write its own dry
+run accepts -- while `createPage`, `insertBlock`, `insertBatchBlock`,
+`updateBlock` and `createTag` all succeed against the same graph. Local graphs
+are unaffected, which is why it went unnoticed. Block creation had already
+moved off it for a different reason: it writes its single `page-id` into both
+`:block/parent` and `:block/page`.
+
+`write_and_verify` is the point of this module. This API returns success for
+calls that do nothing -- a wrong identifier type, an unresolvable name, or an
+unsupported combination all produce `null` or a stock acknowledgement. A write
+that is not read back is a write whose outcome is unknown, so verification is
+built into the write path rather than left to each caller.
 """
 
 from __future__ import annotations
@@ -54,13 +57,19 @@ _READ_METHODS = frozenset({
     "logseq.DB.datascriptQuery",
     # Dedicated reads with no query equivalent worth preferring.
     "logseq.DB.getBlock",               # getBlock
+    "logseq.DB.getPage",                # getPageUUID fast path
     "logseq.DB.getTagsByName",          # getTagUUID
     "logseq.DB.getAllTags",             # listTags
     "logseq.DB.getAllProperties",       # listProperties
 })
 
 WRITE_METHODS = frozenset({
-    "logseq.DB.upsertNodes",            # createPage
+    # `upsertNodes` is deliberately ABSENT. It fails on synced graphs --
+    # "The Imported EDN has N validation error(s)" for writes its own dry run
+    # accepts -- while createPage, insertBlock, insertBatchBlock, updateBlock
+    # and createTag all succeed on the same graph. Nothing routes through it
+    # any more; leaving it out keeps it from creeping back.
+    "logseq.DB.createPage",             # createPage
     "logseq.DB.insertBlock",            # createBlock
     "logseq.DB.insertBatchBlock",       # createManyBlocks, createPageofBlocks
     "logseq.DB.moveBlock",              # moveBlock
@@ -82,7 +91,6 @@ ALLOWED_METHODS = _CONNECTION_METHODS | _READ_METHODS | WRITE_METHODS
 # Some responses come back as text/plain rather than JSON.
 PLAIN_TEXT_METHODS = frozenset({
     "logseq.DB.datascriptQuery",
-    "logseq.DB.upsertNodes",
 })
 
 # Queries can be expensive; a retry doubles the load without improving the

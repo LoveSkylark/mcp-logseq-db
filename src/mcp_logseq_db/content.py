@@ -94,14 +94,44 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         Resolve a page title to exactly one UUID.
 
-        Refuses an ambiguous match rather than returning the first hit. Page
-        titles are not unique, and selecting a write target from a fuzzy match
-        is how the wrong entity gets modified.
+        Primary lookup is `logseq.DB.getPage`, which accepts a name OR a UUID
+        and, given a title held by both a page and a tag, returns the page.
+        Its result is checked twice before being trusted:
+
+          - it returns RECYCLED pages, carrying
+            `:logseq.property/deleted-at` and parented under Recycle. Handing
+            one back would resolve a title to a page the user deleted, and the
+            split-identity repair depends on recycled pages NOT resolving.
+          - it must be Page-classed, so a title held only by a tag resolves to
+            nothing rather than to the tag.
+
+        KNOWN TRADE-OFF: `getPage` returns one entity, so when it succeeds
+        this does NOT detect two live pages sharing a title -- it resolves to
+        whichever Logseq picked. That guard survives only on the fallback
+        path. It is accepted because `createPage` is idempotent on title and
+        refuses a taken one, so duplicates can no longer be created through
+        this server; an older graph may still contain them. Ambiguity is
+        refused rather than guessed at wherever it IS seen, because selecting
+        a write target from a fuzzy match is how the wrong entity gets
+        modified.
         """
         self._validate_title(title)
         page_class = await self._class_id(PAGE_CLASS)
 
-        # Exact display title first.
+        # Fast path: one call, name or UUID.
+        direct = await self._client.call("logseq.DB.getPage", [title])
+        if isinstance(direct, dict) and direct.get("name"):
+            recycled = direct.get(":logseq.property/deleted-at") is not None
+            is_page = any(self._reference_id(t) == page_class
+                          or t == page_class
+                          for t in (direct.get("tags") or []))
+            if is_page and not recycled:
+                return {"found": True, "title": title,
+                        "page_uuid": direct.get("uuid")}
+
+        # Fall back to the query, which can see every match and so can report
+        # ambiguity. Reached when the fast path found nothing, found a
+        # recycled page, or found something that is not Page-classed.
         query = (
             "[:find [(pull ?page [:db/id :block/uuid :block/name :block/title "
             ":logseq.property/deleted-at]) ...] :in $ ?class :where "
@@ -112,9 +142,8 @@ class VerifiedContent(VerifiedWriteHelpers):
             query, "Page title lookup", page_class)
 
         if not pages:
-            # Fall back to the normalized name, which is lowercased. Without
-            # this, the exact string Logseq stores in :block/name fails to
-            # resolve the page it names.
+            # The normalized name is lowercased. Without this the exact string
+            # Logseq stores in :block/name fails to resolve the page it names.
             query = (
                 "[:find [(pull ?page [:db/id :block/uuid :block/name "
                 ":block/title :logseq.property/deleted-at]) ...] "
@@ -607,34 +636,84 @@ class VerifiedContent(VerifiedWriteHelpers):
 
     # ----------------------------------------------------------- page writes
 
+    @serialized_write
     async def create_page(
         self, title: str, *, dry_run: bool = False
     ) -> ContentResult:
         """
         Create one page.
 
-        Goes through the same batch path as block creation, so it inherits the
-        duplicate-title snapshot and the read-back. A page whose title already
-        exists is rejected rather than created, because verification could not
-        then tell the new page from the old one.
+        Routed through `logseq.DB.createPage`, not `upsertNodes`. Two reasons:
+
+          - `upsertNodes` fails on synced graphs. It returns "The Imported EDN
+            has 3 validation error(s)" for a page add that the dry run accepts,
+            while `createPage`, `insertBlock` and `createTag` all write to the
+            same graph without complaint. Local graphs are unaffected, which is
+            why this went unnoticed.
+          - `createPage` is idempotent on title: calling it twice returns the
+            same entity rather than creating a duplicate.
+
+        The duplicate check below therefore reports a clearer error than
+        Logseq would, but is no longer load-bearing.
+
+        NOTE the second argument of `logseq.DB.createPage` is a PROPERTIES map,
+        not options. Passing `{"dry-run": true}` creates the page anyway AND
+        mints a `dry-run` property in the caller's namespace. So there is no
+        server-side dry run here, and `dry_run` below validates locally only.
         """
-        # Checked before the write, not after. Relying on Logseq to no-op a
-        # duplicate meant the failure surfaced as a readback mismatch, which
-        # reads like a transport problem rather than a rejected argument.
         self._require_title(title)
         existing = await self._entities_by_title(title)
-        if existing and not dry_run:
+        if existing:
             kinds = ", ".join(
                 "page" if e.get("name") else "block" for e in existing)
             raise ValueError(
                 f"An entity titled {title!r} already exists ({kinds}). Pages, "
-                "tags and blocks share a title space, and a duplicate could "
-                "not be told from the original on read-back.")
+                "tags and blocks share a title space.")
 
-        return await self.upsert_nodes(
-            [{"operation": "add", "entityType": "page",
-              "data": {"title": title}}],
-            dry_run=dry_run)
+        if dry_run:
+            return ContentResult(
+                validation={"title": title, "checked": "locally"},
+                response=None, verified_entities=(), verified=False,
+                diagnostic=(
+                    "Dry run: nothing was written, so verified is false by "
+                    "design. This checks the title locally -- createPage has "
+                    "no server-side dry run, because its second argument is a "
+                    "properties map rather than options."))
+
+        response: Any = None
+        timed_out = False
+        try:
+            response = await self._client.call(
+                "logseq.DB.createPage", [title])
+        except httpx.TimeoutException:
+            timed_out = True
+
+        created = self._created_uuid(response)
+        page = None
+        if created:
+            page = await poll_readback(
+                self._client,
+                lambda: self._optional_entity_by_uuid(created),
+                lambda value: value is not None)
+        if page is None:
+            # No usable identity came back; fall back to resolving the title.
+            match = [e for e in await self._entities_by_title(title)
+                     if e.get("name")]
+            page = match[0] if match else None
+
+        if page is None or not page.get("name"):
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    f"No page titled {title!r} is present after the write."))
+
+        return ContentResult(
+            validation=None, response=response, verified_entities=(page,),
+            recovered_after_timeout=timed_out,
+            diagnostic=(
+                "createPage creates the page with one empty block; that block "
+                "is counted by any later block read."))
 
     @serialized_write
     async def rename_page(self, page_uuid: str, new_title: str) -> ContentResult:
@@ -1086,6 +1165,7 @@ class VerifiedContent(VerifiedWriteHelpers):
         return [e["uuid"] for e in entries
                 if isinstance(e, dict) and isinstance(e.get("uuid"), str)]
 
+    @serialized_write
     async def update_block(
         self,
         block_uuid: str,
@@ -1093,36 +1173,70 @@ class VerifiedContent(VerifiedWriteHelpers):
         *,
         dry_run: bool = False,
     ) -> ContentResult:
-        """Edit one existing block title."""
-        block_uuid = self._require_entity(self._validated_uuid(block_uuid))
-        # Captured so the envelope can report the prior title. Without it an
-        # edit is the one write whose previous state cannot be recovered from
-        # its own result, which makes an unwanted change hard to undo.
-        previous = None
-        if not dry_run:
-            previous = await self._optional_entity_by_uuid(block_uuid)
+        """
+        Edit one existing block title.
 
-        result = await self.upsert_nodes(
-            [{
-                "operation": "edit",
-                "entityType": "block",
-                "id": block_uuid,
-                "data": {"title": title},
-            }],
-            dry_run=dry_run,
+        Routed through `logseq.DB.updateBlock` rather than `upsertNodes`.
+        `upsertNodes` fails outright on synced graphs -- it returns "The
+        Imported EDN has N validation error(s)" for writes the dry run
+        accepts, while every other route succeeds on the same graph.
+
+        `updateBlock` does NOT guard against a page UUID: given one it
+        rewrites the page's own title. The block check below is the only thing
+        preventing that.
+
+        Verification checks the title CHANGED rather than that it matches what
+        was sent. Logseq parses content on write, so the stored title need not
+        equal the request: `[[X]]` is rewritten to `[[uuid]]` and a markdown
+        heading loses its marker.
+        """
+        block_uuid = self._require_entity(self._validated_uuid(block_uuid))
+        self._validate_title(title)
+
+        previous = await self._entity_by_uuid(block_uuid)
+        if previous.get("name"):
+            raise ValueError(
+                "UUID identifies a page, not a block. updateBlock would "
+                "rewrite the page's title; use renamePage instead.")
+
+        if dry_run:
+            return ContentResult(
+                validation={"block": previous, "title": title},
+                response=None, verified_entities=(), verified=False,
+                diagnostic=(
+                    "Dry run: nothing was written, so verified is false by "
+                    "design. The block exists and the title is usable."),
+                previous_entities=(previous,))
+
+        response, timed_out = await self._call_ambiguous(
+            "logseq.DB.updateBlock", [block_uuid, title])
+
+        unchanged = previous.get("title")
+        current = await poll_readback(
+            self._client,
+            lambda: self._optional_entity_by_uuid(block_uuid),
+            lambda value: value is not None and value.get("title") != unchanged,
         )
-        if previous is None:
-            return result
+        if current is None:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic="The block disappeared during the edit",
+                previous_entities=(previous,))
+        if current.get("title") == unchanged and title != unchanged:
+            return ContentResult(
+                validation=None, response=response, verified_entities=(),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "The edit was not observed; the block still has its "
+                    "original title. This API returns success for writes that "
+                    "do nothing."),
+                previous_entities=(previous,), observed_entities=(current,))
+
         return ContentResult(
-            validation=result.validation,
-            response=result.response,
-            verified_entities=result.verified_entities,
-            recovered_after_timeout=result.recovered_after_timeout,
-            verified=result.verified,
-            diagnostic=result.diagnostic,
-            previous_entities=(previous,),
-            observed_entities=result.observed_entities,
-        )
+            validation=None, response=response, verified_entities=(current,),
+            recovered_after_timeout=timed_out,
+            previous_entities=(previous,))
 
     @serialized_write
     async def move_block(
