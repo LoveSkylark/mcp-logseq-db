@@ -123,7 +123,10 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "isTitleAvailable":     ("logseq.DB.datascriptQuery",),
     "inspectPage":          ("logseq.DB.datascriptQuery",),
     "createPage":           ("logseq.DB.createPage",),
-    "renamePage":           ("logseq.DB.renamePage",),
+    "renamePage":           ("logseq.DB.renamePage",
+                             "logseq.DB.datascriptQuery"),
+    "retitleOverDuplicate": ("logseq.DB.renamePage",
+                             "logseq.DB.datascriptQuery"),
     "deletePage":           ("logseq.DB.deletePage",),
     "clearPage":            ("logseq.DB.removeBlock",),
     # Lists
@@ -302,6 +305,20 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "The clash check counts recycled pages, so a title whose only holder "
         "is recycled is still refused. isTitleAvailable reports that before "
         "the attempt.",
+    ),
+    "retitleOverDuplicate": (
+        "Two renamePage calls and no block edits. References are by UUID, so "
+        "inbound links, tags and property values on both pages survive — "
+        "which is why this is cheaper and less lossy than rewriting "
+        "referring blocks and deleting a page.",
+        "Works on a RECYCLED holder: renaming it is what releases its title.",
+        "NOT atomic. If the second rename fails the first stands, and the "
+        "parked page's UUID and original title are reported so it can be put "
+        "back.",
+        "Refuses when the holder has content blocks, is in an alias "
+        "relation, or is not a single page. Direction is never inferred: "
+        "from_uuid keeps its identity and gains the title, and both inbound "
+        "reference counts are reported so the caller can check the choice.",
     ),
     "deletePage": (
         "Recycles rather than destroys: the page keeps its UUID, tags, refs "

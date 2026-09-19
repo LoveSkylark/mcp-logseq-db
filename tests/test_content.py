@@ -127,6 +127,8 @@ class FakeClient:
             return self._get_page(*args)
         if method == "logseq.DB.updateBlock":
             return self._update_block(*args)
+        if method == "logseq.DB.renamePage":
+            return self._rename(*args)
         if method == "logseq.DB.insertBlock":
             return self._insert_block(*args)
         if method == "logseq.DB.insertBatchBlock":
@@ -180,6 +182,21 @@ class FakeClient:
         # Replace rather than mutate: the real client returns a fresh dict per
         # call, so an in-place edit would let an earlier snapshot alias it.
         self.graph.entities[block_uuid] = {**current, "title": title}
+        return None
+
+    def _rename(self, page_uuid, new_title):
+        """Updates :block/title AND :block/name. The tool verifies the name
+        survived, because a rename that stripped page identity would
+        otherwise look like success.
+
+        Works on a RECYCLED page, which is what releases its title -- the
+        behaviour retitleOverDuplicate is built on.
+        """
+        if not self.write_effective:
+            return None
+        current = self.graph.entities[page_uuid]
+        self.graph.entities[page_uuid] = {
+            **current, "title": new_title, "name": str(new_title).lower()}
         return None
 
     def _insert_block(self, target_uuid, title, options=None):
@@ -295,6 +312,12 @@ class FakeClient:
                     if target in wanted:
                         rows[target] = rows.get(target, 0) + 1
             return [[target, n] for target, n in rows.items()]
+        if "[?holder :block/alias ?target]" in query:
+            # An alias in the inbound direction: some page names this one as
+            # its alias, which makes it live wiring rather than a duplicate.
+            return [e["id"] for e in self.graph.entities.values()
+                    if any(a.get("id") == params[0]
+                           for a in (e.get("alias") or []))]
         if ":block/_parent" in query and "#uuid" in query:
             uuid = query.split('#uuid "')[1].split('"')[0]
             root = self.graph.entities.get(uuid)
@@ -1329,6 +1352,168 @@ async def test_every_holder_of_a_duplicated_title_is_reported(graph, content):
     result = await content.is_title_available("Twin")
 
     assert len(result["held_by"]) == 2
+
+
+# ------------------------------------------- retitling over a duplicate
+#
+# Two renames fix a typo pair losslessly, because references are by UUID and
+# neither page's wiring is touched. The documented route was one updateBlock
+# per referring block plus a deletePage plus a repairLinks sweep -- more
+# calls, and lossy. The guards are the whole risk surface: an alias holder
+# looks exactly like an abandoned typo.
+
+async def test_a_typo_pair_is_fixed_in_two_renames(graph, content):
+    """The acceptance case: Creatvity -> Creativity, zero block edits."""
+    keeper = graph.add("Creatvity", None, None, name="creatvity",
+                       tags=[PAGE_CLASS_ID])
+    holder = graph.add("Creativity", None, None, name="creativity",
+                       tags=[PAGE_CLASS_ID])
+    referrer = graph.add("see [[uuid]]", graph.page["id"], graph.page["id"])
+    referrer["refs"] = [{"id": keeper["id"]}]
+
+    result = await content.retitle_over_duplicate(
+        keeper["uuid"], "Creativity")
+
+    assert result["verified"] is True
+    assert result["renamed"]["title"] == "Creativity"
+    assert result["renamed"]["previous_title"] == "Creatvity"
+    assert result["parked"]["uuid"] == holder["uuid"]
+    assert result["parked"]["title"] == "Creativity (parked)"
+    assert result["references"] == {"from": 1, "holder": 0}
+    # Nothing edited a block, and the reference still points at the same UUID.
+    assert graph.entities[referrer["uuid"]]["refs"] == [{"id": keeper["id"]}]
+
+
+async def test_it_works_when_the_holder_is_recycled(graph, content):
+    """Renaming a recycled page is what releases its title -- the whole
+    reason this beats recycling and waiting for the title to free up, which
+    never happens."""
+    keeper = graph.add("Presuade", None, None, name="presuade",
+                       tags=[PAGE_CLASS_ID])
+    graph.add("Persuade", None, None, name="persuade", tags=[PAGE_CLASS_ID],
+              extra={":logseq.property/deleted-at": 1758240000})
+
+    result = await content.retitle_over_duplicate(keeper["uuid"], "Persuade")
+
+    assert result["verified"] is True
+    assert result["parked"]["recycled"] is True
+    assert (await content.get_page_uuid("Persuade"))[
+        "page_uuid"] == keeper["uuid"]
+
+
+async def test_a_content_bearing_holder_is_refused(graph, content):
+    keeper = graph.add("Activty", None, None, name="activty",
+                       tags=[PAGE_CLASS_ID])
+    holder = graph.add("Activity", None, None, name="activity",
+                       tags=[PAGE_CLASS_ID])
+    graph.add("real content here", holder["id"], holder["id"])
+
+    result = await content.retitle_over_duplicate(keeper["uuid"], "Activity")
+
+    assert result["verified"] is False
+    assert result["parked"] is None
+    assert "content block" in result["diagnostic"]
+    # Refused with the evidence, not just a refusal.
+    assert result["references"] == {"from": 0, "holder": 0}
+    assert graph.entities[holder["uuid"]]["title"] == "Activity"
+
+
+async def test_an_alias_holder_is_refused(graph, content):
+    """The near-miss this guard exists for: a page that reads as an abandoned
+    typo and is a working alias of the page it resembles."""
+    keeper = graph.add("Abilities", None, None, name="abilities",
+                       tags=[PAGE_CLASS_ID])
+    holder = graph.add("Abilties", None, None, name="abilties",
+                       tags=[PAGE_CLASS_ID])
+    attribute = graph.add("Attribute", None, None, name="attribute",
+                          tags=[PAGE_CLASS_ID])
+    attribute["alias"] = [{"id": holder["id"]}]
+
+    result = await content.retitle_over_duplicate(keeper["uuid"], "Abilties")
+
+    assert result["verified"] is False
+    assert "ALIAS" in result["diagnostic"]
+    assert graph.entities[holder["uuid"]]["title"] == "Abilties"
+
+
+async def test_direction_is_reported_even_when_it_looks_wrong(graph, content):
+    """Which side keeps the title is the caller's call, so a holder with more
+    inbound references is not refused -- but both counts come back, because
+    that is the evidence the choice needed."""
+    keeper = graph.add("Cheet Sheet", None, None, name="cheet sheet",
+                       tags=[PAGE_CLASS_ID])
+    holder = graph.add("Cheat Sheet", None, None, name="cheat sheet",
+                       tags=[PAGE_CLASS_ID])
+    for n in range(3):
+        referrer = graph.add(f"ref {n}", graph.page["id"], graph.page["id"])
+        referrer["refs"] = [{"id": holder["id"]}]
+
+    result = await content.retitle_over_duplicate(
+        keeper["uuid"], "Cheat Sheet")
+
+    assert result["verified"] is True
+    assert result["references"] == {"from": 0, "holder": 3}
+
+
+async def test_a_free_title_needs_no_parking(graph, content):
+    keeper = graph.add("Loom-Weaver", None, None, name="loom-weaver",
+                       tags=[PAGE_CLASS_ID])
+
+    result = await content.retitle_over_duplicate(
+        keeper["uuid"], "Loom Weaver")
+
+    assert result["verified"] is True
+    assert result["parked"] is None
+    assert "nothing was parked" in result["diagnostic"]
+
+
+async def test_a_taken_parking_title_is_refused_before_any_write(
+        graph, content):
+    keeper = graph.add("Flexability", None, None, name="flexability",
+                       tags=[PAGE_CLASS_ID])
+    holder = graph.add("Flexibility", None, None, name="flexibility",
+                       tags=[PAGE_CLASS_ID])
+    graph.add("Flexibility (parked)", None, None,
+              name="flexibility (parked)", tags=[PAGE_CLASS_ID])
+
+    result = await content.retitle_over_duplicate(
+        keeper["uuid"], "Flexibility")
+
+    assert result["verified"] is False
+    assert "park_suffix" in result["diagnostic"]
+    assert graph.entities[holder["uuid"]]["title"] == "Flexibility"
+
+
+async def test_a_partial_application_reports_how_to_undo(graph):
+    """Not atomic, so the failure mode has to be legible: the title was
+    freed, the second rename did not land, and the parked page is sitting
+    under a name nobody chose."""
+    class SecondRenameFailsClient(FakeClient):
+        def __init__(self, graph):
+            super().__init__(graph)
+            self.renames = 0
+
+        def _rename(self, page_uuid, new_title):
+            self.renames += 1
+            if self.renames > 1:
+                return None      # reports success, does nothing
+            return super()._rename(page_uuid, new_title)
+
+    keeper = graph.add("Creatvity", None, None, name="creatvity",
+                       tags=[PAGE_CLASS_ID])
+    holder = graph.add("Creativity", None, None, name="creativity",
+                       tags=[PAGE_CLASS_ID])
+    client = SecondRenameFailsClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+
+    result = await verified.retitle_over_duplicate(
+        keeper["uuid"], "Creativity")
+
+    assert result["verified"] is False
+    assert "PARTIALLY APPLIED" in result["diagnostic"]
+    assert holder["uuid"] in result["diagnostic"]
+    assert result["parked"]["title"] == "Creativity (parked)"
+    assert graph.entities[keeper["uuid"]]["title"] == "Creatvity"
 
 
 # --------------------------------------------- outline is the batching path

@@ -445,6 +445,7 @@ findBacklinks(uuid)                -> refs, tag holders, property values
 findOrphans(pageUuid)              -> informational, not a repair signal
 createPage(title)
 renamePage(pageUuid, newTitle)
+retitleOverDuplicate(fromUuid, toTitle)   two renames; takes a title back
 deletePage(pageUuid)               recycles; references are not rewritten
 clearPage(pageUuid)                empties a page, keeps the page
 importPage(target, markdown)       a whole page in one call
@@ -457,6 +458,21 @@ different queries, and declared-but-unset properties appear in neither (§6).
 It is `inspectPage` rather than `getPage` because it returns far more than a
 page entity, and because `logseq.DB.getPage` is a different and much narrower
 thing.
+
+`isTitleAvailable` exists because `getPageUUID` and the write path disagree
+about recycled pages, both correctly: a resolver must not return a page the
+user deleted, and a writer must refuse a title whose entity still exists. The
+asymmetry is not a bug to reconcile but it was not discoverable either, and a
+page was recycled on the belief that its title would be released. It answers
+with the writers' own check.
+
+`retitleOverDuplicate` follows from the same fact plus one more: a recycled
+page CAN be renamed, which does release its title. Two renames therefore take
+a title back from an empty duplicate without touching a block, where the
+documented repair rewrote every referring block and deleted a page. Its guards
+-- content blocks, alias relations, multiple holders -- are the cases where
+that trade is not available, and it refuses with the reference counts for both
+sides rather than choosing a direction itself.
 
 ### Lists
 

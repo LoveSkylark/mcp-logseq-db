@@ -21,7 +21,8 @@ from mcp_logseq_db.server import create_server
 EXPECTED_TOOLS = {
     "capabilities",
     # Pages
-    "getPageUUID", "inspectPage", "pageStats", "createPage", "renamePage",
+    "getPageUUID", "isTitleAvailable", "inspectPage", "pageStats",
+    "createPage", "renamePage", "retitleOverDuplicate",
     "deletePage",
     "clearPage",
     # Blocks

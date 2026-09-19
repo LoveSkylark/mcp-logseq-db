@@ -86,10 +86,10 @@ the classes have different repairs and two of them are not damage at all.
 | Class | Signature | Repair |
 | --- | --- | --- |
 | **A — dead stub** | 0 own blocks, 0 refs, twin has content | Recycle the stub |
-| **B — split identity** | 0 own blocks, **has refs**, twin has content | Repoint or rebuild (below) |
+| **B — split identity** | 0 own blocks, **has refs**, twin has content | `retitleOverDuplicate`, or repoint/rebuild (below) |
 | **C — genuine split** | Both have own blocks | Stop. Human decision |
 | **D — nested structure** | One is a sub-page of a container | Not damage. Leave |
-| **E — near-title variant** | Titles differ (typo, case, singular/plural) | Usually leave |
+| **E — near-title variant** | Titles differ (typo, case, singular/plural) | `retitleOverDuplicate` |
 
 Class A is the only one safe to repair unattended, and only after both counts
 are confirmed for that specific page.
@@ -103,10 +103,36 @@ A container still looks distinctive — few or zero `own_blocks`, many
 `subtree_blocks`, and `nested_pages` above zero. That combination is ordinary
 structure. Leave it.
 
-Class E cannot usually be fixed by renaming. If the correctly spelled page
-already exists, renaming the typo collides with it and yields a fresh
-duplicate instead of a fix. Tags and pages share one title space, so the same
-collision applies to tags. Report these; do not rename.
+## Class E — near-title variants
+
+This file used to say these "cannot usually be fixed by renaming" and to
+report rather than repair them, on the reasoning that renaming the typo
+collides with the correctly spelled page. **That was wrong.** The collision is
+real but it is avoidable: rename the holder out of the way first, then rename
+onto the freed title.
+
+`retitleOverDuplicate(from_uuid, to_title)` does both renames. `Creatvity` →
+`Creativity` is two calls with the attribute matrix untouched, because
+references are by UUID and a rename does not disturb them. It works even when
+the holder is recycled — renaming a recycled page is what releases its title.
+
+It refuses, and hands back the counts instead, when:
+
+- the holder has content blocks. That is Class C, and merging is your call.
+- the holder is in an ALIAS relation. This one matters: `Abilties` read as an
+  abandoned typo and was a live alias of `Attribute`. An alias is wiring, and
+  parking it changes what resolves where.
+- the title has more than one holder, or the holder is a block, tag or
+  property rather than a page.
+
+**Direction is yours to choose**, and it is not about spelling. Pass the UUID
+of the page the graph is actually wired into. The result reports inbound
+reference counts for both sides so you can check the choice; if the
+misspelled side carries the references, keeping its identity and giving it the
+correct title is the right repair.
+
+Not atomic. If the second rename fails, the holder is left parked and the
+result tells you its UUID and original title so you can put it back.
 
 ## Repairing a split identity (Class B)
 
@@ -116,9 +142,13 @@ user on a blank page while the real material sits elsewhere under the same
 title. Identical creation timestamps across many such pairs indicate one bad
 import rather than user error.
 
-Three routes.
+Three routes, and `retitleOverDuplicate` is usually the first to try: if B is
+empty, giving A the title and parking B is two calls and touches no blocks at
+all. The two routes below are for when B has content, when an alias is
+involved, or when the reference target itself has to change.
 
-**Repoint via placeholders** — the usual choice. De-resolve each reference to
+**Repoint via placeholders** — the usual choice when renaming will not do.
+De-resolve each reference to
 `{{link:A-title}}`, recycle B, then let `repairLinks` resolve them against A.
 
 - Cost: one `updateBlock` per referencing block, one `deletePage`, one

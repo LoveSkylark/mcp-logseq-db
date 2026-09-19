@@ -6,43 +6,7 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
----
 
-### Instruction 4 — `isTitleAvailable(title)` **[pair with 5]**
-
-**Signature:** `isTitleAvailable(title) → {available, held_by?: {uuid, kind, recycled}}`, using the exact check the write path uses.
-
-**Why:** the resolution paths disagree. `getPageUUID("Creativity")` reported free; `renamePage` and `createPage` both reported taken, because they count recycled pages and `getPageUUID` doesn't.
-
-**Addresses:** an inconsistency that caused real damage today. I recycled a page believing the title would be released, discovered mid-repair that it wasn't, and couldn't reverse it.
-
-**Works with:** every rename, every page creation, all duplicate-title repair.
-
-**Implementation:** either reconcile the two paths, or expose this using the writers' rule and document that `getPageUUID` is deliberately recycle-blind. Reporting `recycled: true` in `held_by` is the important part.
-
-**Concerns:** don't "fix" `getPageUUID` to include recycled pages — resolving links to recycled targets would be worse. The two behaviours are both correct; the problem is that neither is discoverable.
-
-**Done when:** it returns `taken, recycled: true` for a title held only by a recycled page.
-
----
-
-### Instruction 5 — `retitleOverDuplicate(from_uuid, to_title)` **[pair with 4]**
-
-**Signature:** `retitleOverDuplicate(from_uuid, to_title, park_suffix?) → {renamed, parked?}`. If `to_title` is held by a page with no content blocks, rename the holder to `"<to_title> <park_suffix>"`, then rename `from_uuid` to `to_title`. Refuse if the holder has content.
-
-**Why:** we discovered today that this two-rename route works, is lossless, needs no reference editing, and — crucially — **a recycled page can be renamed**, which releases its title.
-
-**Addresses:** repair.md's documented Class B/E route is one `updateBlock` per referring block plus `deletePage` plus `repairLinks` — lossier, riskier and more calls. And its Class E guidance ("cannot usually be fixed by renaming; report these, do not rename") is flatly wrong. This route fixed `Creatvity` → `Creativity` in two calls with the attribute matrix untouched.
-
-**Works with:** `Presuade`/`Persuade`, `Activty`/`Activity`, `Flexability`/`Flexibility`, `Loom-Weaver`/`Loom Weaver`, `Cheet Sheet`/`Cheat Sheet`.
-
-**Implementation:** compose two `renamePage` calls. Verify both by UUID. Not atomic — if the second fails, report the parked state explicitly so the caller can undo.
-
-**Concerns:** three real ones. **Refuse when the holder has content blocks** — that's Class C, a human decision. **Refuse when the target is an alias holder** — `Abilties` is a live alias of `Attribute` and I came one step from recycling it. **Direction is a judgement call**: it should follow whichever side is actually wired into the graph, not whichever is spelled correctly, so surface both ref counts and make the caller pass the direction rather than inferring it.
-
-**Done when:** it fixes a typo pair in two calls with zero block edits, and refuses on a content-bearing or alias-holding target.
-
----
 
 ### Instruction 6 — Alias visibility on `pageStats`
 

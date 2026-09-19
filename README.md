@@ -28,17 +28,18 @@ still true.
 `findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
 `getPropertyIndent` · `getProperyUsers`
 
-**Lists** — no arguments, each returns a whole kind
+**Lists** — each returns a whole kind; the two page listings take
+`with_counts`
 
 `listPages` · `listJournals` · `listTags` · `listProperties` ·
 `listClosedValues` · `listOrphanTags` · `listOrphanProperties` · `listAssets` ·
 `listStatus` · `listRecycled`
 
-**Writes** — each verifies by read-back
+**Writes** — each verifies by read-back; each takes `verbose`
 
 `importPage` · `repairLinks` · `createPage` · `renamePage` ·
-`deletePage` · `clearPage` · `createBlock` · `createPageofBlocks` ·
-`updateBlock` · `moveBlock` · `removeBlock` ·
+`retitleOverDuplicate` · `deletePage` · `clearPage` · `createBlock` ·
+`createPageofBlocks` · `updateBlock` · `moveBlock` · `removeBlock` ·
 `creatTag` · `deleteTag` · `addTag` · `removeTag` · `createProperty` ·
 `deleteProperty` · `addProperty` · `removeProperty`
 

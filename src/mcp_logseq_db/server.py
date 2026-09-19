@@ -179,6 +179,18 @@ def create_server(
         return (await content().rename_page(
             page_uuid, new_title)).to_dict(verbose)
 
+    @server.tool(name="retitleOverDuplicate", structured_output=True)
+    async def retitle_over_duplicate(
+        from_uuid: str,
+        to_title: str,
+        park_suffix: str = "(parked)",
+    ) -> dict[str, Any]:
+        """Give a page a title that an EMPTY duplicate is holding, by renaming the holder out of the way and then renaming from_uuid onto it. Two renames, no block edits: references are by UUID, so every inbound link, tag and property value on both pages survives. This also works when the holder is a recycled page -- renaming it is what releases the title. YOU choose the direction: from_uuid keeps its identity and gains the title, and both pages' inbound reference counts are reported so you can check you picked the side the graph is actually wired into. Refuses, with the counts, when the holder has content blocks (merging is your decision), when the holder is in an alias relation (an alias is live wiring, not an abandoned typo), or when the title is held by more than one entity or by a block, tag or property. Not atomic -- if the second rename fails, the parked page's UUID and original title come back with instructions to undo."""
+        from_uuid = require_uuid(
+            from_uuid, role="from_uuid", hint="getPageUUID")
+        return await content().retitle_over_duplicate(
+            from_uuid, to_title, park_suffix=park_suffix)
+
     @server.tool(name="deletePage", structured_output=True)
     async def delete_page(
         page_uuid: str,
@@ -599,6 +611,10 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         ),
         "is_title_available": (
             "Pass a title, not a UUID or an ident."
+        ),
+        "retitle_over_duplicate": (
+            "Pass the UUID of the page that should END UP with the title, "
+            "then the title. The holder is found by title, not passed in."
         ),
         "inspect_page": (
             "Pass an exact page UUID and one of: page, blocks, tags, "

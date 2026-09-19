@@ -55,6 +55,7 @@ validates locally only.
 
 ```
 renamePage(page_uuid, new_title)
+retitleOverDuplicate(from_uuid, to_title, park_suffix="(parked)")
 ```
 
 Verified by UUID. Reading back by the new title would not distinguish a rename
@@ -67,6 +68,23 @@ A title another entity already holds is rejected, for the same reason as
 `createPage` — and on the same recycle-aware check, so a title whose only
 holder is a recycled page is refused. `isTitleAvailable(new_title)` reports
 that before the attempt.
+
+`retitleOverDuplicate` is the way THROUGH that rejection when the holder is an
+empty duplicate. It renames the holder to `"<to_title> (parked)"`, then renames
+`from_uuid` onto the freed title — two renames, no block edits, and every
+inbound reference on both pages intact, since references are by UUID. It works
+on a recycled holder too: renaming a recycled page is what releases its title.
+
+It refuses, returning both pages' inbound reference counts rather than raising,
+when the holder has content blocks, when the holder is in an alias relation, or
+when the title has more than one holder or a non-page holder.
+
+Direction is yours: `from_uuid` keeps its identity and gains the title. Choose
+the side the graph is wired into, not the correctly spelled one, and use the
+reported counts to check.
+
+Not atomic. If the second rename fails, the result carries the parked page's
+UUID and original title with instructions to undo.
 
 ### Deleting
 

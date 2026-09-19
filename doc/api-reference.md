@@ -285,6 +285,7 @@ the error names the level that stopped.
 | `findOrphans(uuid)` | `datascriptQuery` | verified |
 | `createPage(title)` | `createPage` | **verified** |
 | `renamePage(uuid, title)` | `renamePage` | **verified** |
+| `retitleOverDuplicate(uuid, title)` | `renamePage` × 2 | **verified**, not atomic |
 | `deletePage(uuid)` | `deletePage` | **verified — recycles; UUID tried first, name second** |
 | `clearPage(uuid)` | `removeBlock`, looped | **verified** |
 | `importPage(target, markdown)` | `insertBatchBlock` + `datascriptQuery` | **verified** |
@@ -380,6 +381,38 @@ Declared-but-unset properties, via the page's classes:
 ```json
 {"method": "logseq.DB.datascriptQuery", "args": ["[:find (pull ?c [:db/ident :block/title]) (pull ?prop [:db/id :db/ident :block/title :logseq.property/type]) :in $ ?page :where [?page :block/tags ?c] [?c :logseq.property.class/properties ?prop]]", 846]}
 ```
+
+---
+
+### Taking a title back from an empty duplicate
+
+A rename cannot land on a title another entity holds, and recycling the holder
+does not release it. But a rename can MOVE the holder out of the way first, and
+a recycled page can be renamed — which is what finally releases its title. So
+`retitleOverDuplicate` is two `renamePage` calls:
+
+```json
+{"method": "logseq.DB.renamePage", "args": ["$HOLDER_UUID", "$TITLE (parked)"]}
+```
+```json
+{"method": "logseq.DB.renamePage", "args": ["$FROM_UUID", "$TITLE"]}
+```
+
+No block is touched. References are stored as entity ids, so every inbound
+link, tag and property value on both pages is unaffected by either rename —
+which is why this is cheaper and less lossy than de-resolving references,
+deleting a page and re-resolving.
+
+The guards are reads: block counts for the holder, and an alias check in both
+directions, since an alias is live resolution wiring rather than an abandoned
+duplicate.
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find [?holder ...] :in $ ?target :where [?holder :block/alias ?target]]", 846]}
+```
+
+Not atomic: the two renames are separate transactions, so a failure on the
+second leaves the holder parked.
 
 ---
 

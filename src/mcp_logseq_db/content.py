@@ -1283,6 +1283,223 @@ class VerifiedContent(VerifiedWriteHelpers):
                    if preserved else "")),
             previous_entities=tuple(before))
 
+    @serialized_write
+    async def retitle_over_duplicate(
+        self,
+        from_uuid: str,
+        to_title: str,
+        *,
+        park_suffix: str = "(parked)",
+    ) -> dict[str, Any]:
+        """
+        Give a page a title an empty duplicate is holding, by parking the
+        holder out of the way first.
+
+        TWO RENAMES, NOTHING ELSE. References are by UUID, so neither page's
+        inbound links, tags or property values are touched: the typo fix that
+        the documented route did as one `updateBlock` per referring block plus
+        a `deletePage` plus a `repairLinks` sweep is two calls here, and
+        lossless. A recycled page can be renamed, which is what releases its
+        title -- so this works on the recycle-held titles that `getPageUUID`
+        reports as free.
+
+        DIRECTION IS THE CALLER'S. Which side keeps the title is a judgement
+        about which one the graph is actually wired into, not about which is
+        spelled correctly, so it is never inferred: `from_uuid` keeps its
+        identity and gains the title. Both pages' inbound reference counts are
+        reported either way, including on a refusal, because that is the
+        evidence the judgement needs.
+
+        REFUSALS, all reported rather than raised, since each hands back
+        something the caller has to decide about:
+
+          - the holder has content blocks. Merging content is a human
+            decision and this tool will not make it.
+          - the holder is in an alias relation. An alias is live wiring: one
+            near-miss here was a page that looked like an abandoned typo and
+            was a working alias of the page it resembled.
+          - more than one entity holds the title, or the holder is a block,
+            tag or property rather than a page. Parking is a page rename.
+
+        NOT ATOMIC. If the second rename fails the first stands, so the
+        parked page's UUID and original title are reported explicitly and the
+        diagnostic says how to put it back.
+        """
+        from_uuid = self._require_entity(self._validated_uuid(from_uuid))
+        self._require_title(to_title)
+        if not isinstance(park_suffix, str) or not park_suffix.strip():
+            raise ValueError("park_suffix must be a non-empty string")
+
+        source = await self._page_by_uuid(from_uuid)
+        holders = [e for e in await self._entities_by_title(to_title)
+                   if e["id"] != source["id"]]
+
+        def report(
+            *,
+            verified: bool,
+            diagnostic: str,
+            renamed: dict[str, Any] | None = None,
+            parked: dict[str, Any] | None = None,
+            references: dict[str, int] | None = None,
+        ) -> dict[str, Any]:
+            return {
+                "verified": verified,
+                "from_uuid": from_uuid,
+                "to_title": to_title,
+                "renamed": renamed,
+                "parked": parked,
+                "references": references or {},
+                "diagnostic": diagnostic,
+            }
+
+        if len(holders) > 1:
+            return report(
+                verified=False,
+                diagnostic=(
+                    f"{len(holders)} entities hold {to_title!r}. Parking one "
+                    "would leave the others holding it, so this is not a "
+                    "duplicate pair -- resolve it with isTitleAvailable and "
+                    "decide per holder."))
+
+        if not holders:
+            # Nothing to park. A plain rename is the whole operation, and
+            # rename_page already refuses a clash and verifies by UUID.
+            result = await self.rename_page(from_uuid, to_title)
+            return report(
+                verified=result.verified,
+                renamed=self._retitle_state(result, source),
+                diagnostic=(
+                    f"No entity held {to_title!r}, so nothing was parked and "
+                    "this was a plain rename."
+                    if result.verified else
+                    result.diagnostic or "The rename was not observed."))
+
+        holder = holders[0]
+        kind = (await self._title_holder_kinds([holder]))[0]
+        if kind != "page":
+            return report(
+                verified=False,
+                diagnostic=(
+                    f"{to_title!r} is held by a {kind}, not a page. Parking "
+                    "is a page rename, and pages, tags, blocks and "
+                    "properties share one title space -- so this clash needs "
+                    "a different remedy."))
+
+        # Counts for both sides in one pass: the guard, and the evidence for
+        # the direction the caller chose.
+        own, empty, refs = await self._count_indexes(
+            [holder["id"], source["id"]])
+        references = {
+            "from": refs.get(source["id"], 0),
+            "holder": refs.get(holder["id"], 0),
+        }
+        holder_content = own.get(holder["id"], 0) - empty.get(holder["id"], 0)
+
+        aliases = await self._alias_relations(holder)
+        if aliases["aliases"] or aliases["aliased_by"]:
+            return report(
+                verified=False,
+                references=references,
+                diagnostic=(
+                    f"{to_title!r} is held by a page in an ALIAS relation "
+                    f"({len(aliases['aliases'])} alias(es), "
+                    f"{len(aliases['aliased_by'])} page(s) aliasing it). An "
+                    "alias is live wiring, not an abandoned duplicate: "
+                    "parking or recycling it changes what resolves where. "
+                    "Report this and stop."))
+
+        if holder_content:
+            return report(
+                verified=False,
+                references=references,
+                diagnostic=(
+                    f"{to_title!r} is held by a page with {holder_content} "
+                    "content block(s). Moving the title would leave that "
+                    "content under a parked name, and merging it is a human "
+                    "decision -- read both pages and choose."))
+
+        parked_title = f"{to_title} {park_suffix.strip()}"
+        if await self._entities_by_title(parked_title):
+            return report(
+                verified=False,
+                references=references,
+                diagnostic=(
+                    f"The parking title {parked_title!r} is itself taken. "
+                    "Pass a different park_suffix."))
+
+        park = await self.rename_page(holder["uuid"], parked_title)
+        if not park.verified:
+            return report(
+                verified=False,
+                references=references,
+                diagnostic=(
+                    "The holder could not be parked, so nothing was changed. "
+                    + (park.diagnostic or "")))
+
+        rename = await self.rename_page(from_uuid, to_title)
+        parked_state = self._retitle_state(park, holder)
+        if not rename.verified:
+            return report(
+                verified=False,
+                parked=parked_state,
+                references=references,
+                diagnostic=(
+                    f"PARTIALLY APPLIED. {to_title!r} was freed by parking "
+                    f"its holder as {parked_title!r}, but the rename of "
+                    f"{from_uuid} did not take effect. To undo, rename "
+                    f"{holder['uuid']} back to {to_title!r}. "
+                    + (rename.diagnostic or "")))
+
+        return report(
+            verified=True,
+            renamed=self._retitle_state(rename, source),
+            parked=parked_state,
+            references=references,
+            diagnostic=(
+                f"Two renames, no block edits. References are by UUID, so "
+                f"every inbound link, tag and property value on both pages "
+                f"survived -- {references['from']} on the renamed page and "
+                f"{references['holder']} on the parked one, now displaying "
+                f"the parked title. The parked page still exists; recycle it "
+                "only after checking findBacklinks."))
+
+    @staticmethod
+    def _retitle_state(
+        result: ContentResult, before: dict[str, Any]
+    ) -> dict[str, Any]:
+        after = result.verified_entities[0] if result.verified_entities else {}
+        return {
+            "uuid": before.get("uuid"),
+            "previous_title": before.get("title"),
+            "title": after.get("title"),
+            "recycled": before.get(":logseq.property/deleted-at") is not None,
+        }
+
+    async def _alias_relations(
+        self, page: dict[str, Any]
+    ) -> dict[str, list[int]]:
+        """
+        Alias relations in both directions.
+
+        Both matter: a page may alias others, or be the alias another page
+        points at. Either way it is wired into resolution, and a title that
+        looks like an abandoned typo may be a working alias of the page it
+        resembles.
+        """
+        incoming = await self._query_list(
+            "[:find [?holder ...] :in $ ?target :where "
+            "[?holder :block/alias ?target]]",
+            "Alias holder lookup", page["id"])
+        declared = page.get("alias")
+        declared = declared if isinstance(declared, list) else [declared]
+        return {
+            "aliased_by": [v for v in incoming if isinstance(v, int)],
+            "aliases": [
+                self._reference_id(a) for a in declared
+                if self._reference_id(a) is not None
+            ],
+        }
+
     async def _page_by_uuid(self, page_uuid: str) -> dict[str, Any]:
         page = await self._entity_by_uuid(page_uuid)
         if not page.get("name"):
