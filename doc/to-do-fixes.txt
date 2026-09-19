@@ -1,0 +1,255 @@
+# MCP Tool Improvement Plan
+
+Ordered so each instruction is independently shippable. Phase 1 is cheap and safe; Phase 2 is where the real cost savings are; Phase 3 needs upstream verification first. Two pairs are marked where splitting them makes no sense.
+
+Every item traces to something that actually cost us in this session, noted under *Evidence*.
+
+---
+
+## Phase 1 — Low-hanging fruit
+
+### Instruction 1 — `placement: "last-child"` on `moveBlock`
+
+**Signature:** add `"last-child"` to the existing `placement` enum.
+
+**Why:** `child` prepends. There is currently no way to append to a page or parent without first knowing the last sibling's UUID, which costs a read. Worse, the default behaviour silently reverses a sequence when you move siblings left-to-right.
+
+**Addresses:** a footgun with no safe alternative. Not a documentation gap — no amount of documentation makes "the obvious call reverses your content" acceptable.
+
+**Works with:** every journal-to-page migration; any multi-block relocation.
+
+**Implementation:** compute the max `:block/order` among the target's children and generate a key after it. The fractional-index logic already exists for `after`.
+
+**Concerns:** none material. Purely additive; existing `child` semantics unchanged. Keep `child` as-is rather than redefining it, or you break callers.
+
+**Done when:** moving three blocks in source order with `last-child` yields source order at the destination.
+
+**Evidence:** reversed content on three pages before I noticed the `Zz` < `a0` ordering. Cost 3 repair calls plus the reading to detect it.
+
+---
+
+### Instruction 2 — Terse response mode
+
+**Signature:** `verbose?: boolean` (default `true` for compatibility) on every write tool. When false, return `{verified, uuid, parent, page, order, diagnostic}` only.
+
+**Why:** every write echoes the full entity twice — `previous_entities` and `verified_entities` — including complete block text. Read-back verification is right; echoing it back is not.
+
+**Addresses:** the single largest cost in this session. Two moves of long prose blocks consumed more budget than twenty moves of short ones.
+
+**Works with:** `moveBlock` above all, then `updateBlock`, `addTag`, `createBlock`. `clearPage` especially — it returned the full text of 38 deleted blocks.
+
+**Implementation:** response shaping only. No change to the verification path — still read back and compare, just don't serialise the payload.
+
+**Concerns:** `clearPage`'s verbose output turned out to be *useful* — it let me diff my transcription against the originals after import. So make terse opt-in per call, not a global default, and consider keeping `clearPage` verbose by default since its payload is the only record of what was destroyed.
+
+**Done when:** a `moveBlock` on a 400-word block returns under ~200 tokens.
+
+**Evidence:** this is why chained `moveBlock` became unaffordable for the Feb 2026 rewrite and we took the import route with its transcription risk. Fix this and that trade-off disappears.
+
+---
+
+### Instruction 3 — `listJournals(with_counts: true)`
+
+**Signature:** add `with_counts?: boolean`; when set, each entry carries `own_blocks`, `content_blocks`, `refs`.
+
+**Why:** triaging which journals hold content currently costs one `pageStats` per journal.
+
+**Addresses:** pure call-count waste on the most common opening move of any migration.
+
+**Works with:** journal triage; would extend naturally to `listPages`.
+
+**Implementation:** one query joining journals to block counts, rather than N round trips.
+
+**Concerns:** on a large graph `listPages(with_counts)` could get slow — cap it or paginate. Keep it opt-in so the cheap listing stays cheap.
+
+**Done when:** one call replaces ~50.
+
+**Evidence:** I spent roughly 50 `pageStats` calls this session purely deciding which journals were worth reading.
+
+---
+
+### Instruction 4 — `isTitleAvailable(title)` **[pair with 5]**
+
+**Signature:** `isTitleAvailable(title) → {available, held_by?: {uuid, kind, recycled}}`, using the exact check the write path uses.
+
+**Why:** the resolution paths disagree. `getPageUUID("Creativity")` reported free; `renamePage` and `createPage` both reported taken, because they count recycled pages and `getPageUUID` doesn't.
+
+**Addresses:** an inconsistency that caused real damage today. I recycled a page believing the title would be released, discovered mid-repair that it wasn't, and couldn't reverse it.
+
+**Works with:** every rename, every page creation, all duplicate-title repair.
+
+**Implementation:** either reconcile the two paths, or expose this using the writers' rule and document that `getPageUUID` is deliberately recycle-blind. Reporting `recycled: true` in `held_by` is the important part.
+
+**Concerns:** don't "fix" `getPageUUID` to include recycled pages — resolving links to recycled targets would be worse. The two behaviours are both correct; the problem is that neither is discoverable.
+
+**Done when:** it returns `taken, recycled: true` for a title held only by a recycled page.
+
+---
+
+### Instruction 5 — `retitleOverDuplicate(from_uuid, to_title)` **[pair with 4]**
+
+**Signature:** `retitleOverDuplicate(from_uuid, to_title, park_suffix?) → {renamed, parked?}`. If `to_title` is held by a page with no content blocks, rename the holder to `"<to_title> <park_suffix>"`, then rename `from_uuid` to `to_title`. Refuse if the holder has content.
+
+**Why:** we discovered today that this two-rename route works, is lossless, needs no reference editing, and — crucially — **a recycled page can be renamed**, which releases its title.
+
+**Addresses:** repair.md's documented Class B/E route is one `updateBlock` per referring block plus `deletePage` plus `repairLinks` — lossier, riskier and more calls. And its Class E guidance ("cannot usually be fixed by renaming; report these, do not rename") is flatly wrong. This route fixed `Creatvity` → `Creativity` in two calls with the attribute matrix untouched.
+
+**Works with:** `Presuade`/`Persuade`, `Activty`/`Activity`, `Flexability`/`Flexibility`, `Loom-Weaver`/`Loom Weaver`, `Cheet Sheet`/`Cheat Sheet`.
+
+**Implementation:** compose two `renamePage` calls. Verify both by UUID. Not atomic — if the second fails, report the parked state explicitly so the caller can undo.
+
+**Concerns:** three real ones. **Refuse when the holder has content blocks** — that's Class C, a human decision. **Refuse when the target is an alias holder** — `Abilties` is a live alias of `Attribute` and I came one step from recycling it. **Direction is a judgement call**: it should follow whichever side is actually wired into the graph, not whichever is spelled correctly, so surface both ref counts and make the caller pass the direction rather than inferring it.
+
+**Done when:** it fixes a typo pair in two calls with zero block edits, and refuses on a content-bearing or alias-holding target.
+
+---
+
+### Instruction 6 — Alias visibility on `pageStats`
+
+**Signature:** add `is_alias_of?: uuid` and `aliases?: uuid[]`.
+
+**Why:** nothing in the counts reveals that a page is a functioning alias. I found `Abilties` only because `findBacklinks` happened to show a property holder.
+
+**Addresses:** a silent data-loss path. An empty page with one ref looks exactly like a dead stub and is one `deletePage` from breaking a working alias — and `alias` is a built-in property outside the sandbox, so you can't repair it afterwards.
+
+**Works with:** all duplicate triage. `Mechanics` also carries two aliases.
+
+**Implementation:** read `:logseq.property/alias` in both directions.
+
+**Concerns:** also make `deletePage` refuse on an alias holder without an explicit acknowledgement, the way it does for references. Stats alone rely on the caller looking.
+
+**Done when:** `pageStats` on `Abilties` shows its alias relationship to `Attribute`.
+
+---
+
+## Phase 2 — Highest value
+
+### Instruction 7 — `moveBlocks(block_uuids[], target_uuid, placement)`
+
+**Signature:** relocate a list in the given order in one call; return per-block `{uuid, verified}` plus a summary.
+
+**Why:** flat sibling runs are the dominant shape in this graph. Feb 10th is 115 of them, Feb 11th 31, Feb 28th 17. One call per block is the wrong granularity.
+
+**Addresses:** exactly your "cost lives at the tool boundary" principle — this is the one bulk write still missing.
+
+**Works with:** journal-to-page migration, which was essentially the entire job today.
+
+**Implementation:** iterate internally using the `last-child` logic from Instruction 1 to preserve order; verify each; return one summary. Depends on Instruction 1.
+
+**Concerns:** **not atomic** — a mid-list failure leaves a partially moved chapter, the state I flagged as worse than not starting. So report exactly which UUIDs landed, and consider an `all_or_nothing` mode that moves them back on failure. Cap the batch and paginate rather than risking a 4-minute client timeout on 115 blocks.
+
+**Done when:** a 31-block chapter moves in one call, in order, byte-exact.
+
+**Evidence:** this plus Instruction 2 would have let the entire Feb 2026 rewrite move byte-exact in a handful of calls. I'd never have needed `importPage`, and the 5,500-word retyping risk would not have existed.
+
+---
+
+### Instruction 8 — `searchBlocks(text, page_uuid?, limit?)`
+
+**Signature:** substring or regex match over block titles; return `{uuid, page, title, order}`.
+
+**Why:** there is no way to find a string in the graph.
+
+**Addresses:** I logged a dozen block-level typos — `Opions`, `Agressive`, `Advanatage`, `Benifit`, `Initive`, `fufill`, `Campaing`, `Sesion Zero`, `Eqipment`, a stray `麻木` mid-sentence — and then could not fix them, because locating them again meant re-reading whole pages whose content had aged out of my context. The tool that could edit them existed; the tool to find them didn't.
+
+**Works with:** typo sweeps, duplicate-content detection, provenance checks (finding the DC20 and *Righteous Blood* material), and verifying an import matched its source.
+
+**Implementation:** Datascript predicate over `:block/title`. Return terse rows, not full entities.
+
+**Concerns:** predicates run in Logseq's DB worker and can wedge it, per your own troubleshooting notes — so single-attempt, no retry, and a mandatory `limit`. A large result set can also silently return `[]` at scale; return a count alongside results so the caller can tell "no matches" from "too many".
+
+**Done when:** `searchBlocks("Opions")` returns the block and its page in one call.
+
+---
+
+### Instruction 9 — `importPage` multi-line blocks
+
+**Signature:** accept `markdown` as `string[]` where each element is one block, or support a `---` / blank-line delimiter.
+
+**Why:** the line-based format cannot express a block containing newlines.
+
+**Addresses:** your 8-step Resolution Sequence is one block with eight embedded newlines. Import would either break it into eight blocks or mangle it, so it needed a `createBlock` fallback mid-import.
+
+**Works with:** any import of real manuscript content — numbered lists, markdown tables, code blocks.
+
+**Implementation:** `createBlock` already accepts embedded newlines and preserves them, so the storage layer is fine. This is purely the input format.
+
+**Concerns:** keep the existing line format working. Indentation-as-structure gets ambiguous with multi-line values, so require explicit depth in the array form rather than inferring it.
+
+**Done when:** an 8-line numbered list imports as one block.
+
+---
+
+## Phase 3 — Valuable, but verify upstream first
+
+### Instruction 10 — `purgeRecycled(uuid)` and `restorePage(uuid)` **[pair]**
+
+**Why:** recycling is currently one-way from the API. There's no purge and no restore.
+
+**Addresses:** it dead-ended a live repair today. Once I'd recycled `Creativity` I could neither bring it back nor clear it, and had to hand off to the UI mid-job.
+
+**Works with:** all duplicate repair; cleanup after any mistaken delete.
+
+**Concerns:** **check the Logseq API actually exposes these before scheduling the work** — `deleteTag` is already documented as an unverified route, and this may be the same situation. `purgeRecycled` is the only genuinely irreversible operation in the whole toolset, so it needs the strongest acknowledgement and a mandatory `findBacklinks` report first. Note that Instruction 5 makes this *less* urgent: renaming the recycled page out of the way now solves the title problem without purging.
+
+**Done when:** a recycled page can be restored to `listPages`, and purge refuses without acknowledgement.
+
+---
+
+### Instruction 11 — `findDuplicateTitles(normalize?)` **[pair with 4]**
+
+**Why:** I eyeballed 330 titles for near-matches. That doesn't scale and it misses things.
+
+**Addresses:** the natural front end to repair.md's Class A–E triage. Should return, per pair, both content counts, both ref counts, and alias status — so classification happens before any write.
+
+**Works with:** every duplicate repair; a periodic graph audit.
+
+**Implementation:** normalised grouping — case, whitespace, punctuation, singular/plural, small edit distance. Include tags, since tags and pages share one title space.
+
+**Concerns:** edit distance will produce false positives on legitimately distinct short titles (`Thread`/`Threads`, `Maneuver`/`Maneuvers` may both be intentional). Report and rank; never act. Must surface alias status or it'll recommend deleting working aliases — the `Abilties` trap.
+
+**Done when:** it groups the known pairs and flags `Abilties` as an alias rather than a duplicate.
+
+---
+
+### Instruction 12 — `splitBlock(uuid, offset | delimiter)`
+
+**Why:** `updateBlock` is title-only, so there's no inverse of a merge.
+
+**Addresses:** the Feb 28th mechanics summary has headings fused onto the tail of the preceding paragraph — `"…both dice succeed [1]\n\n**Modifiers:**"`. "Modifiers:", "Equipment:" and "Special Effects Die:" are all trapped mid-block and can't be promoted to their own headings.
+
+**Works with:** cleaning up any pasted or generated content, which is a large share of this graph.
+
+**Implementation:** `updateBlock` the original to the first part, `createBlock` the remainder, `moveBlock` it to `after`. Composition of existing primitives.
+
+**Concerns:** not atomic — a failure between steps leaves truncated text, which is data loss in the user's prose. Do the create before the truncate so the content exists twice at the worst moment, never zero times.
+
+**Done when:** a two-part block splits into two correctly ordered blocks with no text lost.
+
+---
+
+### Instruction 13 — `migratePage(source_page, target_page, filter?)`
+
+**Why:** journal-to-page migration was the whole job and has no primitive.
+
+**Addresses:** the complete workflow — enumerate top-level blocks, move them in order, verify, report what's left.
+
+**Works with:** the remaining Feb 10th and Feb 11th chapters; any future journal cleanup.
+
+**Implementation:** build on Instruction 7. Do this last — it's a convenience wrapper, and it's only worth writing once the batch move underneath it is solid.
+
+**Concerns:** don't let it decide *what* to migrate. Placement judgement — which cluster belongs on which page — was the irreducibly human part of this session, and the one the tool shouldn't touch. Keep it mechanical: "move these blocks there", not "work out where this belongs".
+
+---
+
+## Cross-cutting concerns
+
+**Document the two behaviours we found the hard way.** Recycled pages can be renamed and this releases the title; `getPageUUID` and the write path disagree on recycled titles. Both contradict the current reference files, and both caused mistakes today. Also correct write-workflows' stale "There is **no move**. No route exists for it" and data-modeling's "No block movement — yet."
+
+**Keep verification, cut the echo.** The read-back-and-compare discipline is the best thing about this toolset and caught real failures. Instruction 2 targets the response size, not the checking.
+
+**Prefer additive changes.** Every item here is a new tool, a new enum value, or a new optional parameter. Nothing redefines existing behaviour, so nothing needs a coordinated client update.
+
+**Sequencing:** 1 → 2 → 7 unlocks the most, in that order. Instruction 1 is a prerequisite for 7; 7 is a prerequisite for 13. Everything else is independent.
+
+I can put this in a document if you want it outside the chat.

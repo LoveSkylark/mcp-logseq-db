@@ -37,9 +37,11 @@ from .markdown import (
     parse_markdown,
     restore_reference,
 )
+from .mutations import VerifiedMutations
 
 # Above this, a repair is more likely a broken import than an intention.
 DEFAULT_MAX_PAGES_TO_CREATE = 5
+DEFAULT_MAX_TAGS_TO_CREATE = 5
 # Distance for "did you mean" against existing titles.
 NEAR_MISS_CUTOFF = 0.82
 
@@ -66,6 +68,7 @@ class VerifiedImport(VerifiedWriteHelpers):
     def __init__(self, client: LogseqDBClient) -> None:
         self._client = client
         self._content = VerifiedContent(client)
+        self._mutations = VerifiedMutations(client)
 
     # ------------------------------------------------------------- import
 
@@ -107,15 +110,23 @@ class VerifiedImport(VerifiedWriteHelpers):
         if replace:
             await self._content.clear_page(page_uuid)
 
+        # Baseline BEFORE inserting, so verification measures the delta this
+        # import produced rather than an absolute total. An absolute count
+        # cannot work here: createPage seeds every new page with one empty
+        # block, so the total is always one higher than the markdown accounts
+        # for. The previous guard papered over that by clamping `expected`
+        # down to whatever was already present, which made the append check
+        # vacuously true -- a silent no-op verified exactly like a successful
+        # import.
+        before = len(await self._content.get_block_uuid(page_uuid))
+
         calls = await self._insert_tree(page_uuid, parsed.blocks)
 
-        # Verified by count against a parent-walking read, so a block whose
-        # owning page came out wrong is still counted and the mismatch shows.
+        # Counted by a parent-walking read, so a block whose owning page came
+        # out wrong is still counted and the mismatch shows.
         present = await self._content.get_block_uuid(page_uuid)
+        gained = len(present) - before
         expected = parsed.block_count()
-        if not replace:
-            # Appending, so only the delta is ours to account for.
-            expected = min(expected, len(present))
 
         notes = list(parsed.warnings)
         if parsed.page_properties:
@@ -131,7 +142,7 @@ class VerifiedImport(VerifiedWriteHelpers):
                 "run repairLinks once their targets exist")
 
         return ImportResult(
-            verified=len(present) >= expected,
+            verified=gained >= expected,
             page_uuid=page_uuid,
             page_title=page.get("title"),
             created_page=created,
@@ -142,10 +153,12 @@ class VerifiedImport(VerifiedWriteHelpers):
             page_properties=parsed.page_properties,
             warnings=tuple(notes),
             diagnostic=(
-                None if len(present) >= expected else
-                f"Expected at least {expected} blocks on the page, found "
-                f"{len(present)}. The import is partial; batches are not "
-                "atomic, so earlier levels are committed."))
+                None if gained >= expected else
+                f"Expected this import to add {expected} block(s); the page "
+                f"went from {before} to {len(present)}, a gain of {gained}. "
+                "The import is partial; batches are not atomic, so earlier "
+                "levels are committed. Audit with findOrphans and pageStats "
+                "rather than retrying, which would duplicate what landed."))
 
     async def _resolve_target(self, target: str) -> tuple[dict[str, Any], bool]:
         """
@@ -220,7 +233,9 @@ class VerifiedImport(VerifiedWriteHelpers):
         *,
         create_missing: bool = False,
         acknowledge_page_creation: bool = False,
+        acknowledge_tag_creation: bool = False,
         max_pages_to_create: int = DEFAULT_MAX_PAGES_TO_CREATE,
+        max_tags_to_create: int = DEFAULT_MAX_TAGS_TO_CREATE,
         include_tags: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
@@ -259,6 +274,14 @@ class VerifiedImport(VerifiedWriteHelpers):
         resolved, missing, ambiguous = await self._resolve_names(wanted_links)
         near = await self._near_misses(missing)
 
+        # Tags are resolved on the same terms as links. Before this, the tag
+        # branch rewrote every placeholder unchecked: Logseq mints a tag for
+        # any #name it parses, so a name that did not exist was created
+        # silently, appeared in no bucket of the result, and was not gated by
+        # create_missing -- which reads as approval for pages only.
+        tags_resolved, tags_missing, tags_ambiguous = (
+            await self._resolve_tag_names(wanted_tags))
+
         if missing and create_missing:
             if not acknowledge_page_creation:
                 return {
@@ -284,6 +307,30 @@ class VerifiedImport(VerifiedWriteHelpers):
                         "Raise max_pages_to_create deliberately if it is not."),
                 }
 
+        if tags_missing and create_missing:
+            if not acknowledge_tag_creation:
+                return {
+                    "verified": False,
+                    "would_create_tags": sorted(tags_missing),
+                    "diagnostic": (
+                        f"{len(tags_missing)} tag(s) do not exist and would "
+                        "be created: " + ", ".join(sorted(tags_missing))
+                        + ". Set acknowledge_tag_creation=true to proceed, "
+                        "or leave it unset and these placeholders stay in "
+                        "place. acknowledge_page_creation does NOT cover "
+                        "tags -- they are a separate entity kind."),
+                }
+            if len(tags_missing) > max_tags_to_create:
+                return {
+                    "verified": False,
+                    "would_create_tags": sorted(tags_missing),
+                    "diagnostic": (
+                        f"{len(tags_missing)} tags would be created, above "
+                        f"the limit of {max_tags_to_create}. Raise "
+                        "max_tags_to_create deliberately if that is "
+                        "intended."),
+                }
+
         if dry_run:
             return {
                 "verified": False,
@@ -294,8 +341,17 @@ class VerifiedImport(VerifiedWriteHelpers):
                 "missing": sorted(missing),
                 "ambiguous": sorted(ambiguous),
                 "did_you_mean": near,
-                "tags": sorted(wanted_tags),
-                "diagnostic": "Dry run: nothing was written.",
+                "tags_resolved": sorted(tags_resolved),
+                "tags_missing": sorted(tags_missing),
+                "tags_ambiguous": sorted(tags_ambiguous),
+                "would_create_tags": (
+                    sorted(tags_missing) if create_missing else []),
+                "diagnostic": (
+                    "Dry run: nothing was written."
+                    + (f" {len(tags_missing)} tag(s) do not exist; they "
+                       "would be skipped unless create_missing and "
+                       "acknowledge_tag_creation are both set."
+                       if tags_missing else "")),
             }
 
         if missing and create_missing and acknowledge_page_creation:
@@ -305,8 +361,18 @@ class VerifiedImport(VerifiedWriteHelpers):
                     resolved.add(name)
             missing = {n for n in missing if n not in resolved}
 
+        if tags_missing and create_missing and acknowledge_tag_creation:
+            for name in sorted(tags_missing):
+                result = await self._mutations.create_tag(name)
+                if result.verified:
+                    tags_resolved.add(name)
+            tags_missing = {n for n in tags_missing if n not in tags_resolved}
+
+        # Only resolved tags are handed to the rewrite, so an unresolved name
+        # keeps its placeholder rather than being minted on write.
         updated, refs_created, unverified = await self._rewrite(
-            blocks_by_page, resolved, wanted_tags if include_tags else set())
+            blocks_by_page, resolved,
+            tags_resolved if include_tags else set())
 
         return {
             "verified": not unverified,
@@ -317,6 +383,9 @@ class VerifiedImport(VerifiedWriteHelpers):
             "missing": sorted(missing),
             "ambiguous": sorted(ambiguous),
             "did_you_mean": near,
+            "tags_resolved": sorted(tags_resolved),
+            "tags_missing": sorted(tags_missing),
+            "tags_ambiguous": sorted(tags_ambiguous),
             "unverified": unverified,
             "diagnostic": (
                 f"Repaired {updated} block(s)."
@@ -324,7 +393,13 @@ class VerifiedImport(VerifiedWriteHelpers):
                    "placeholders were left in place."
                    if missing else "")
                 + (f" {len(ambiguous)} name(s) matched more than one page and "
-                   "were skipped rather than guessed." if ambiguous else "")),
+                   "were skipped rather than guessed." if ambiguous else "")
+                + (f" {len(tags_missing)} tag(s) do not exist and were "
+                   "skipped rather than created; their placeholders were "
+                   "left in place." if tags_missing else "")
+                + (f" {len(tags_ambiguous)} tag name(s) matched more than "
+                   "one tag and were skipped rather than guessed."
+                   if tags_ambiguous else "")),
         }
 
     async def _pages_with_placeholders(
@@ -365,6 +440,30 @@ class VerifiedImport(VerifiedWriteHelpers):
             elif result.get("candidates"):
                 # Never pick a write target from a fuzzy match: repairing a
                 # link to the wrong page is silent damage.
+                ambiguous.add(name)
+            else:
+                missing.add(name)
+        return resolved, missing, ambiguous
+
+    async def _resolve_tag_names(
+        self, names: set[str]
+    ) -> tuple[set[str], set[str], set[str]]:
+        """
+        The tag counterpart of `_resolve_names`.
+
+        Tag titles are not unique -- the random suffix lives in the ident --
+        so `get_tag_uuid` reports an ambiguous title as not found, with
+        candidates. Treat that as ambiguous rather than missing: creating a
+        third tag of the same title would be the worst available outcome.
+        """
+        resolved: set[str] = set()
+        missing: set[str] = set()
+        ambiguous: set[str] = set()
+        for name in names:
+            result = await self._mutations.get_tag_uuid(name)
+            if result.get("found"):
+                resolved.add(name)
+            elif result.get("candidates"):
                 ambiguous.add(name)
             else:
                 missing.add(name)

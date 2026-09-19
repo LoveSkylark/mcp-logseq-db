@@ -83,8 +83,12 @@ class FakeClient:
 
     async def call(self, method: str, args: list[Any]) -> Any:
         self.calls.append((method, args))
-        if method == "logseq.DB.upsertNodes":
-            return self._upsert(*args)
+        if method == "logseq.DB.createPage":
+            return self._create_page(*args)
+        if method == "logseq.DB.getPage":
+            return self._get_page(*args)
+        if method == "logseq.DB.updateBlock":
+            return self._update_block(*args)
         if method == "logseq.DB.insertBlock":
             return self._insert_block(*args)
         if method == "logseq.DB.insertBatchBlock":
@@ -95,36 +99,50 @@ class FakeClient:
             return self._move(*args)
         if method == "logseq.DB.datascriptQuery":
             return self._query(args[0], args[1:])
+        # upsertNodes is deliberately NOT handled: it fails on synced graphs
+        # and nothing routes through it any more. A call here means something
+        # regressed.
         raise AssertionError(f"unexpected method {method}")
 
-    def _upsert(self, operations, options):
-        # TWO arguments. The options map is required -- sending one argument
-        # makes every write fail with "The Imported EDN has 4 validation
-        # error(s)". The fake enforces the arity so dropping it again fails
-        # here rather than on a live graph.
-        if options.get("dry-run"):
-            return "Dry run: ok"
+    def _create_page(self, title, properties=None):
+        """Idempotent on title -- a repeat returns the existing page rather
+        than creating a duplicate. Creates one empty first block, as the real
+        method does.
+
+        The second argument is a PROPERTIES map, not options: passing
+        {"dry-run": true} creates the page anyway and mints a property.
+        """
         if not self.write_effective:
-            return None          # the silent no-op
-        for op in operations:
-            if op["operation"] == "edit":
-                # Replace rather than mutate: the real client returns a fresh
-                # dict per call, so an in-place edit would let a caller's
-                # earlier snapshot alias the updated entity.
-                current = self.graph.entities[op["id"]]
-                self.graph.entities[op["id"]] = {
-                    **current, "title": op["data"]["title"]}
-                continue
-            data = op["data"]
-            if op["entityType"] == "page":
-                self.graph.add(data["title"], None, None,
-                               name=data["title"].lower(), tags=[PAGE_CLASS_ID])
-                continue
-            parent = self.graph.entities[data["page-id"]]
-            page = (parent["id"] if parent.get("name")
-                    else parent["page"]["id"])
-            self.graph.add(data["title"], parent["id"], page)
-        return {"block": len(operations)}
+            return None
+        existing = next(
+            (e for e in self.graph.entities.values()
+             if e.get("name") == str(title).lower()), None)
+        if existing is not None:
+            return dict(existing)
+        page = self.graph.add(title, None, None, name=str(title).lower(),
+                              tags=[PAGE_CLASS_ID], extra=properties or None)
+        self.graph.add("", page["id"], page["id"])
+        return dict(page)
+
+    def _get_page(self, identifier):
+        """Accepts a name OR a uuid, and returns recycled pages -- both
+        behaviours the caller has to compensate for."""
+        found = self.graph.entities.get(identifier)
+        if found is None:
+            found = next(
+                (e for e in self.graph.entities.values()
+                 if e.get("name") == str(identifier).lower()
+                 or e.get("title") == identifier), None)
+        return dict(found) if found else None
+
+    def _update_block(self, block_uuid, title):
+        if not self.write_effective:
+            return None
+        current = self.graph.entities[block_uuid]
+        # Replace rather than mutate: the real client returns a fresh dict per
+        # call, so an in-place edit would let an earlier snapshot alias it.
+        self.graph.entities[block_uuid] = {**current, "title": title}
+        return None
 
     def _insert_block(self, target_uuid, title, options=None):
         """sibling: false means child of the target. Unlike upsertNodes this

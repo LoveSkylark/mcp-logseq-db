@@ -192,11 +192,13 @@ def create_server(
         page_uuid: str | None = None,
         create_missing: bool = False,
         acknowledge_page_creation: bool = False,
+        acknowledge_tag_creation: bool = False,
         max_pages_to_create: int = 5,
+        max_tags_to_create: int = 5,
         include_tags: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Convert {{link:X}} and {{tag:X}} placeholders left by importPage back to live references. Omit page_uuid to scan every page, which is the usual case since links resolve only once their targets have been imported. Names that match no page are skipped and reported with near-miss suggestions; names matching several pages are skipped rather than guessed. Creating the missing pages needs BOTH create_missing and acknowledge_page_creation, and is capped — accidental page creation is how a graph fills with stubs. Tags are opt-in via include_tags. Safe to re-run."""
+        """Convert {{link:X}} and {{tag:X}} placeholders left by importPage back to live references. Omit page_uuid to scan every page, which is the usual case since links resolve only once their targets have been imported. NOTHING IS CREATED WITHOUT EXPLICIT APPROVAL: a name matching no page or tag is skipped, its placeholder left in place, and reported — links under missing, tags under tags_missing. Names matching several candidates are skipped rather than guessed. Creating missing pages needs BOTH create_missing and acknowledge_page_creation; creating missing TAGS needs create_missing and acknowledge_tag_creation, which is a separate flag because tags are a separate entity kind. Both are capped. Run with dry_run first to see exactly which pages and tags would be created. Tags are opt-in via include_tags. Safe to re-run."""
         if page_uuid is not None:
             page_uuid = require_uuid(
                 page_uuid, role="page_uuid", hint="getPageUUID")
@@ -204,7 +206,9 @@ def create_server(
             page_uuid,
             create_missing=create_missing,
             acknowledge_page_creation=acknowledge_page_creation,
+            acknowledge_tag_creation=acknowledge_tag_creation,
             max_pages_to_create=max_pages_to_create,
+            max_tags_to_create=max_tags_to_create,
             include_tags=include_tags,
             dry_run=dry_run)
 
@@ -556,8 +560,11 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "line must begin with '- '; indentation alone creates nothing."
         ),
         "repair_links": (
-            "Omit page_uuid to scan the whole graph. To create missing pages "
-            "you must pass create_missing AND acknowledge_page_creation."
+            "Omit page_uuid to scan the whole graph. Unresolvable names are "
+            "skipped and reported, never created. To create missing pages "
+            "you must pass create_missing AND acknowledge_page_creation; to "
+            "create missing tags, create_missing AND "
+            "acknowledge_tag_creation. Use dry_run to preview both."
         ),
         "find_orphans": (
             "Pass an exact page UUID. The result is informational -- the "

@@ -334,8 +334,10 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         Every block on a page, at any depth.
 
-        Named for the tool it backs. `:block/page` rather than `:block/parent`
-        is deliberate: parent reaches one level, page reaches all of them.
+        Named for the tool it backs. Walks `:block/parent` rather than
+        `:block/page`: on some graphs a block's `:block/page` points at an
+        ancestor block, and a page-scoped query misses it even though Logseq
+        displays it normally. Parent traversal matches what the UI shows.
         """
         page_uuid = self._validated_uuid(page_uuid)
         page = await self._entity_by_uuid(page_uuid)
@@ -458,9 +460,12 @@ class VerifiedContent(VerifiedWriteHelpers):
         if orphans:
             diagnostic = (
                 f"{len(orphans)} block(s) have an owning page that differs "
-                "from their nearest ancestor page. They are invisible to any "
-                "page-scoped query. If they were created by a nested write on "
-                "an older build, removeBlock is the repair."
+                "from their nearest ancestor page. This is NOT damage: Logseq "
+                "renders the outline from :block/parent, so they display "
+                "normally in the UI. Only a query written against "
+                ":block/page misses them, which is what this count explains. "
+                "Do not move them to 'correct' it -- a move rewrites their "
+                "order for no benefit."
             )
         elif nested:
             diagnostic = (
@@ -486,7 +491,11 @@ class VerifiedContent(VerifiedWriteHelpers):
         Every other read returns payload proportional to page size, so asking
         "is this page empty, does anything point at it" cost an unbounded
         response -- one container page returned 216 full blocks to communicate
-        two integers. This returns six.
+        two integers. This returns integers only.
+
+        `true_orphans` counts blocks whose :block/page differs from their
+        nearest ancestor page. That is informational, NOT a fault -- see the
+        module docstring.
         """
         page_uuid = self._validated_uuid(page_uuid)
         page = await self._entity_by_uuid(page_uuid)
@@ -506,6 +515,17 @@ class VerifiedContent(VerifiedWriteHelpers):
         by_page = await count(
             "[:find (count ?b) . :in $ ?page :where "
             "[?b :block/page ?page]]", page_id)
+        # createPage seeds every new page with one empty block, and Logseq
+        # leaves a trailing empty block behind ordinary editing, so own_blocks
+        # overstates content by however many of those exist. Counted
+        # separately rather than subtracted silently: an empty block the user
+        # typed is indistinguishable from a seed one, and hiding the
+        # difference would replace a known overcount with an invisible
+        # undercount. Matches :block/title "" only -- a block carrying no
+        # title attribute at all is not counted here.
+        empty = await count(
+            "[:find (count ?b) . :in $ ?page :where "
+            "[?b :block/page ?page] [?b :block/title \"\"]]", page_id)
         refs = await count(
             "[:find (count ?e) . :in $ ?target :where "
             "[?e :block/refs ?target]]", page_id)
@@ -535,6 +555,8 @@ class VerifiedContent(VerifiedWriteHelpers):
             "page_uuid": page_uuid,
             "title": page.get("title"),
             "own_blocks": by_page,
+            "empty_blocks": empty,
+            "content_blocks": by_page - empty,
             "subtree_blocks": len(own) + len(nested) + len(orphans),
             "nested_pages": len(nested),
             "true_orphans": len(orphans),
@@ -542,9 +564,16 @@ class VerifiedContent(VerifiedWriteHelpers):
             "tag_holders": tag_holders,
             "property_values": property_values,
             "diagnostic": (
-                f"{by_page} own block(s), {len(nested)} nested page(s), "
+                f"{by_page - empty} block(s) with content, {by_page} own "
+                f"block(s) including {empty} empty, {len(nested)} nested "
+                f"page(s), "
                 f"{refs + tag_holders + property_values} inbound reference(s)"
-                + (f", {len(orphans)} ORPHANED block(s)" if orphans else "")),
+                + (f", {len(orphans)} ORPHANED block(s)" if orphans else "")
+                + (". content_blocks is the figure to pair with the "
+                   "reference count when judging whether a page is empty; "
+                   "own_blocks counts the empty block createPage seeds and "
+                   "so is never 0 on a page that was created through this "
+                   "API." if empty else "")),
         }
 
     async def find_block_tree(
@@ -776,13 +805,14 @@ class VerifiedContent(VerifiedWriteHelpers):
         Delete a page, which on this build recycles rather than destroys it.
 
         A recycled page keeps its UUID, tags, refs and blocks, gaining
-        :logseq.property/deleted-at. Inbound references are NOT rewritten, so
-        anything linking to it keeps pointing at a page that no longer appears
-        in listings -- which is why references are surfaced and require
-        acknowledgement.
+        :logseq.property/deleted-at, and is reparented under a Recycle page.
+        Inbound references are NOT rewritten, so anything linking to it keeps
+        pointing at a page that no longer appears in listings -- which is why
+        references are surfaced and require acknowledgement.
 
-        The identifier this route wants is unconfirmed, so the UUID is tried
-        first and the page name second. Whichever worked is reported.
+        The route accepts the page UUID. The name fallback below is retained
+        because it costs one call only when the UUID form does nothing, and
+        this API does nothing silently.
         """
         page_uuid = self._require_entity(self._validated_uuid(page_uuid))
         page = await self._page_by_uuid(page_uuid)
@@ -1355,357 +1385,6 @@ class VerifiedContent(VerifiedWriteHelpers):
             recovered_after_timeout=timed_out, previous_entities=(block,))
 
     @serialized_write
-    async def repair_orphans(
-        self,
-        page_uuid: str | None = None,
-        *,
-        max_pages: int = 5,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        """
-        Re-attach blocks whose owning page is wrong.
-
-        With no `page_uuid`, pages are swept `max_pages` at a time, worst
-        first. The limit is not tuning -- a tool call has a wall-clock
-        deadline, and a sweep that exceeds it is cancelled with its result
-        lost even though the work happened. A graph with 3,700 orphaned blocks
-        needs roughly 5,000 moves, each with a verification read, so an
-        unbounded sweep cannot finish in time. Bounded, each call returns a
-        summary and `pages_remaining`; because the operation is idempotent,
-        calling it repeatedly walks the whole graph safely.
-
-        The damage: `:block/parent` is correct but `:block/page` points at an
-        ancestor BLOCK instead of the page. Such blocks are real children that
-        no page-scoped query can see, so they are invisible in the UI. The
-        cause is the old creation route writing its single `page-id` into both
-        attributes; the current `insertBlock` route cannot produce it.
-
-        Three facts about `moveBlock` shape the repair, all established by
-        hand before this was written:
-
-          - It NO-OPS when the position would not change. Moving a block to
-            the parent it already has does nothing, so one move cannot fix
-            ownership in place. Each repair is two moves: out to the page,
-            then back.
-          - `placement=child` PREPENDS. Repairing siblings left to right with
-            `child` reverses them, so only a first-born uses `child` and the
-            rest go `after` the sibling before them.
-          - A move carries the subtree and the descendants' `:block/page`
-            follows. So a nested chain of orphans is repaired by moving only
-            the topmost one, which is why this costs far fewer than two calls
-            per orphan.
-
-        Logseq also appears to repair `:block/page` itself when a page is
-        rendered or re-indexed, so a page can come back clean without being
-        touched. The sweep reports those as `already_clean` rather than
-        claiming credit.
-        """
-        if page_uuid is not None:
-            return await self._repair_one(
-                self._validated_uuid(page_uuid), dry_run=dry_run)
-
-        if not isinstance(max_pages, int) or not 1 <= max_pages <= 50:
-            raise ValueError("max_pages must be between 1 and 50")
-
-        found = await self._pages_with_orphans()
-        if not found:
-            return {
-                "pages_scanned": 0,
-                "pages_remaining": 0,
-                "verified": True,
-                "diagnostic": "No page has orphaned blocks.",
-            }
-
-        # Worst first, so the largest wins land earliest and an interrupted
-        # run has still done the most good.
-        found.sort(key=lambda p: -p["orphans"])
-        pages = found[:max_pages]
-        remaining_pages = len(found) - len(pages)
-        remaining_orphans = sum(p["orphans"] for p in found[len(pages):])
-
-        if dry_run:
-            return {
-                "dry_run": True,
-                "pages_with_orphans": len(found),
-                "orphans": sum(p["orphans"] for p in found),
-                "would_repair_now": len(pages),
-                # Worst ten only. The list grows with the damage, and it is
-                # the one part of this result that crosses the tool boundary
-                # at a size proportional to it.
-                "worst": found[:10],
-                "diagnostic": (
-                    f"{len(found)} page(s) hold "
-                    f"{sum(p['orphans'] for p in found)} orphaned block(s). "
-                    f"A run would repair the worst {len(pages)}. "
-                    "Nothing was written."),
-            }
-
-        repaired: list[dict[str, Any]] = []
-        failed: list[dict[str, Any]] = []
-        already_clean = 0
-        total_blocks = 0
-        total_moves = 0
-
-        for page in pages:
-            try:
-                result = await self._repair_one(page["uuid"], dry_run=False)
-            except Exception as error:  # noqa: BLE001
-                # One page must not strand the sweep. Recorded and skipped;
-                # re-running picks it up again.
-                failed.append({"title": page.get("title"),
-                               "error": str(error)[:200]})
-                continue
-            if result.get("branches_repaired") is None:
-                # Nothing to do by the time we got here -- Logseq may have
-                # re-indexed the page in the meantime.
-                already_clean += 1
-                continue
-            total_blocks += result.get("blocks_covered", 0)
-            total_moves += result.get("moves", 0)
-            entry = {"title": result.get("title"),
-                     "blocks": result.get("blocks_covered"),
-                     "remaining": result.get("orphans_remaining")}
-            (repaired if result.get("verified") else failed).append(entry)
-
-        return {
-            "verified": not failed,
-            "pages_scanned": len(pages),
-            "pages_repaired": len(repaired),
-            "pages_already_clean": already_clean,
-            "pages_remaining": remaining_pages,
-            "orphans_remaining": remaining_orphans,
-            "blocks_recovered": total_blocks,
-            "moves": total_moves,
-            "repaired": repaired[:20],
-            "incomplete": failed,
-            "diagnostic": (
-                f"Recovered {total_blocks} block(s) across "
-                f"{len(repaired)} page(s) in {total_moves} move(s)."
-                + (f" {already_clean} page(s) were already clean by the time "
-                   "they were reached -- Logseq repairs some of this itself "
-                   "on re-index." if already_clean else "")
-                + (f" {len(failed)} page(s) are incomplete." if failed else "")
-                + (f" {remaining_pages} page(s) and about "
-                   f"{remaining_orphans} block(s) still to go -- call again "
-                   "to continue." if remaining_pages else
-                   " The graph is clean.")),
-        }
-
-    async def _pages_with_orphans(self) -> list[dict[str, Any]]:
-        """
-        Pages holding at least one block whose page differs from its parent's.
-
-        One query rather than a pageStats call per page. It cannot see a page
-        boundary, so a block correctly owned by a nested page is included here
-        and then discarded by the per-page classification -- a false positive
-        costs one wasted read, a false negative would leave damage behind.
-        """
-        query = (
-            "[:find [(pull ?page [:db/id :block/uuid :block/title]) ...] "
-            ":where [?block :block/parent ?parent] "
-            "[?parent :block/page ?page] "
-            # ?page must be a real page. Damage chains: when a parent is
-            # itself orphaned its :block/page is a BLOCK, so without this the
-            # scan returns blocks and the per-page repair raises on them.
-            "[?page :block/name _] "
-            "[?block :block/page ?other] "
-            "[(not= ?other ?page)]]"
-        )
-        found = await self._query_list(query, "Orphan page scan")
-
-        out: list[dict[str, Any]] = []
-        for page in found:
-            if not isinstance(page, dict) or not page.get("uuid"):
-                continue
-            try:
-                orphans = len((await self._classify_subtree(page["uuid"]))[2])
-            except (ValueError, LookupError):
-                # Not a page after all, or gone. Skip rather than abort the
-                # sweep -- one bad entry must not strand the rest.
-                continue
-            if orphans:
-                out.append({"uuid": page["uuid"],
-                            "title": page.get("title"),
-                            "orphans": orphans})
-        return out
-
-    async def _repair_one(
-        self, page_uuid: str, *, dry_run: bool
-    ) -> dict[str, Any]:
-        page_uuid = self._require_entity(page_uuid)
-        page = await self._page_by_uuid(page_uuid)
-        page_id = page.get("id")
-
-        tree = await self._ordered_tree(page_uuid)
-        if tree is None:
-            return {"page_uuid": page_uuid, "repaired": 0,
-                    "diagnostic": "The page has no blocks."}
-
-        # The topmost orphan in each broken branch, with what is needed to put
-        # it back: its parent, and the sibling it should follow.
-        plan: list[dict[str, Any]] = []
-
-        def walk(node: dict[str, Any], expected_page: Any) -> None:
-            children = node.get("children", [])
-            for index, child in enumerate(children):
-                if child.get("name"):
-                    # A nested page is its own boundary, not damage.
-                    walk(child, child.get("id"))
-                    continue
-                if self._reference_id(child.get("page")) != expected_page:
-                    plan.append({
-                        "uuid": child["uuid"],
-                        "title": (child.get("title") or "")[:60],
-                        "parent_uuid": node["uuid"],
-                        "after_uuid": (children[index - 1]["uuid"]
-                                       if index else None),
-                        "descendants": _count_descendants(child),
-                    })
-                    # Descendants follow the move; do not plan them too.
-                    continue
-                walk(child, expected_page)
-
-        walk(tree, page_id)
-
-        if not plan:
-            return {"page_uuid": page_uuid, "title": page.get("title"),
-                    "repaired": 0, "moves": 0,
-                    "diagnostic": "No orphaned blocks; nothing to repair."}
-
-        covered = len(plan) + sum(p["descendants"] for p in plan)
-        if dry_run:
-            return {
-                "page_uuid": page_uuid,
-                "title": page.get("title"),
-                "dry_run": True,
-                "branches": len(plan),
-                "blocks_covered": covered,
-                "moves": len(plan) * 2,
-                # Three samples rather than the whole plan. The plan is the
-                # only part of this tool that crosses the boundary at a size
-                # proportional to the damage, and a caller deciding whether to
-                # proceed does not need all of it.
-                "sample": [p["title"] for p in plan[:3]],
-                "diagnostic": (
-                    f"{len(plan)} broken branch(es) covering {covered} "
-                    f"block(s); {len(plan) * 2} moves. Nothing was written."),
-            }
-
-        repaired = 0
-        moves = 0
-        failures: list[dict[str, Any]] = []
-
-        for step in plan:
-            # The per-move subtree verification in move_block walks the whole
-            # descendant tree on every call, which is O(page) per move and so
-            # quadratic across a page -- on a 147-block page it was the
-            # bottleneck that put the repair past the tool deadline. Here the
-            # cheaper check is sound: the final _classify_subtree below
-            # inspects every block on the page, so a descendant left behind
-            # is caught there rather than 147 times over.
-            first = await self._move_unverified(
-                step["uuid"], page_uuid, placement="child")
-            moves += 1
-            if not first:
-                failures.append({**step, "stage": "detach"})
-                continue
-
-            # Back where it belongs, preserving sibling order.
-            if step["after_uuid"]:
-                second = await self._move_unverified(
-                    step["uuid"], step["after_uuid"], placement="after")
-            else:
-                second = await self._move_unverified(
-                    step["uuid"], step["parent_uuid"], placement="child")
-            moves += 1
-            if not second:
-                # The block is now top-level on the correct page: visible, but
-                # not under its heading. Reported rather than hidden.
-                failures.append({**step, "stage": "reattach"})
-                continue
-            repaired += 1
-
-        remaining = len((await self._classify_subtree(page_uuid))[2])
-
-        return {
-            "page_uuid": page_uuid,
-            "title": page.get("title"),
-            "verified": remaining == 0 and not failures,
-            "branches_repaired": repaired,
-            "blocks_covered": covered,
-            "moves": moves,
-            "orphans_remaining": remaining,
-            "failures": failures,
-            "diagnostic": (
-                f"Repaired {repaired} branch(es) in {moves} move(s); "
-                f"{covered} block(s) now belong to the page."
-                if remaining == 0 and not failures else
-                f"Repaired {repaired} of {len(plan)} branch(es); "
-                f"{remaining} orphan(s) remain. Re-run to continue -- the "
-                "operation is idempotent."),
-        }
-
-    async def _move_unverified(
-        self, block_uuid: str, target_uuid: str, *, placement: str
-    ) -> bool:
-        """
-        Move without the per-move subtree walk.
-
-        Only for bulk repair, where every block on the page is verified once
-        at the end. `move_block` is the tool-facing version and keeps the full
-        check; this exists because that check is O(page) per call and turns a
-        large repair quadratic.
-
-        Still confirms the block itself landed: a silent no-op is the failure
-        this whole layer exists to catch, and it costs one read.
-        """
-        target = await self._entity_by_uuid(target_uuid)
-        expected_parent = (target["id"] if placement == "child"
-                           else self._reference_id(target.get("parent")))
-        expected_page = (target["id"] if target.get("name")
-                         else self._reference_id(target.get("page")))
-
-        options = ({"children": True} if placement == "child"
-                   else {"before": placement == "before"})
-        try:
-            await self._client.call(
-                "logseq.DB.moveBlock", [block_uuid, target_uuid, options])
-        except httpx.TimeoutException:
-            return False
-
-        moved = await self._optional_entity_by_uuid(block_uuid)
-        return (moved is not None
-                and self._reference_id(moved.get("parent")) == expected_parent
-                and self._reference_id(moved.get("page")) == expected_page)
-
-    async def _ordered_tree(self, page_uuid: str) -> dict[str, Any] | None:
-        """
-        The page's subtree with children sorted into document order.
-
-        Order matters more here than for a read: repairs walk siblings left to
-        right and place each after the previous, so a wrong order in is a
-        wrong order out.
-        """
-        query = (
-            "[:find (pull ?root [:db/id :block/uuid :block/title :block/name "
-            ":block/order {:block/page [:db/id]} {:block/_parent ...}]) . "
-            f":where [?root :block/uuid #uuid \"{page_uuid}\"]]"
-        )
-        root = await self._client.call("logseq.DB.datascriptQuery", [query])
-        if not isinstance(root, dict):
-            return None
-
-        def normalise(node: dict[str, Any]) -> dict[str, Any]:
-            children = [normalise(c) for c in (node.get("_parent") or [])
-                        if isinstance(c, dict)]
-            children.sort(key=lambda c: str(c.get("order", "")))
-            out = {k: v for k, v in node.items() if k != "_parent"}
-            out["children"] = children
-            return out
-
-        return normalise(root)
-
-    @serialized_write
     async def remove_block(self, block_uuid: str) -> ContentResult:
         """
         Delete one block and its subtree, then verify the whole subtree is gone.
@@ -1784,11 +1463,18 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         Build an indented outline on a page.
 
-        Costs 2d-1 calls for depth d, independent of width: create a level,
-        read back the UUIDs Logseq assigned, create the next. The read-back is
-        structural, not defensive -- creation does not return UUIDs and
-        `page-id` will not resolve a title, so children have no way to name
-        their parents until the level above exists.
+        Costs one call per parent that has children. `insertBatchBlock`
+        returns the entities it created, so a parent's UUID is known before
+        its own children are inserted -- there is no read-back cycle, and
+        duplicate titles among siblings are fine because nothing has to
+        identify a new block by its title.
+
+        Structure comes from INDENTATION ONLY. A leading markdown bullet is
+        stripped; any other prefix becomes part of the title.
+
+        Not atomic. A multi-level outline is several calls, so a failure
+        partway leaves earlier levels committed; the error names the level
+        that stopped.
         """
         page_uuid = self._require_entity(self._validated_uuid(page_uuid))
         page = await self._entity_by_uuid(page_uuid)
@@ -1873,71 +1559,6 @@ class VerifiedContent(VerifiedWriteHelpers):
     # --------------------------------------------------------- batch engine
 
     @serialized_write
-    async def upsert_nodes(
-        self,
-        operations: list[dict[str, Any]],
-        *,
-        dry_run: bool = False,
-    ) -> ContentResult:
-        """
-        Run a batch of add/edit operations and verify each one.
-
-        `upsertNodes` accepts exactly three combinations: add+page, add+block,
-        edit+block. `edit`+`page` is rejected by Logseq, and there is no
-        removal verb at all -- `operation` offers only add and edit.
-        """
-        normalized = await self._validate_operations(operations)
-
-        # The options map is REQUIRED. Sending one argument makes every write
-        # fail with "The Imported EDN has 4 validation error(s)".
-        validation = await self._client.call(
-            "logseq.DB.upsertNodes", [normalized, {"dry-run": True}])
-        if dry_run:
-            # verified=False deliberately. Nothing was written, so anything
-            # reading the boolean alone must not see a success -- the
-            # diagnostic explains, but the flag is what gets checked.
-            return ContentResult(
-                validation=validation, response=None, verified_entities=(),
-                verified=False,
-                diagnostic=(
-                    "Dry run: nothing was written, so verified is false by "
-                    "design. It validates the PAYLOAD, not the transaction -- "
-                    "Logseq reports what it would create, and a graph carrying "
-                    "invalid entities can still reject the real write."))
-
-        # Snapshot per add so the read-back can tell a new entity from one
-        # that already carried the same title. Titles are not unique, so the
-        # snapshot is scoped the same way verification is: siblings for a
-        # block, the whole graph for a page.
-        before_ids: dict[int, set[int]] = {}
-        for index, op in enumerate(normalized):
-            if op["operation"] != "add":
-                continue
-            before_ids[index] = {
-                e["id"] for e in await self._candidates_for(op)}
-
-        response: Any = None
-        timed_out = False
-        try:
-            response = await self._client.call(
-                "logseq.DB.upsertNodes", [normalized, {"dry-run": False}])
-        except httpx.TimeoutException:
-            timed_out = True
-
-        verified: list[dict[str, Any]] = []
-        for index, operation in enumerate(normalized):
-            if operation["operation"] == "edit":
-                verified.append(await self._verify_edit(operation))
-                continue
-            verified.append(
-                await self._verify_add(operation, before_ids[index]))
-
-        return ContentResult(
-            validation=validation,
-            response=response,
-            verified_entities=tuple(verified),
-            recovered_after_timeout=timed_out,
-        )
 
     async def _verify_edit(self, operation: dict[str, Any]) -> dict[str, Any]:
         expected = operation["data"]["title"]
@@ -2011,81 +1632,6 @@ class VerifiedContent(VerifiedWriteHelpers):
             raise RuntimeError("Created block has the wrong owning page")
         await self._verify_title_uuid_refs(entity, title)
         return entity
-
-    async def _validate_operations(
-        self, operations: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        if not isinstance(operations, list) or not 1 <= len(operations) <= MAX_BATCH_OPERATIONS:
-            raise ValueError(
-                f"operations must contain 1 to {MAX_BATCH_OPERATIONS} items")
-        # (parent uuid, title) for blocks; (None, title) for pages. Two blocks
-        # may share a title in one batch as long as they have different
-        # parents -- verification looks for each new block among its own
-        # parent's children, so siblings are the only ambiguous case.
-        add_keys: set[tuple[str | None, str]] = set()
-        normalized: list[dict[str, Any]] = []
-
-        for index, operation in enumerate(operations):
-            if not isinstance(operation, dict) or not isinstance(
-                    operation.get("data"), dict):
-                raise ValueError(f"operation {index} must contain a data object")
-            op_type = operation.get("operation")
-            entity_type = operation.get("entityType")
-            data = dict(operation["data"])
-
-            title = data.get("title")
-            if not isinstance(title, str) or not title.strip():
-                raise ValueError(f"operation {index} requires a non-empty title")
-            self._validate_title(title)
-
-            if op_type == "add" and entity_type == "page":
-                if set(data) != {"title"}:
-                    raise ValueError("Page add supports only data.title")
-                # A page is a named entity, so the title scope applies here
-                # even though it does not apply to block content.
-                self._require_title(title)
-
-            elif op_type == "add" and entity_type == "block":
-                # Closed allowlist. `tags`, `order` and `parent-id` are all
-                # rejected by the API as disallowed keys.
-                if set(data) != {"title", "page-id"}:
-                    raise ValueError(
-                        "Block add supports only data.title and data.page-id")
-                parent_uuid = self._validated_uuid(data.get("page-id"))
-                # Parent may be a page OR a block -- this is how nesting works.
-                await self._entity_by_uuid(parent_uuid)
-                data["page-id"] = parent_uuid
-
-            elif op_type == "edit" and entity_type == "block":
-                if set(data) != {"title"}:
-                    raise ValueError("Block edit supports only data.title")
-                block_uuid = self._validated_uuid(operation.get("id"))
-                block = await self._entity_by_uuid(block_uuid)
-                if block.get("name"):
-                    raise ValueError("Block edit id identifies a page")
-                normalized.append(dict(operation, data=data, id=block_uuid))
-                continue
-
-            else:
-                raise ValueError(
-                    "Supported operations are add page, add block, and edit "
-                    "block. Editing a page, tag or property is not supported "
-                    "by Logseq, and there is no removal operation."
-                )
-
-            key = (data.get("page-id") if entity_type == "block" else None,
-                   title)
-            if key in add_keys:
-                where = ("under the same parent" if key[0]
-                         else "for a page")
-                raise ValueError(
-                    f"Two operations in this batch add {title!r} {where}; "
-                    "verification could not tell the results apart. Titles "
-                    "need only be unique among siblings."
-                )
-            add_keys.add(key)
-            normalized.append(dict(operation, data=data))
-        return normalized
 
     # --------------------------------------------------------------- shared
 
@@ -2241,10 +1787,6 @@ STRUCTURAL_IDENTS = frozenset({
     "tx-id", "created-at", "updated-at", "format", "collapsed?",
     "journal-day", "journal?", "left",
 })
-
-
-def _count_descendants(node: dict[str, Any]) -> int:
-    return sum(1 + _count_descendants(c) for c in node.get("children", []))
 
 
 def _is_structural(prop: Any) -> bool:

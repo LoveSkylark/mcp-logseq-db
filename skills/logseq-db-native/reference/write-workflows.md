@@ -17,9 +17,19 @@ nothing, so the read-back is the only evidence.
 createPage(title)
 ```
 
-A title already used by any page or block is rejected rather than duplicated:
-verification identifies a new entity by title, so a duplicate could not be
-told from the original.
+A title already held by any page, tag or block is rejected — the three share
+one title space.
+
+Routed through `logseq.DB.createPage`, not `upsertNodes`. Two reasons:
+`upsertNodes` fails outright on synced graphs, returning "The Imported EDN has
+N validation error(s)" for a write its own dry run accepts; and `createPage`
+is idempotent on title, so a repeat returns the existing page rather than a
+duplicate.
+
+Its second argument is a PROPERTIES map, not options. Passing
+`{"dry-run": true}` creates the page anyway and mints a `dry-run` property in
+your namespace — so there is no server-side dry run here, and `dry_run`
+validates locally only.
 
 ### Renaming
 
@@ -51,9 +61,8 @@ pointing at it. The tool lists the referring entities and refuses until
 `acknowledge_reference_rewrite=true`, so the user can decide — do not set the
 flag without telling them what it means.
 
-The identifier this route accepts is unconfirmed. The UUID is tried first and
-the page name second, and the result reports which worked. If the envelope says
-`via its name`, record that: it also settles which form `deleteTag` needs.
+`deletePage` accepts the page UUID — confirmed, and the envelope reports which
+form worked. The same route underlies `deleteTag`.
 
 ### Clearing
 

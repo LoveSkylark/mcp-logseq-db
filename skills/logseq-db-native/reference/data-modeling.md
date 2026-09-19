@@ -30,6 +30,11 @@ Before designing anything, know the shape of the hole:
 rather than destroys, and does not rewrite inbound references, so a model that
 churns pages leaves dangling links behind.
 
+Titles are shared across pages, tags and blocks, so a page title can collide
+with a tag of the same name. The tools refuse such collisions, but the raw API
+permits them — `createTag` will happily take a title an existing page holds.
+An older graph may therefore already contain pairs the tools would now reject.
+
 **Blocks: title only at creation.** Tags, properties, and position are all
 follow-up calls. A block with a tag and two properties is four calls, not one.
 

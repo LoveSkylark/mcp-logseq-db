@@ -90,6 +90,36 @@ benefit. This was learned the expensive way: a repair tool was built on the
 assumption that these blocks were invisible, and roughly 1,500 blocks were
 moved before anyone opened the page and saw the text rendering fine.
 
+## A page is never empty
+
+`createPage` seeds every new page with one empty block, and Logseq leaves a
+trailing empty block behind ordinary editing. So a block count on a page made
+through this API is never 0, and every count of "how much is on this page" is
+high by however many empty blocks exist.
+
+This matters most where a count feeds a decision. The rule that emptiness
+alone is never grounds to delete has a converse: a genuinely empty page still
+reports a block, so an audit searching for empty pages by `own_blocks == 0`
+finds nothing at all.
+
+`pageStats` therefore reports three figures rather than one:
+
+- `own_blocks` — every block with this `:block/page`, seeds included. The raw
+  figure; do not read it as content.
+- `empty_blocks` — those whose title is empty.
+- `content_blocks` — the difference, and **the figure to pair with a reference
+  count** when judging whether a page carries anything.
+
+The split is reported rather than silently subtracted, because an empty block
+someone typed is indistinguishable from a seeded one, and hiding the
+difference would trade a known overcount for an invisible undercount.
+
+The same reasoning applies to verifying a write: check the **delta** a call
+produced, not the absolute total. `importPage` takes a block count before and
+after and compares the gain against the markdown, which is immune to seed
+blocks and to whatever the page already held. An absolute comparison on an
+append cannot distinguish a successful import from a silent no-op.
+
 ## Cost lives at the tool boundary
 
 What costs you is what crosses in and out — arguments and results — not the
@@ -234,6 +264,16 @@ than 68.
 > to point at the new entity. An import whose links point at pages that do not
 > exist yet would create a stub for every one.
 >
+> The heading conversion is structural, not cosmetic: the `##` is stripped
+> from the text and re-expressed as `:logseq.property/heading 2` on the block,
+> which is how the UI renders it as a header. So a heading block's `title`
+> reads as plain text with no markup — that is correct and expected, not a
+> sign the conversion failed. Two consequences: `inspectPage` at
+> `detail=blocks` does NOT return the attribute, so use `getBlock` to see it;
+> and because `:logseq.property/` is outside the writable namespace, a heading
+> level cannot be set or changed with `addProperty`. The only way to create
+> one is to let the parser do it by writing `- ## Text`.
+>
 > So `importPage` escapes them: `[[X]]` → `{{link:X}}` and `#X` → `{{tag:X}}`.
 > The content is inert until repaired. **Tell the user this** — the links they
 > wrote will not work until the second step.
@@ -242,12 +282,36 @@ than 68.
 graph, which is usually right: links resolve only once their targets have been
 imported, so the natural order is import everything, then repair once.
 
-It is safe to re-run. Names that match no page are skipped and reported with
-near-miss suggestions; names matching several pages are skipped rather than
-guessed. **Creating the missing pages needs both `create_missing` and
-`acknowledge_page_creation`** and is capped — report what would be created and
-let the user decide, because a typo and a genuinely new page look identical
-from here. Tags are opt-in via `include_tags`.
+It is safe to re-run. Names that match no target are skipped and reported —
+links under `missing` with near-miss suggestions, tags under `tags_missing` —
+and names matching several candidates are skipped rather than guessed.
+
+**Nothing is created without an explicit acknowledgement, and the two kinds
+are separate flags.** Pages need `create_missing` plus
+`acknowledge_page_creation`; tags need `create_missing` plus
+`acknowledge_tag_creation`. Both are capped. `acknowledge_page_creation` does
+not cover tags — a page and a tag are different entity kinds, and approval of
+one is not approval of the other. Tags are still opt-in via `include_tags`.
+
+> **Always dry-run first and show the user what would be created.** Run
+> `repairLinks(dry_run=true)` and read `missing` and `tags_missing`: those are
+> the names that do not exist yet. Name them to the user and get agreement
+> before setting any acknowledgement flag. A typo, a rename, and a genuinely
+> new entity are indistinguishable from here, so this is the user's call and
+> not yours. Offering to repair is not the same as offering to create.
+
+The safe default needs no flags at all: with neither acknowledgement set, a
+repair rewrites only the placeholders whose targets already exist and leaves
+the rest in place, which is always a valid state to stop in and can be resumed
+after the missing entities are created deliberately.
+
+Historical note, in case an older build is in use: the tag branch once skipped
+resolution entirely and rewrote every tag placeholder unchecked, which made
+Logseq mint a tag for each name that did not exist. Those creations were
+reported in no bucket of the result — `resolved` came back empty even for tags
+that did resolve. If a repair reports tag activity with no `tags_resolved` or
+`tags_missing` keys, that is the old behaviour and `include_tags` is unsafe on
+that build.
 
 Page properties (`key:: value` above the first block) are parsed and reported
 but not applied: they are outside the writable namespace.
@@ -308,7 +372,13 @@ blocks the removal orphans.
 
 ### Tags
 
-A tag must exist before it can be attached. `creatTag(title)` creates one. Its
+A tag must exist before it can be attached, and this is enforced on the repair
+path too: `repairLinks` resolves every tag placeholder before rewriting it and
+skips the ones that do not exist, because Logseq mints a tag for any `#name`
+it parses on write. Create the tag deliberately with `creatTag` first, or pass
+`acknowledge_tag_creation` once the user has approved the specific names.
+
+`creatTag(title)` creates one. Its
 ident is deterministic — `:plugin.class.<caller>/<Title>`, spaces stripped — so
 it need not be read back. Tags made in the Logseq UI land under `user.class/*`
 and DO carry a random suffix.
@@ -385,6 +455,11 @@ position would not change (reported as `verified: false`, which is correct),
 `moveBlock`,
 `removeBlock`, `creatTag`, `deleteTag`, `addTag`, `removeTag`,
 `createProperty`, `deleteProperty`, `addProperty`, `removeProperty`
+
+Creating tools require an acknowledgement when an entity would be minted:
+`repairLinks` (`acknowledge_page_creation` for pages,
+`acknowledge_tag_creation` for tags, each alongside `create_missing`). Preview
+with `dry_run` and name the entities to the user first.
 
 Destructive tools require an acknowledgement when anything is affected:
 `deletePage` (`acknowledge_reference_rewrite`), `deleteTag`

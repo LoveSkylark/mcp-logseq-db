@@ -23,7 +23,35 @@ being accepted.
 | `pageStats` shows `own_blocks` well below `subtree_blocks`, or `true_orphans` above zero | Some blocks' `:block/page` points at an ancestor block. **Not damage** — Logseq renders from `:block/parent`, so they display normally. | Nothing. Do not move blocks to correct it; a move rewrites their order for no benefit. |
 | A user says content is missing from a page | Check the page in the Logseq UI before believing any count. | A count disagreement is not evidence of missing content. Confirm the symptom first. |
 | A tool call returns "no result received after 4 minutes" | The client stopped waiting; the server usually kept working and committed. | Do not retry blindly. Re-read state to see what landed. Bulk operations need a batch limit so each call returns in time. |
-| A large query returns `[]` when a `(count …)` of the same clauses returns thousands | Result size, not the query. Reads can fail silently at scale. | Ask for a scalar with `.`, or narrow the clauses. |
+| A large query returns `[]` when a `(count …)` of the same clauses returns thousands | Almost always a MALFORMED query, not size. An inline `#uuid "…"` or a quoted string inside the query text breaks the JSON body, and the failure looks like an empty result. | Pass strings and UUIDs as `:in` parameters instead of inlining them. Confirm the query runs at all with a `(count …)` form first. |
+| Every write fails with "The Imported EDN has N validation error(s)" while the dry run succeeds | `upsertNodes` fails on SYNCED graphs. Nothing in this server routes through it any more; if you see this, something is calling it directly. | Not a graph fault and not repairable from here. `createPage`, `insertBlock`, `updateBlock` and `createTag` all work on the same graph. |
+| A write works in the Logseq UI but fails through a tool | The method that tool routes through is failing, not the graph. | Try a tool that uses a different route before concluding anything about the data. |
+
+## Before blaming the graph
+
+Four separate diagnoses in one session — invisible blocks, a wedged DB worker,
+dangling references, three corrupt entities — were all wrong. Each came from
+reading an error message or a metric as a cause, and each survived several
+exchanges because it was asserted rather than tested. The actual fault, every
+time, was narrower and findable.
+
+So when something fails:
+
+**Try a different route before blaming the data.** `upsertNodes` failing said
+nothing about the graph; `insertBlock` wrote to it fine. One alternate call
+would have settled in seconds what several hours of inference did not.
+
+**Ask what the UI shows.** It is the cheapest test available and it has been
+right every time. "Can you do this in Logseq itself?" invalidates most
+corruption theories immediately.
+
+**Check whether the query ran.** `null` from a `(count …)` means the request
+never reached Logseq — a count returns a number or nothing at all. `[]` from a
+query with inline quotes usually means the same. Neither is data.
+
+**Do not trust a metric built on the attribute you suspect.** If
+`own_blocks` is computed from `:block/page`, it cannot be evidence about
+`:block/page`.
 
 ## The write circuit
 
