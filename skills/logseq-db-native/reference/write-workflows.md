@@ -105,9 +105,21 @@ is not enough.
 moveBlock(block_uuid, target_uuid, placement="child")
 ```
 
-`child` puts the block under the target; a page target moves it to that page's
-top level. `before` and `after` place it as a sibling, so they need a block
-target — a page has no siblings.
+`child` and `last-child` put the block under the target; a page target moves
+it to that page's top level. `before` and `after` place it as a sibling, so
+they need a block target — a page has no siblings.
+
+**`child` PREPENDS. `last-child` APPENDS.** Moving three blocks in source
+order with `child` puts each new arrival in front of the last, so the
+destination ends up reversed — silently, and only visible by reading the
+destination back. Use `last-child` whenever the order of what you are moving
+matters, which is almost always. `child` keeps prepending because that is
+Logseq's own behaviour and callers depend on it.
+
+`last-child` costs one extra read: it looks up the target's children to find
+what to move after, because nothing in this API can write `:block/order`. In
+exchange it verifies the block ended up *last*, so a `verified: true` from
+`last-child` is a stronger claim than one from `child`.
 
 The API returns nothing, so three things are verified by reading back: the new
 parent, the owning page, and that descendants followed. Each is a distinct
@@ -115,6 +127,11 @@ failure. A block whose parent did not change is a silent no-op. A block whose
 owning page did not follow is a real child of the target that no page-scoped
 query can see. Descendants left pointing at the old page are the same failure
 one level down.
+
+Moving a block to the position it already occupies is a no-op reported as
+`verified: false`. The exception is `last-child` on a block already last:
+nothing is written and the result is `verified: true`, with a diagnostic
+saying no move was needed — the requested state was read and found to hold.
 
 Two moves are refused before the call: a target inside the block's own subtree,
 which would detach it from the graph, and sibling placement against a page.

@@ -196,8 +196,11 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "Verified on three counts: the new parent, the owning page, and that "
         "descendants followed. A block whose page did not follow is a real "
         "child of the target that no page-scoped query can see.",
-        "placement is child, before or after. A page has no siblings, so a "
-        "page target requires child.",
+        "placement=child PREPENDS, so relocating several blocks with it "
+        "reverses their order. Use last-child to APPEND; it is verified by "
+        "the block ending up last, not merely under the right parent.",
+        "placement is child, last-child, before or after. A page has no "
+        "siblings, so a page target requires child or last-child.",
     ),
     "createPageofBlocks": (
         "Costs one call per parent that has children -- not 2d-1. Creation "

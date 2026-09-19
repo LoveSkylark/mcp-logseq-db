@@ -235,11 +235,14 @@ async def writes(client: LogseqDBClient, settings: Settings) -> None:
         return found if isinstance(found, dict) else None
 
     async def children_of(parent_uuid: str) -> list[dict[str, Any]]:
-        return await client.call("logseq.DB.datascriptQuery", [
+        found = await client.call("logseq.DB.datascriptQuery", [
             "[:find [(pull ?child [:db/id :block/uuid :block/title "
             ":block/order {:block/parent [:db/id]} {:block/page [:db/id]}]) "
             f"...] :where [?parent :block/uuid #uuid \"{parent_uuid}\"] "
             "[?child :block/parent ?parent]]"]) or []
+        # Sorted, because pull does not guarantee order and the prepend check
+        # below is entirely about order.
+        return sorted(found, key=lambda child: str(child.get("order", "")))
 
     def uuid_of(response: Any) -> str | None:
         if isinstance(response, list):
@@ -357,6 +360,27 @@ async def writes(client: LogseqDBClient, settings: Settings) -> None:
         else:
             info("a repeated move changed :block/order; the no-op behaviour "
                  "may have changed")
+
+        # `children: true` PREPENDS. This is the behaviour the last-child
+        # placement exists to work around, and the reason three pages of
+        # content ended up reversed before anyone read the destination back.
+        # If it ever starts appending, last-child becomes redundant -- so it
+        # is checked here rather than assumed.
+        await client.call("logseq.DB.insertBlock",
+                          [batch_uuids[0], "sibling for ordering",
+                           {"sibling": False}])
+        await client.call("logseq.DB.moveBlock",
+                          [nested_uuid, batch_uuids[0], {"children": True}])
+        ordered = await children_of(batch_uuids[0])
+        first = ordered[0].get("uuid") if ordered else None
+        if len(ordered) > 1 and first == nested_uuid:
+            ok("children:true still PREPENDS",
+               "so last-child is still needed to append")
+        elif len(ordered) > 1:
+            info("children:true no longer prepends -- last-child may now be "
+                 "redundant, and the docs claim it is needed")
+        else:
+            info("not enough siblings to tell prepend from append")
 
     # Deletion, and that it takes the subtree.
     await client.call("logseq.DB.removeBlock", [top_uuid])

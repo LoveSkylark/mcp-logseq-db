@@ -197,6 +197,8 @@ class FakeClient:
             return self._create_page(*args)
         if method == "logseq.DB.getPage":
             return self._get_page(*args)
+        if method == "logseq.DB.getTagsByName":
+            return self._get_tags_by_name(*args)
         if method == "logseq.DB.updateBlock":
             return self._update(*args)
         if method == "logseq.DB.datascriptQuery":
@@ -255,6 +257,15 @@ class FakeClient:
                           if e.get("name") == str(identifier).lower()), None)
         return dict(found) if found else None
 
+    def _get_tags_by_name(self, title):
+        """Tags, modelled here as ident-carrying entities with no :block/name.
+        No fixture creates one, so a tag reference resolves to nothing -- which
+        is the case repair has to handle, since Logseq would mint the tag on
+        write."""
+        return [dict(e) for e in self.graph.entities.values()
+                if e.get("title") == title and e.get("ident")
+                and not e.get("name")]
+
     def _update(self, block_uuid, title):
         self._parse(self.graph.entities[block_uuid], title)
         return None
@@ -292,6 +303,11 @@ class FakeClient:
             uuid = query.split('#uuid "')[1].split('"')[0]
             found = self.graph.entities.get(uuid)
             return dict(found) if found else None
+        if "(count ?page)" in query and ':block/title "' in query:
+            # The title-uniqueness guard in get_page_uuid.
+            title = query.split(':block/title "')[1].split('"')[0]
+            return len([e for e in self.graph.entities.values()
+                        if e.get("title") == title and e.get("name")])
         if ':block/title "' in query and ":find [(pull ?" in query:
             title = query.split(':block/title "')[1].split('"')[0]
             return [e for e in self.graph.entities.values()

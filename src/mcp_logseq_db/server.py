@@ -8,11 +8,14 @@ same API method -- a page IS a block in the DB -- so exposing both asked a
 caller to choose between identical operations. There is one `addTag` and one
 `addProperty`, each taking a target that may be either.
 
-Removed, having no verified route: `insert_block` and `move_block` (both
-routed through methods reached only by a graph-worker CLI fallback that
-existed because a hardcoded capability list was wrong), `rename_tag`,
-`add_tag_property`, `remove_tag_property`, `set_tag_parent`,
-`remove_tag_extends`, `set_block_icon`, `remove_block_icon`.
+Removed, having no verified route: `insert_block` (routed through a method
+reached only by a graph-worker CLI fallback that existed because a hardcoded
+capability list was wrong), `rename_tag`, `add_tag_property`,
+`remove_tag_property`, `set_tag_parent`, `remove_tag_extends`,
+`set_block_icon`, `remove_block_icon`.
+
+`move_block` was on that list and is now a tool: `logseq.DB.moveBlock` is
+verified on every placement, including across pages.
 
 `delete_page`/`recycle_page` are gone too: one was documented as an alias of
 the other, which invites a caller to reason about a distinction that may not
@@ -20,7 +23,9 @@ exist. Whether recycling is reversible is an open question; until it is
 settled, exposing one honest tool beats two ambiguous ones.
 
 Nesting no longer needs its own tool. `createBlock` takes a parent that may be
-a page or a block, because the API's `page-id` field is a parent pointer.
+a page or a block, because `insertBlock`'s target argument accepts either --
+and unlike `upsertNodes`, it sets `:block/parent` and `:block/page`
+independently rather than writing one value into both.
 """
 
 from __future__ import annotations
@@ -31,7 +36,13 @@ from functools import wraps
 from typing import Any, Literal
 
 import httpx
-from mcp.server import MCPServer
+# The full module path rather than the `mcp.server` re-export: the SDK's v2
+# migration guide names `mcp.server.mcpserver`, and a convenience re-export is
+# a weaker guarantee than the module the guide documents. FastMCP was renamed
+# MCPServer and moved here in mcp 2.0.0, which is why pyproject pins
+# `mcp>=2,<3` -- an unbounded pin resolves through that rename and fails at
+# import.
+from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from .access import WriteAccessPolicy
@@ -258,7 +269,7 @@ def create_server(
     async def create_block(
         parent_uuid: str, title: str, dry_run: bool = False
     ) -> dict[str, Any]:
-        """Create one block. parent_uuid may be a page UUID (top-level block) or a block UUID (nested child). Only the title can be set at creation; tags and position are follow-up calls, and the new UUID is assigned by Logseq rather than returned."""
+        """Create one block. parent_uuid may be a page UUID (top-level block) or a block UUID (nested child). Only the title can be set at creation; tags and position are follow-up calls. The block is appended after the parent's existing children."""
         return (await content().create_block(
             parent_uuid, title, dry_run=dry_run)).to_dict()
 
@@ -282,9 +293,11 @@ def create_server(
     async def move_block(
         block_uuid: str,
         target_uuid: str,
-        placement: Literal["child", "before", "after"] = "child",
+        placement: Literal[
+            "child", "last-child", "before", "after"
+        ] = "child",
     ) -> dict[str, Any]:
-        """Move a block and its subtree relative to a target. placement=child puts it under the target (a page target moves it to the page's top level); before and after place it as a sibling. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed -- all three confirmed working, including across pages."""
+        """Move a block and its subtree relative to a target. placement=child PREPENDS under the target, so moving several blocks with it reverses their order -- use last-child to APPEND, which is what relocating a sequence needs. Both accept a page target, moving the block to the page's top level; before and after place it as a sibling and need a block target. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed; last-child additionally confirms the block ended up last."""
         block_uuid = require_uuid(
             block_uuid, role="block_uuid", hint="getBlockUUID")
         target_uuid = require_uuid(
@@ -598,8 +611,9 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         "update_block": "Pass an exact block UUID and a non-empty title.",
         "move_block": (
             "Pass the block to move, then the target, then placement. The "
-            "target may be a block, or a page when placement is child. A "
-            "block cannot be moved inside its own subtree."
+            "target may be a block, or a page when placement is child or "
+            "last-child. Use last-child to append; child prepends. A block "
+            "cannot be moved inside its own subtree."
         ),
         "remove_block": "Pass an exact block UUID, not a page UUID.",
         "get_tag_uuid": "Pass the tag's display title.",

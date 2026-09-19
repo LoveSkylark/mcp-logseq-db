@@ -20,7 +20,7 @@ Observed:
 
 | Call | Response | What happened |
 | --- | --- | --- |
-| `page-id` set to a page *name* | `{:block 1}` | nothing created |
+| a page *name* where a parent UUID belongs | `{:block 1}` | nothing created |
 | `removeProperty` given a UUID | `null` | nothing removed |
 | `upsertProperty` with an explicit ident | full entity | ident silently discarded |
 | `removeBlock` given a UUID | `null` | block actually deleted |
@@ -322,17 +322,23 @@ that failed; treat it as a partial write and audit with `findOrphans` rather
 than retrying, which would duplicate what already landed.
 
 `moveBlock(block_uuid, target_uuid, placement)` relocates a block and its
-subtree — `child`, `before` or `after`. Confirmed working on all placements,
-including across pages. The API returns nothing, so the tool verifies the new
-parent, the owning page, and that descendants followed.
+subtree — `child`, `last-child`, `before` or `after`. Confirmed working on all
+placements, including across pages. The API returns nothing, so the tool
+verifies the new parent, the owning page, and that descendants followed.
 
 Three behaviours matter when using it directly:
 
 - **It no-ops when the position would not change.** Moving a block to the
   parent it already has does nothing, and comes back `verified: false` with a
-  silent-no-op diagnostic. That is the tool being honest, not failing.
-- **`child` prepends.** Moving several siblings left to right with `child`
-  reverses them. Use `after <previous sibling>` for all but the first.
+  silent-no-op diagnostic. That is the tool being honest, not failing. The one
+  exception is `last-child` on a block that is already last: nothing is
+  written and the result is `verified: true`, because the requested state was
+  read and found to hold.
+- **`child` prepends; `last-child` appends.** Moving several siblings left to
+  right with `child` reverses them at the destination. Use `last-child` — it
+  costs one extra read, and verifies the block ended up *last* rather than
+  merely under the right parent. (`after <previous sibling>` also works and is
+  what `last-child` does internally, but it makes you track the anchor.)
 - **A move carries the subtree**, and descendants' `:block/page` follows.
 
 Those three matter whenever you move blocks, and there is no bulk repair tool
@@ -446,7 +452,8 @@ that to the user rather than setting it reflexively.
 **`moveBlock` is confirmed working** on all placements, including across
 pages. Three behaviours to know when calling it directly: it no-ops when the
 position would not change (reported as `verified: false`, which is correct),
-`placement=child` prepends, and a move carries the subtree.
+`placement=child` prepends while `last-child` appends, and a move carries the
+subtree.
 
 ## Tools
 

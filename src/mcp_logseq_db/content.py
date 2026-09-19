@@ -99,33 +99,36 @@ class VerifiedContent(VerifiedWriteHelpers):
           - it must be Page-classed, so a title held only by a tag resolves to
             nothing rather than to the tag.
 
-        KNOWN TRADE-OFF: `getPage` returns one entity, so when it succeeds
-        this does NOT detect two live pages sharing a title -- it resolves to
-        whichever Logseq picked. That guard survives only on the fallback
-        path. It is accepted because `createPage` is idempotent on title and
-        refuses a taken one, so duplicates can no longer be created through
-        this server; an older graph may still contain them. Ambiguity is
-        refused rather than guessed at wherever it IS seen, because selecting
-        a write target from a fuzzy match is how the wrong entity gets
-        modified.
+        KNOWN TRADE-OFF, NOW CLOSED: `getPage` returns ONE entity, so on its
+        own it cannot tell a unique title from a duplicated one -- it resolves
+        to whichever Logseq picked, and an ambiguous title looked resolved.
+        That is exactly the case the split-identity repair has to detect, and
+        `createPage` being idempotent does not help on a graph that was
+        migrated with duplicates already in it. The fast path therefore
+        confirms the title is unique before trusting its answer, at the cost
+        of one count query. Ambiguity is refused rather than guessed at,
+        because selecting a write target from a fuzzy match is how the wrong
+        entity gets modified.
         """
         self._validate_title(title)
         page_class = await self._class_id(PAGE_CLASS)
 
-        # Fast path: one call, name or UUID.
+        # Fast path: name or UUID, one call plus the uniqueness check.
         direct = await self._client.call("logseq.DB.getPage", [title])
         if isinstance(direct, dict) and direct.get("name"):
             recycled = direct.get(":logseq.property/deleted-at") is not None
             is_page = any(self._reference_id(t) == page_class
                           or t == page_class
                           for t in (direct.get("tags") or []))
-            if is_page and not recycled:
+            if (is_page and not recycled
+                    and await self._title_is_unique(title, page_class)):
                 return {"found": True, "title": title,
                         "page_uuid": direct.get("uuid")}
 
         # Fall back to the query, which can see every match and so can report
         # ambiguity. Reached when the fast path found nothing, found a
-        # recycled page, or found something that is not Page-classed.
+        # recycled page, found something that is not Page-classed, or found a
+        # title more than one page holds.
         query = (
             "[:find [(pull ?page [:db/id :block/uuid :block/name :block/title "
             ":logseq.property/deleted-at]) ...] :in $ ?class :where "
@@ -160,6 +163,27 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "candidates": [p.get("uuid") for p in live],
             }
         return {"found": True, "title": title, "page_uuid": live[0].get("uuid")}
+
+    async def _title_is_unique(self, title: str, page_class: int) -> bool:
+        """
+        Is exactly one page-classed entity holding this title?
+
+        A count is a fixed, tiny response, so this guard costs one query
+        rather than the full pull the fallback path issues. Recycled pages are
+        counted too, which only means a graph holding a recycled duplicate
+        takes the fallback -- where recycling IS filtered and the single live
+        page resolves normally.
+
+        Anything other than exactly one, INCLUDING a count that cannot be
+        read, sends the caller to the query path. An unreadable count must not
+        read as "unique": that is the failure this guard exists to prevent.
+        """
+        count = await self._client.call(
+            "logseq.DB.datascriptQuery",
+            ["[:find (count ?page) . :in $ ?class :where "
+             "[?page :block/tags ?class] "
+             f"[?page :block/title {json.dumps(title)}]]", page_class])
+        return count == 1
 
     async def get_page(
         self, page_uuid: str, detail: str = "page"
@@ -1277,6 +1301,22 @@ class VerifiedContent(VerifiedWriteHelpers):
         the outcome is established by reading afterwards rather than from the
         response.
 
+        PLACEMENT. `child` PREPENDS -- that is Logseq's behaviour, not a
+        choice made here, and it is kept as-is because redefining it would
+        break callers. `last-child` appends, which is what moving a sequence
+        of blocks needs: with `child`, moving siblings in source order
+        reverses them at the destination, silently and with no safe
+        alternative. `before` and `after` place the block as a sibling of the
+        target.
+
+        `last-child` is implemented as "after the target's current last
+        child" rather than by generating an order key. Nothing in this API can
+        write `:block/order` -- `updateBlock` takes a title and nothing else --
+        so the only way to obtain an order is to let Logseq compute one
+        relative to an existing sibling. It costs one read of the target's
+        children, which is also what makes the result checkable: appending is
+        verified by the moved block being LAST, not merely by its parent.
+
         Three things are checked, because a move can go wrong in three ways:
         the parent may not change; the owning page may not follow the block to
         a new page; and descendants may be left behind pointing at the old
@@ -1285,17 +1325,18 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         block_uuid = self._require_entity(self._validated_uuid(block_uuid))
         target_uuid = self._validated_uuid(target_uuid)
-        if placement not in {"child", "before", "after"}:
-            raise ValueError("placement must be child, before, or after")
+        if placement not in {"child", "last-child", "before", "after"}:
+            raise ValueError(
+                "placement must be child, last-child, before, or after")
 
         block = await self._preflight_block(block_uuid, role="source")
         target = await self._entity_by_uuid(target_uuid)
         if block["id"] == target["id"]:
             raise ValueError("A block cannot be moved relative to itself")
-        if placement != "child" and target.get("name"):
+        if placement in {"before", "after"} and target.get("name"):
             raise ValueError(
-                "A page has no siblings; use placement=child to move a block "
-                "to the top level of a page")
+                "A page has no siblings; use placement=child or last-child to "
+                "move a block to the top level of a page")
 
         # Moving a block beneath its own descendant would detach the subtree
         # from the tree entirely.
@@ -1305,7 +1346,7 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "The target is inside the block's own subtree; moving there "
                 "would detach it from the graph")
 
-        expected_parent = (target["id"] if placement == "child"
+        expected_parent = (target["id"] if placement in {"child", "last-child"}
                            else self._reference_id(target.get("parent")))
         expected_page = (target["id"] if target.get("name")
                          else self._reference_id(target.get("page")))
@@ -1314,10 +1355,34 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "The target is missing the parent or page reference needed to "
                 "place a block relative to it")
 
-        options = ({"children": True} if placement == "child"
-                   else {"before": placement == "before"})
+        anchor_uuid = target_uuid
+        options: dict[str, Any] = ({"children": True}
+                                   if placement in {"child", "last-child"}
+                                   else {"before": placement == "before"})
+
+        if placement == "last-child":
+            siblings = await self._children_of(target_uuid)
+            if siblings and siblings[-1].get("id") == block["id"]:
+                # Already last. Reported as verified because the requested
+                # state holds and was READ, not because a write was observed;
+                # issuing the move anyway would return null and read as a
+                # silent no-op.
+                return ContentResult(
+                    validation=None, response=None,
+                    verified_entities=(block,),
+                    diagnostic=(
+                        "No move was needed: the block is already the last "
+                        "child of the target."),
+                    previous_entities=(block,))
+            others = [s for s in siblings if s.get("id") != block["id"]]
+            if others:
+                # Append by placing after the current last child. Its parent
+                # is the target, so expected_parent above still holds.
+                anchor_uuid = others[-1]["uuid"]
+                options = {"before": False}
+
         response, timed_out = await self._call_ambiguous(
-            "logseq.DB.moveBlock", [block_uuid, target_uuid, options])
+            "logseq.DB.moveBlock", [block_uuid, anchor_uuid, options])
 
         moved = await poll_readback(
             self._client,
@@ -1373,6 +1438,30 @@ class VerifiedContent(VerifiedWriteHelpers):
                     "belong to the old page. They are invisible to page-scoped "
                     "queries until repaired."),
                 previous_entities=(block,), observed_entities=tuple(stranded))
+
+        if placement == "last-child":
+            # The point of this placement, so it is checked rather than
+            # assumed: a correct parent with the wrong order is exactly the
+            # outcome `child` produces, and the reason this exists.
+            final = await poll_readback(
+                self._client,
+                lambda: self._children_of(target_uuid),
+                lambda kids: bool(kids) and kids[-1].get("id") == moved["id"])
+            if not final or final[-1].get("id") != moved["id"]:
+                position = next(
+                    (i for i, kid in enumerate(final)
+                     if kid.get("id") == moved["id"]), None)
+                return ContentResult(
+                    validation=None, response=response,
+                    verified_entities=(moved,),
+                    recovered_after_timeout=timed_out, verified=False,
+                    diagnostic=(
+                        "The block is under the requested parent but not last: "
+                        f"it is at position {position} of {len(final)}. "
+                        "Moving a sequence from here would not preserve "
+                        "source order."),
+                    previous_entities=(block,),
+                    observed_entities=tuple(final))
 
         return ContentResult(
             validation=None, response=response, verified_entities=(moved,),

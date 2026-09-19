@@ -19,6 +19,11 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27,<1",
+    # The upper bound is load-bearing. mcp 2.0.0 renamed FastMCP to MCPServer
+    # and moved it to mcp.server.mcpserver; an unbounded pin resolves straight
+    # through that rename and fails at import, intermittently -- a warm cache
+    # keeps working and the next fresh resolve breaks. This server is written
+    # against 2.x, so 3.x needs the same treatment when it lands.
     "mcp>=2,<3",
 ]
 

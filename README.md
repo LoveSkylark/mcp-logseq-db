@@ -113,6 +113,14 @@ pages. It no-ops when the position would not change, which the tool reports as
 `verified: false` rather than a false success — so moving a block to the parent
 it already has takes two moves, out and back.
 
+**`placement=child` prepends; use `last-child` to append.** That is the
+route's own behaviour and it is left alone, because callers depend on it — but
+it means moving several blocks in source order with `child` reverses them at
+the destination, silently. `last-child` reads the target's children and moves
+the block after the current last one, then verifies it ended up *last* rather
+than merely under the right parent. Nothing in this API can write
+`:block/order` directly, which is why appending costs that extra read.
+
 **Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
 `deleteProperty` refuse until you confirm, listing what would be affected.
 
@@ -262,10 +270,10 @@ scripts/test.ps1 -Docker    # clean container, no local Python involved
 Nothing in the suite needs Logseq running.
 
 Separately, `scripts/live_reliability.py` checks whether the server's
-assumptions about Logseq are still true — that `page-id` accepts a block UUID,
-that property writes are still namespaced, that a page name still fails
-silently. The unit tests cannot answer those questions, because the fakes
-encode the same beliefs the code does. Run it after a Logseq upgrade.
+assumptions about Logseq are still true — that a block UUID is accepted where a
+parent is expected, that property writes are still namespaced, that a page name
+still fails silently. The unit tests cannot answer those questions, because the
+fakes encode the same beliefs the code does. Run it after a Logseq upgrade.
 
 ## Documentation
 

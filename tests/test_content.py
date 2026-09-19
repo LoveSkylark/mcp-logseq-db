@@ -21,6 +21,26 @@ PAGE_CLASS_ID = 4
 PROPERTY_CLASS_ID = 3
 
 
+def order_key(value: float) -> str:
+    """
+    A fixed-width numeric string.
+
+    Logseq's real orders are fractional-index strings that sort
+    LEXICOGRAPHICALLY, which is how `Zz` ends up before `a0`. The code sorts
+    by str(order) for that reason, so the fake has to produce keys where
+    lexicographic and numeric order agree -- constant width does that, and a
+    bare str(1.5) would not.
+    """
+    return f"{value:012.4f}"
+
+
+def order_value(order: Any) -> float:
+    try:
+        return float(order)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class FakeGraph:
     """A minimal DB with real parent/page relationships."""
 
@@ -35,7 +55,7 @@ class FakeGraph:
                              tags=[PAGE_CLASS_ID])
 
     def add(self, title, parent, page, *, name=None, tags=None, ident=None,
-            entity_id=None, extra=None) -> dict[str, Any]:
+            entity_id=None, extra=None, order=None) -> dict[str, Any]:
         entity_id = entity_id if entity_id is not None else next(self._ids)
         uuid = "%08x-0000-4000-8000-000000000000" % entity_id
         entity: dict[str, Any] = {"id": entity_id, "uuid": uuid, "title": title}
@@ -47,12 +67,24 @@ class FakeGraph:
             entity["tags"] = [{"id": t} for t in tags]
         if parent is not None:
             entity["parent"] = {"id": parent}
+            # Appended after existing siblings, which is what insertBlock does.
+            # Order is modelled because placement is a real behaviour: without
+            # it, a test asserting that three blocks arrive in source order
+            # passes whatever the code does.
+            entity["order"] = order if order is not None else order_key(
+                max((order_value(s.get("order"))
+                     for s in self.children(parent)), default=0.0) + 1.0)
         if page is not None:
             entity["page"] = {"id": page}
         if extra:
             entity.update(extra)
         self.entities[uuid] = entity
         return entity
+
+    def ordered_children(self, parent_id: int) -> list[dict[str, Any]]:
+        """Children in document order, as _children_of sorts them."""
+        return sorted(self.children(parent_id),
+                      key=lambda e: str(e.get("order", "")))
 
     def by_id(self, entity_id: int) -> dict[str, Any] | None:
         return next((e for e in self.entities.values()
@@ -163,8 +195,14 @@ class FakeClient:
                 for b in blocks]
 
     def _move(self, block_uuid, target_uuid, options=None):
-        """Reparent, carrying the subtree's page with it. Returns nothing --
-        which is the whole reason the tool verifies by reading back."""
+        """Reparent, carrying the subtree's page with it, and place the block
+        within its new siblings. Returns nothing -- which is the whole reason
+        the tool verifies by reading back.
+
+        `{"children": true}` PREPENDS, which is Logseq's actual behaviour and
+        the reason last-child exists; `{"before": …}` places the block next to
+        the target.
+        """
         if not self.write_effective:
             return None
         block = self.graph.entities[block_uuid]
@@ -173,8 +211,29 @@ class FakeClient:
         parent = target["id"] if as_child else target["parent"]["id"]
         page = target["id"] if target.get("name") else target["page"]["id"]
 
+        siblings = [e for e in self.graph.ordered_children(parent)
+                    if e["id"] != block["id"]]
+        # Halve toward zero rather than subtracting, so keys stay positive.
+        # A negative key would break the fixed-width trick: "-00001" sorts
+        # BEFORE "-00002" lexicographically, which is the wrong way round.
+        if as_child:
+            position = (order_value(siblings[0].get("order")) / 2.0
+                        if siblings else 1.0)
+        else:
+            index = next(i for i, s in enumerate(siblings)
+                         if s["id"] == target["id"])
+            here = order_value(siblings[index].get("order"))
+            if (options or {}).get("before"):
+                position = ((order_value(siblings[index - 1].get("order"))
+                             + here) / 2 if index else here / 2.0)
+            else:
+                below = (order_value(siblings[index + 1].get("order"))
+                         if index + 1 < len(siblings) else here + 2.0)
+                position = (here + below) / 2
+
         block["parent"] = {"id": parent}
         block["page"] = {"id": page}
+        block["order"] = order_key(position)
         for descendant in self.graph.descendants(block["id"]):
             descendant["page"] = {"id": page}
         return None
@@ -232,6 +291,16 @@ class FakeClient:
             uuid = query.split('#uuid "')[1].split('"')[0]
             found = self.graph.entities.get(uuid)
             return dict(found) if found else None
+        if "(count ?page)" in query and ':block/title "' in query:
+            # getPage returns one entity, so the resolver counts page-classed
+            # holders of the title before trusting it. Answered here so both
+            # branches of that guard are exercised rather than only the
+            # fallback.
+            title = query.split(':block/title "')[1].split('"')[0]
+            return len([e for e in self.graph.entities.values()
+                        if e.get("title") == title
+                        and any(t.get("id") == params[0]
+                                for t in e.get("tags", []))])
         if ':block/title "' in query and ":find [(pull ?" in query:
             title = query.split(':block/title "')[1].split('"')[0]
             matches = [e for e in self.graph.entities.values()
@@ -318,8 +387,8 @@ async def test_create_block_on_a_page_makes_a_top_level_block(graph, content):
 
 
 async def test_create_block_on_a_block_nests_it(graph, content):
-    """`page-id` is a parent pointer, not a page pointer. This is the whole
-    reason nested creation does not need a separate route."""
+    """`insertBlock`'s target argument takes a page OR a block uuid. That is
+    the whole reason nested creation does not need a separate route."""
     parent = (await content.create_block(
         graph.page["uuid"], "Parent")).verified_entities[0]
 
@@ -481,6 +550,18 @@ async def test_entity_scope_denies_an_out_of_scope_target(graph):
 
 
 # ------------------------------------------------------------------ reads
+
+async def test_get_page_uuid_resolves_a_unique_title(graph, content):
+    """The fast path's positive branch: getPage answers, the uniqueness count
+    confirms it, and the result is trusted without the full pull."""
+    page = graph.add("Only One", None, None, name="only one",
+                     tags=[PAGE_CLASS_ID])
+
+    result = await content.get_page_uuid("Only One")
+
+    assert result["found"] is True
+    assert result["page_uuid"] == page["uuid"]
+
 
 async def test_get_page_uuid_refuses_an_ambiguous_title(graph, content):
     graph.add("Twin", None, None, name="twin", tags=[PAGE_CLASS_ID])
@@ -795,6 +876,140 @@ async def test_move_refuses_a_page_target_for_sibling_placement(graph, content):
     with pytest.raises(ValueError, match="page has no siblings"):
         await content.move_block(
             block["uuid"], graph.page["uuid"], placement="after")
+
+
+async def test_move_rejects_an_unknown_placement(graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], "Block")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="child, last-child, before, or after"):
+        await content.move_block(
+            block["uuid"], graph.page["uuid"], placement="first-child")
+
+
+# ------------------------------------------------- last-child appends
+#
+# `child` prepends, which is Logseq's behaviour and is left alone. The cost of
+# having no append was three pages of reversed content: moving siblings in
+# source order with `child` puts each new arrival in front of the last.
+
+async def test_child_placement_still_prepends(graph, content):
+    """Pinned deliberately. `child` is Logseq's behaviour and callers depend
+    on it; last-child was added rather than redefining this."""
+    target = (await content.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+    await content.create_block(target["uuid"], "Sitting there")
+    arrival = (await content.create_block(
+        graph.page["uuid"], "Arriving")).verified_entities[0]
+
+    await content.move_block(arrival["uuid"], target["uuid"])
+
+    children = [c["title"] for c in await content._children_of(target["uuid"])]
+    assert children == ["Arriving", "Sitting there"]
+
+
+async def test_last_child_appends_rather_than_prepending(graph, content):
+    existing = (await content.create_block(
+        graph.page["uuid"], "Already here")).verified_entities[0]
+    target = (await content.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+    await content.move_block(existing["uuid"], target["uuid"])
+    arrival = (await content.create_block(
+        graph.page["uuid"], "Arriving")).verified_entities[0]
+
+    result = await content.move_block(
+        arrival["uuid"], target["uuid"], placement="last-child")
+
+    assert result.verified is True
+    children = [c["title"] for c in await content._children_of(target["uuid"])]
+    assert children == ["Already here", "Arriving"]
+
+
+async def test_moving_a_sequence_with_last_child_preserves_source_order(
+        graph, content):
+    """The acceptance case. With `child` this same loop yields Third, Second,
+    First -- silently, and only visible by reading the destination back."""
+    source = [
+        (await content.create_block(graph.page["uuid"], title)
+         ).verified_entities[0]
+        for title in ("First", "Second", "Third")
+    ]
+    destination = graph.add("DEST", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+
+    for block in source:
+        result = await content.move_block(
+            block["uuid"], destination["uuid"], placement="last-child")
+        assert result.verified is True
+
+    moved = await content._children_of(destination["uuid"])
+    assert [b["title"] for b in moved] == ["First", "Second", "Third"]
+
+
+async def test_last_child_into_an_empty_parent(graph, content):
+    """No existing sibling to anchor after, so it falls back to the plain
+    child call -- where prepending and appending are the same thing."""
+    target = (await content.create_block(
+        graph.page["uuid"], "Empty target")).verified_entities[0]
+    block = (await content.create_block(
+        graph.page["uuid"], "Only child")).verified_entities[0]
+
+    result = await content.move_block(
+        block["uuid"], target["uuid"], placement="last-child")
+
+    assert result.verified is True
+    assert result.verified_entities[0]["parent"]["id"] == target["id"]
+
+
+async def test_last_child_on_a_block_already_last_writes_nothing(graph):
+    """The requested state already holds. Issuing the move would return null
+    and read as a silent no-op, so it is reported from the READ instead."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    target = (await verified.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+    block = (await verified.create_block(
+        target["uuid"], "Last already")).verified_entities[0]
+
+    result = await verified.move_block(
+        block["uuid"], target["uuid"], placement="last-child")
+
+    assert result.verified is True
+    assert "already the last child" in (result.diagnostic or "")
+    assert not any(m == "logseq.DB.moveBlock" for m, _ in client.calls)
+
+
+async def test_last_child_reports_a_move_that_did_not_reach_the_end(graph):
+    """A correct parent with the wrong order is exactly what `child` produces,
+    so appending cannot be verified by the parent alone."""
+    class PrependingClient(FakeClient):
+        def _move(self, block_uuid, target_uuid, options=None):
+            # Ignores the anchor and always prepends under the target's
+            # parent, which is the behaviour last-child exists to avoid.
+            block = self.graph.entities[block_uuid]
+            anchor = self.graph.entities[target_uuid]
+            parent = (anchor["id"] if anchor.get("name")
+                      else anchor["parent"]["id"])
+            first = self.graph.ordered_children(parent)
+            block["parent"] = {"id": parent}
+            block["page"] = {"id": self.graph.page["id"]}
+            block["order"] = order_key(
+                order_value(first[0].get("order")) / 2.0 if first else 1.0)
+            return None
+
+    client = PrependingClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    target = (await verified.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+    await verified.create_block(target["uuid"], "Sibling")
+    arrival = (await verified.create_block(
+        graph.page["uuid"], "Arriving")).verified_entities[0]
+
+    result = await verified.move_block(
+        arrival["uuid"], target["uuid"], placement="last-child")
+
+    assert result.verified is False
+    assert "not last" in (result.diagnostic or "")
 
 
 # --------------------------------------------- outline is the batching path

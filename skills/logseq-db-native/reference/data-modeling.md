@@ -64,8 +64,9 @@ across pages, and is confirmed on all placements. An earlier version of this
 file said there was no route for it and told you to get structure right at
 creation; that is no longer true, so a model that needs to reorganise later is
 viable. Three behaviours still shape how you use it: it no-ops when the
-position would not change, `child` prepends, and the subtree's `:block/page`
-follows the move.
+position would not change, `child` PREPENDS while `last-child` appends (use
+`last-child` when moving a sequence, or the destination ends up reversed), and
+the subtree's `:block/page` follows the move.
 
 That last point is the one that shapes import order least now that blocks can
 be moved — but building outward from identity is still cheaper than fixing

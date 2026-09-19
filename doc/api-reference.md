@@ -196,7 +196,7 @@ which is what removed the read-back cycle from outline building.
 | `createBlock(parent, title)` | `insertBlock` | **verified, nesting included** |
 | `createPageofBlocks(page, outline)` | `insertBatchBlock` per parent | **verified** |
 | `updateBlock(uuid, title)` | `updateBlock` | **verified** |
-| `moveBlock(uuid, target, placement)` | `moveBlock` | **verified, all placements** |
+| `moveBlock(uuid, target, placement)` | `moveBlock` | **verified, all placements**; `last-child` is built on `before:false` |
 | `removeBlock(uuid)` | `removeBlock` | **verified** |
 
 Every block on a page, at any depth. This walks `:block/parent` recursively
@@ -232,7 +232,7 @@ Create one, or a whole level of siblings in a single call:
 ```
 
 Move a block and its subtree. `{"children": true}` places it under the target
-(prepending); `{"before": true|false}` places it as a sibling. The method
+and **prepends**; `{"before": true|false}` places it as a sibling. The method
 returns nothing whether it moved the block or did nothing, so the outcome comes
 from reading the block back — its parent, its owning page, and whether
 descendants followed.
@@ -240,6 +240,13 @@ descendants followed.
 ```json
 {"method": "logseq.DB.moveBlock", "args": ["$BLOCK_UUID", "$TARGET_UUID", {"children": true}]}
 ```
+
+The `moveBlock` TOOL exposes a fourth placement, `last-child`, which appends.
+It has no route of its own: nothing in this API can write `:block/order`, so it
+reads the target's children and moves the block after the current last one.
+That extra read is also what makes it checkable — appending is verified by the
+block ending up last, not merely under the right parent. `child` is left
+prepending because that is the route's behaviour and callers depend on it.
 
 `createPageofBlocks` costs **one call per parent that has children** — not
 2d−1. Because each batch response carries the entities it created, a parent's
@@ -291,11 +298,14 @@ on a page made through this API is never 0.
 gains `:logseq.property/deleted-at`, and drops out of `listPages`. Inbound
 references are not rewritten.
 
-Resolve a title. `getPage` accepts a name or a UUID and is tried first, but its
-result is checked twice before being trusted — it returns recycled pages, and a
-title held only by a tag must resolve to nothing rather than to the tag. The
-query below is the fallback, and the only path that can see every match and so
-report ambiguity rather than guessing.
+Resolve a title. `getPage` accepts a name or a UUID and is tried first, but
+its result is checked three times before being trusted — it returns recycled
+pages, a title held only by a tag must resolve to nothing rather than to the
+tag, and because it returns a single entity it cannot tell a unique title from
+a duplicated one. That last check is a count, which is cheap; anything other
+than exactly one page-classed holder falls through. The query below is that
+fallback, and the only path that can see every match and so report ambiguity
+rather than guessing.
 
 ```json
 {"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?page [:db/id :block/uuid :block/name :block/title :logseq.property/deleted-at]) ...] :in $ ?class :where [?page :block/tags ?class] [?page :block/title \"$TITLE\"]]", 4]}

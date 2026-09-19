@@ -415,7 +415,7 @@ getBlockTree(blockUuid)            -> one subtree, with a truncation flag
 createBlock(parentUuid, title)     parent may be a page or a block (nests)
 createPageofBlocks(pageUuid, md)   one insertBatchBlock per parent
 updateBlock(blockUuid, title)
-moveBlock(blockUuid, targetUuid, placement)   child | before | after
+moveBlock(blockUuid, targetUuid, placement)   child | last-child | before | after
 removeBlock(blockUuid)             takes the whole subtree
 ```
 
@@ -426,8 +426,14 @@ the sequence a caller gets wrong silently (§2).
 
 `moveBlock` no-ops when the position would not change, which the tool reports
 as `verified: false` rather than as a false success. `placement=child`
-prepends. A move carries the subtree, and the tool checks all three of the new
-parent, the owning page, and whether descendants followed.
+PREPENDS -- the route's behaviour, left alone because callers depend on it --
+so `last-child` exists to append. It has no route of its own: nothing here can
+write `:block/order`, so it reads the target's children and moves the block
+after the current last one, then verifies the block ended up LAST rather than
+merely under the right parent. Without it, relocating a sequence reversed it,
+silently and with no safe alternative. A move carries the subtree, and the
+tool checks all three of the new parent, the owning page, and whether
+descendants followed.
 
 ### Pages
 
