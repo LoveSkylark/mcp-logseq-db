@@ -127,7 +127,8 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
                              "logseq.DB.datascriptQuery"),
     "retitleOverDuplicate": ("logseq.DB.renamePage",
                              "logseq.DB.datascriptQuery"),
-    "deletePage":           ("logseq.DB.deletePage",),
+    "deletePage":           ("logseq.DB.deletePage",
+                             "logseq.DB.datascriptQuery"),
     "clearPage":            ("logseq.DB.removeBlock",),
     # Lists
     "listPages":            ("logseq.DB.datascriptQuery",),
@@ -265,6 +266,11 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "own_blocks counts the empty block createPage seeds, so it is never 0 "
         "on a page created through this API. content_blocks is the figure to "
         "pair with a reference count.",
+        "is_alias_of and aliases report a relation NO count reveals: an empty "
+        "page that is a functioning alias is indistinguishable from a dead "
+        "stub by block and reference counts alone, and deleting it cannot be "
+        "undone -- alias is a built-in property outside the writable "
+        "namespace.",
     ),
     "inspectPage": (
         "The detail selector matters: a page's own tags and its blocks' tags "
@@ -326,6 +332,11 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "Inbound references are NOT rewritten. Entities linking to the page "
         "keep pointing at it, so acknowledge_reference_rewrite is required "
         "when any exist.",
+        "An ALIAS relation in either direction requires "
+        "acknowledge_alias_loss, and is the more serious of the two: a "
+        "reference can be repointed afterwards, an alias cannot -- alias is "
+        "a built-in property outside the writable namespace. No block or "
+        "reference count reveals the relation, so check pageStats first.",
         "The identifier this route accepts is unconfirmed; the UUID is tried "
         "first and the page name second.",
     ),

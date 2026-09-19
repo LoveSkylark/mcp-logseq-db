@@ -314,6 +314,22 @@ on a page made through this API is never 0.
 gains `:logseq.property/deleted-at`, and drops out of `listPages`. Inbound
 references are not rewritten.
 
+An **alias relation** is checked separately and requires its own
+acknowledgement. `alias` is a built-in property, outside the namespace this
+server may write, so a relation broken by a delete cannot be rebuilt here.
+Both spellings are queried, because DB graphs carry the built-in as
+`:logseq.property/alias` while older ones use `:block/alias`, and a guard
+matching only one silently never fires:
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?holder [:db/id :block/uuid :block/title :block/name]) ...] :in $ ?target :where (or-join [?holder ?target] [?holder :logseq.property/alias ?target] [?holder :block/alias ?target])]", 846]}
+```
+
+The reverse direction — the aliases a page declares — is the same query with
+the roles swapped. `pageStats` reports both as `is_alias_of` and `aliases`,
+because an alias relation is invisible to every block and reference count, so
+an empty page that is a functioning alias reads as a dead stub.
+
 Resolve a title. `getPage` accepts a name or a UUID and is tried first, but
 its result is checked three times before being trusted — it returns recycled
 pages, a title held only by a tag must resolve to nothing rather than to the

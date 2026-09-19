@@ -75,6 +75,15 @@ This matters because recycling is not reversible: a page recycled in the
 belief that its title would be released still holds it, and there is no
 undo.
 
+**Empty does not mean unused.** Before recycling any page, pair a block count
+with a reference count — `pageStats` gives both — and check `is_alias_of` and
+`aliases` in the same result. An alias is a live resolution rule and appears
+in NO count, so an empty page that is a working alias is indistinguishable
+from a dead stub. `deletePage` refuses on one without
+`acknowledge_alias_loss`, and that refusal is worth heeding rather than
+overriding: `alias` is a built-in property outside the writable namespace, so
+a relation broken this way cannot be rebuilt through these tools.
+
 ## A page is a block
 
 Pages, blocks, tags, and properties share one entity store. A page carries

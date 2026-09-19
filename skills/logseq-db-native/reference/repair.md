@@ -36,6 +36,34 @@ empty page that is the target of live references. Content and identity land on
 different pages often enough that emptiness alone is never sufficient grounds
 to delete. Always pair a block count with a reference count.
 
+## Alias relations are invisible to counts
+
+An alias is a live resolution rule: `[[Abilties]]` lands the reader on
+`Attribute`. Nothing in a block count or a reference count reveals that, so an
+empty page in an alias relation looks exactly like a dead stub — the one shape
+repair treats as safe to remove unattended.
+
+`pageStats` reports both directions:
+
+- `is_alias_of` — the UUID of the page that declares THIS page as an alias.
+- `aliases` — the UUIDs this page declares as aliases of itself.
+
+Either being set means **stop**. `deletePage` also refuses on an alias
+relation without `acknowledge_alias_loss`, separately from the reference
+acknowledgement, because the two are not equally recoverable: a reference to a
+recycled page can be repointed later, while `alias` is a built-in property
+outside the writable namespace, so an alias relation this server breaks it
+cannot rebuild.
+
+Also worth knowing: the built-in is `:logseq.property/alias` on a DB graph and
+`:block/alias` on older ones. Both are checked — a guard written against one
+of them silently never fires, which for a guard like this is the worst
+possible failure.
+
+Check `pageStats` before recycling any page that looks like an abandoned
+duplicate. `Abilties` was a live alias of `Attribute` and was one call away
+from being recycled; `Mechanics` carries two aliases of its own.
+
 ## Counting cheaply
 
 Start with a counted LISTING, not a per-page read.
@@ -61,6 +89,8 @@ full-graph audit affordable before the listings could do it in bulk.
   display normally; the count only explains why `own_blocks` is lower than
   `subtree_blocks`. Never a reason to write.
 - `refs`, `tag_holders`, `property_values` — inbound references by mechanism.
+- `is_alias_of`, `aliases` — alias relations in both directions. Set means
+  stop; see above.
 
 One call gives both halves of the safety check: a block count and a reference
 count. Never treat emptiness alone as grounds to delete.
@@ -85,7 +115,7 @@ the classes have different repairs and two of them are not damage at all.
 
 | Class | Signature | Repair |
 | --- | --- | --- |
-| **A — dead stub** | 0 own blocks, 0 refs, twin has content | Recycle the stub |
+| **A — dead stub** | 0 own blocks, 0 refs, **no alias relation**, twin has content | Recycle the stub |
 | **B — split identity** | 0 own blocks, **has refs**, twin has content | `retitleOverDuplicate`, or repoint/rebuild (below) |
 | **C — genuine split** | Both have own blocks | Stop. Human decision |
 | **D — nested structure** | One is a sub-page of a container | Not damage. Leave |

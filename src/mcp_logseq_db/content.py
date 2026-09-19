@@ -667,6 +667,11 @@ class VerifiedContent(VerifiedWriteHelpers):
         page_id = page["id"]
 
         own, nested, orphans = await self._classify_subtree(page_uuid)
+        # Two queries, because an alias relation is invisible in every count
+        # below and is the one thing here a delete cannot undo. An empty page
+        # with one inbound reference is indistinguishable from a dead stub
+        # until you know it is a working alias.
+        aliases = await self._alias_relations(page)
 
         # Counted in the query rather than returned and measured, so the
         # response size does not depend on the reference count.
@@ -714,6 +719,30 @@ class VerifiedContent(VerifiedWriteHelpers):
             if isinstance(row, list) and len(row) == 2
             and not _is_structural(row[0]))
 
+        alias_of = [h.get("uuid") for h in aliases["aliased_by"]
+                    if h.get("uuid")]
+        declared_aliases = [a.get("uuid") for a in aliases["aliases"]
+                            if a.get("uuid")]
+
+        alias_note = ""
+        if alias_of or declared_aliases:
+            alias_note = (
+                ". ALIAS RELATION: this page "
+                + " and ".join(filter(None, [
+                    (f"is an alias of {len(alias_of)} page(s)"
+                     if alias_of else ""),
+                    (f"declares {len(declared_aliases)} alias(es)"
+                     if declared_aliases else ""),
+                ]))
+                + ". Deleting either side breaks resolution, and `alias` is a "
+                "built-in property outside this server's writable namespace, "
+                "so it cannot be restored afterwards. An empty page in an "
+                "alias relation is NOT a dead stub.")
+        if len(alias_of) > 1:
+            alias_note += (
+                " More than one page claims this one as an alias, which is "
+                "itself irregular -- read both before touching either.")
+
         return {
             "page_uuid": page_uuid,
             "title": page.get("title"),
@@ -726,6 +755,11 @@ class VerifiedContent(VerifiedWriteHelpers):
             "refs": refs,
             "tag_holders": tag_holders,
             "property_values": property_values,
+            # uuid or None rather than a list: a page is normally the alias of
+            # exactly one page. Several is reported in the diagnostic, because
+            # it is a condition to investigate rather than a shape to model.
+            "is_alias_of": alias_of[0] if alias_of else None,
+            "aliases": declared_aliases,
             "diagnostic": (
                 f"{by_page - empty} block(s) with content, {by_page} own "
                 f"block(s) including {empty} empty, {len(nested)} nested "
@@ -736,7 +770,8 @@ class VerifiedContent(VerifiedWriteHelpers):
                    "reference count when judging whether a page is empty; "
                    "own_blocks counts the empty block createPage seeds and "
                    "so is never 0 on a page that was created through this "
-                   "API." if empty else "")),
+                   "API." if empty else "")
+                + alias_note),
         }
 
     # ------------------------------------------------------ page listings
@@ -1118,7 +1153,11 @@ class VerifiedContent(VerifiedWriteHelpers):
 
     @serialized_write
     async def delete_page(
-        self, page_uuid: str, *, acknowledge_reference_rewrite: bool = False
+        self,
+        page_uuid: str,
+        *,
+        acknowledge_reference_rewrite: bool = False,
+        acknowledge_alias_loss: bool = False,
     ) -> ContentResult:
         """
         Delete a page, which on this build recycles rather than destroys it.
@@ -1128,6 +1167,15 @@ class VerifiedContent(VerifiedWriteHelpers):
         Inbound references are NOT rewritten, so anything linking to it keeps
         pointing at a page that no longer appears in listings -- which is why
         references are surfaced and require acknowledgement.
+
+        ALIAS RELATIONS require a separate acknowledgement, and it is the more
+        serious of the two. A reference to a recycled page still points
+        somewhere and can be repointed later; an alias relation cannot be
+        rebuilt at all, because `alias` is a built-in property outside the
+        plugin namespace this server is permitted to write. Nothing in a block
+        or reference count reveals the relation either, so an empty page that
+        is a functioning alias reads as a dead stub -- which is exactly the
+        shape that invites an unattended delete.
 
         The route accepts the page UUID. The name fallback below is retained
         because it costs one call only when the UUID form does nothing, and
@@ -1140,7 +1188,25 @@ class VerifiedContent(VerifiedWriteHelpers):
 
         blocks = await self.get_block_uuid(page_uuid)
         inbound = await self._inbound_references(page["id"])
+        aliases = await self._alias_relations(page)
         previous = (page, *blocks)
+
+        alias_related = aliases["aliases"] + aliases["aliased_by"]
+        if alias_related and not acknowledge_alias_loss:
+            return ContentResult(
+                validation=None, response=None, verified_entities=(),
+                verified=False,
+                diagnostic=(
+                    f"This page is in an ALIAS relation: it declares "
+                    f"{len(aliases['aliases'])} alias(es) and "
+                    f"{len(aliases['aliased_by'])} page(s) declare it as "
+                    "one. Deleting it breaks resolution, and unlike a "
+                    "reference this cannot be repaired afterwards -- `alias` "
+                    "is a built-in property outside this server's writable "
+                    "namespace. Read the related pages first; set "
+                    "acknowledge_alias_loss=true to proceed anyway."),
+                previous_entities=previous,
+                observed_entities=tuple(alias_related))
 
         if inbound and not acknowledge_reference_rewrite:
             return ContentResult(
@@ -1204,6 +1270,9 @@ class VerifiedContent(VerifiedWriteHelpers):
             diagnostic=(
                 f"Page recycled via its {used}. It keeps its UUID and tags, "
                 f"and {len(inbound)} inbound reference(s) were not rewritten."
+                + (f" {len(alias_related)} alias relation(s) were broken and "
+                   "cannot be rebuilt through this API."
+                   if alias_related else "")
                 if current else f"Page removed via its {used}."),
             previous_entities=previous,
             observed_entities=tuple(inbound))
@@ -1477,27 +1546,42 @@ class VerifiedContent(VerifiedWriteHelpers):
 
     async def _alias_relations(
         self, page: dict[str, Any]
-    ) -> dict[str, list[int]]:
+    ) -> dict[str, list[dict[str, Any]]]:
         """
-        Alias relations in both directions.
+        Alias relations in both directions, as entities.
 
-        Both matter: a page may alias others, or be the alias another page
-        points at. Either way it is wired into resolution, and a title that
-        looks like an abandoned typo may be a working alias of the page it
-        resembles.
+        Both directions matter and they are different facts. A page may
+        DECLARE aliases (other pages that resolve to it), or it may BE one
+        (something else declares it). Deleting either side breaks resolution,
+        and neither is visible in a block or reference count: an empty page
+        that is a working alias looks exactly like a dead stub.
+
+        BOTH ATTRIBUTES are queried. DB graphs carry the built-in as
+        `:logseq.property/alias`; `:block/alias` is the older form, and a
+        guard written against only one of them silently never fires -- which
+        is the worst possible outcome for a guard whose whole job is to stop a
+        deletion. An or-join costs nothing here and removes the guess.
+
+        Note that `alias` is a built-in property, outside the plugin sandbox
+        this server can write. So an alias relation destroyed by a delete
+        cannot be restored through this API at all.
         """
-        incoming = await self._query_list(
-            "[:find [?holder ...] :in $ ?target :where "
-            "[?holder :block/alias ?target]]",
+        entity = "[:db/id :block/uuid :block/title :block/name]"
+        aliased_by = await self._query_list(
+            f"[:find [(pull ?holder {entity}) ...] :in $ ?target :where "
+            "(or-join [?holder ?target] "
+            "[?holder :logseq.property/alias ?target] "
+            "[?holder :block/alias ?target])]",
             "Alias holder lookup", page["id"])
-        declared = page.get("alias")
-        declared = declared if isinstance(declared, list) else [declared]
+        aliases = await self._query_list(
+            f"[:find [(pull ?alias {entity}) ...] :in $ ?page :where "
+            "(or-join [?page ?alias] "
+            "[?page :logseq.property/alias ?alias] "
+            "[?page :block/alias ?alias])]",
+            "Alias lookup", page["id"])
         return {
-            "aliased_by": [v for v in incoming if isinstance(v, int)],
-            "aliases": [
-                self._reference_id(a) for a in declared
-                if self._reference_id(a) is not None
-            ],
+            "aliases": [a for a in aliases if isinstance(a, dict)],
+            "aliased_by": [h for h in aliased_by if isinstance(h, dict)],
         }
 
     async def _page_by_uuid(self, page_uuid: str) -> dict[str, Any]:

@@ -195,14 +195,16 @@ def create_server(
     async def delete_page(
         page_uuid: str,
         acknowledge_reference_rewrite: bool = False,
+        acknowledge_alias_loss: bool = False,
         verbose: bool = True,
     ) -> dict[str, Any]:
-        """Delete a page. On this build it recycles rather than destroys: the page keeps its UUID, tags and blocks and stops appearing in listPages. Inbound references are NOT rewritten, so acknowledge_reference_rewrite is required when any entity links to it. Keep verbose=true here -- the envelope lists the referring entities, which is the record of what now points at a page nobody can find."""
+        """Delete a page. On this build it recycles rather than destroys: the page keeps its UUID, tags and blocks and stops appearing in listPages. Inbound references are NOT rewritten, so acknowledge_reference_rewrite is required when any entity links to it. acknowledge_alias_loss is required when the page is in an ALIAS relation in either direction -- that one is UNREPAIRABLE, because alias is a built-in property outside this server's writable namespace, and no block or reference count reveals the relation, so an empty page that is a working alias looks exactly like a dead stub. Check pageStats for is_alias_of and aliases first. Keep verbose=true here -- the envelope lists the referring and alias-related entities, which is the record of what now points at a page nobody can find."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return (await content().delete_page(
             page_uuid,
-            acknowledge_reference_rewrite=acknowledge_reference_rewrite
+            acknowledge_reference_rewrite=acknowledge_reference_rewrite,
+            acknowledge_alias_loss=acknowledge_alias_loss,
         )).to_dict(verbose)
 
     @server.tool(name="clearPage", structured_output=True)
@@ -264,7 +266,7 @@ def create_server(
 
     @server.tool(name="pageStats", structured_output=True)
     async def page_stats(page_uuid: str) -> dict[str, Any]:
-        """Counts for one page: own blocks, subtree blocks, nested pages, true orphans, and inbound refs, tag holders and property values. Returns integers only, so a full-graph audit costs a fixed payload per page rather than one proportional to page size."""
+        """Counts for one page: own blocks, subtree blocks, nested pages, true orphans, and inbound refs, tag holders and property values. Returns integers only, so a full-graph audit costs a fixed payload per page rather than one proportional to page size. Also reports ALIAS relations -- is_alias_of names the page that declares this one as an alias, and aliases lists the ones it declares itself. Check them before deleting: no count here would otherwise reveal the relation, so an empty page that is a working alias reads as a dead stub, and the relation cannot be rebuilt through this API afterwards."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return await content().page_stats(page_uuid)
@@ -611,6 +613,11 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         ),
         "is_title_available": (
             "Pass a title, not a UUID or an ident."
+        ),
+        "delete_page": (
+            "Pass an exact page UUID. Set acknowledge_reference_rewrite when "
+            "entities link to it, and acknowledge_alias_loss when it is in "
+            "an alias relation -- pageStats reports both."
         ),
         "retitle_over_duplicate": (
             "Pass the UUID of the page that should END UP with the title, "

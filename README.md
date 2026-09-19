@@ -67,6 +67,16 @@ them are worth distinguishing: `own_blocks` includes the empty block
 difference — the figure to pair with a reference count when judging whether a
 page carries anything.
 
+It also reports **alias relations**, which no count would otherwise reveal:
+`is_alias_of` names the page that declares this one as an alias, and `aliases`
+lists the ones it declares itself. This matters because an empty page in an
+alias relation is indistinguishable from a dead stub by block and reference
+counts alone, and it is the one relation this server cannot rebuild — `alias`
+is a built-in property, outside the writable namespace. `deletePage`
+therefore refuses on an alias relation without `acknowledge_alias_loss`, as a
+separate flag from the reference acknowledgement, because a reference can be
+repointed afterwards and an alias cannot.
+
 ## Cost lives at the tool boundary
 
 What a caller pays for is what crosses in and out, not the work a tool does

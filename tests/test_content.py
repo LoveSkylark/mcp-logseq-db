@@ -129,6 +129,8 @@ class FakeClient:
             return self._update_block(*args)
         if method == "logseq.DB.renamePage":
             return self._rename(*args)
+        if method == "logseq.DB.deletePage":
+            return self._delete_page(args[0])
         if method == "logseq.DB.insertBlock":
             return self._insert_block(*args)
         if method == "logseq.DB.insertBatchBlock":
@@ -197,6 +199,27 @@ class FakeClient:
         current = self.graph.entities[page_uuid]
         self.graph.entities[page_uuid] = {
             **current, "title": new_title, "name": str(new_title).lower()}
+        return None
+
+    def _delete_page(self, identifier):
+        """RECYCLES rather than destroys: the entity survives carrying
+        :logseq.property/deleted-at, keeping its UUID, tags and blocks, and
+        its inbound references are NOT rewritten.
+
+        Accepts a uuid or a name, since which one the route keys on is
+        unconfirmed and the tool tries both.
+        """
+        if not self.write_effective:
+            return None
+        found = self.graph.entities.get(identifier)
+        if found is None:
+            found = next(
+                (e for e in self.graph.entities.values()
+                 if e.get("name") == str(identifier).lower()), None)
+        if found is None:
+            return None
+        self.graph.entities[found["uuid"]] = {
+            **found, ":logseq.property/deleted-at": 1758240000}
         return None
 
     def _insert_block(self, target_uuid, title, options=None):
@@ -312,12 +335,23 @@ class FakeClient:
                     if target in wanted:
                         rows[target] = rows.get(target, 0) + 1
             return [[target, n] for target, n in rows.items()]
-        if "[?holder :block/alias ?target]" in query:
-            # An alias in the inbound direction: some page names this one as
-            # its alias, which makes it live wiring rather than a duplicate.
-            return [e["id"] for e in self.graph.entities.values()
+        if "(pull ?holder" in query and ":block/alias ?target" in query:
+            # Inbound: something declares this page as ITS alias. Both
+            # attribute spellings are matched, because the code queries both
+            # -- a guard written against one of them silently never fires.
+            return [e for e in self.graph.entities.values()
                     if any(a.get("id") == params[0]
-                           for a in (e.get("alias") or []))]
+                           for a in (e.get("alias")
+                                     or e.get(":logseq.property/alias")
+                                     or []))]
+        if "(pull ?alias" in query and ":block/alias ?alias" in query:
+            # Outbound: the aliases this page declares.
+            page = self.graph.by_id(params[0]) or {}
+            declared = (page.get("alias")
+                        or page.get(":logseq.property/alias") or [])
+            wanted = {a.get("id") for a in declared if isinstance(a, dict)}
+            return [e for e in self.graph.entities.values()
+                    if e["id"] in wanted]
         if ":block/_parent" in query and "#uuid" in query:
             uuid = query.split('#uuid "')[1].split('"')[0]
             root = self.graph.entities.get(uuid)
@@ -1641,8 +1675,122 @@ async def test_page_stats_returns_counts_not_payload(graph, content):
     assert stats["own_blocks"] == 2
     assert stats["nested_pages"] == 1
     assert stats["true_orphans"] == 0
-    # No block payload anywhere in the result.
-    assert not any(isinstance(v, list) for v in stats.values())
+    # No block payload anywhere. `aliases` is a list of UUIDs, which is
+    # bounded by the alias count rather than by page size, so the rule is
+    # "no ENTITIES", not "no lists".
+    assert not any(
+        isinstance(value, list)
+        and any(isinstance(item, dict) for item in value)
+        for value in stats.values())
+    assert stats["aliases"] == []
+    assert stats["is_alias_of"] is None
+
+
+# --------------------------------------------------------- alias visibility
+#
+# An alias relation appears in NO count: an empty page with one inbound
+# reference that is a working alias is indistinguishable from a dead stub.
+# It was found once only because findBacklinks happened to show a property
+# holder. And it cannot be repaired after a delete -- `alias` is a built-in
+# property, outside the namespace this server may write.
+
+def make_alias_pair(graph, *, owner="Attribute", alias="Abilties",
+                    attribute="alias"):
+    """`owner` declares `alias` as one of its aliases.
+
+    `attribute` switches between the two spellings Logseq has used, because
+    the code queries both and a guard written against one silently never
+    fires.
+    """
+    alias_page = graph.add(alias, None, None, name=alias.lower(),
+                           tags=[PAGE_CLASS_ID])
+    owner_page = graph.add(owner, None, None, name=owner.lower(),
+                           tags=[PAGE_CLASS_ID])
+    owner_page[attribute] = [{"id": alias_page["id"]}]
+    return owner_page, alias_page
+
+
+async def test_page_stats_shows_that_a_page_is_an_alias(graph, content):
+    """The acceptance case: pageStats on Abilties reveals its relationship to
+    Attribute, which every count above it hides."""
+    owner, alias_page = make_alias_pair(graph)
+
+    stats = await content.page_stats(alias_page["uuid"])
+
+    assert stats["own_blocks"] == 0          # reads as a dead stub
+    assert stats["is_alias_of"] == owner["uuid"]
+    assert stats["aliases"] == []
+    assert "ALIAS RELATION" in stats["diagnostic"]
+    assert "NOT a dead stub" in stats["diagnostic"]
+
+
+async def test_page_stats_shows_the_aliases_a_page_declares(graph, content):
+    owner, alias_page = make_alias_pair(graph)
+
+    stats = await content.page_stats(owner["uuid"])
+
+    assert stats["aliases"] == [alias_page["uuid"]]
+    assert stats["is_alias_of"] is None
+    assert "ALIAS RELATION" in stats["diagnostic"]
+
+
+async def test_the_newer_alias_attribute_is_seen_too(graph, content):
+    """DB graphs carry the built-in as :logseq.property/alias. Querying only
+    :block/alias would make every guard below silently pass."""
+    owner, alias_page = make_alias_pair(
+        graph, attribute=":logseq.property/alias")
+
+    stats = await content.page_stats(alias_page["uuid"])
+
+    assert stats["is_alias_of"] == owner["uuid"]
+
+
+async def test_delete_refuses_an_alias_holder_without_acknowledgement(
+        graph, content):
+    """Stats only help if the caller looks, so the destructive path checks
+    too. This is the shape that invites an unattended delete: no blocks, no
+    refs, and a working alias."""
+    _, alias_page = make_alias_pair(graph)
+
+    result = await content.delete_page(alias_page["uuid"])
+
+    assert result.verified is False
+    assert "ALIAS relation" in (result.diagnostic or "")
+    assert "cannot be repaired" in (result.diagnostic or "")
+    assert graph.entities[alias_page["uuid"]].get(
+        ":logseq.property/deleted-at") is None
+
+
+async def test_delete_refuses_a_page_that_declares_aliases(graph, content):
+    """Both directions: deleting the owner orphans the aliases pointing at
+    it, which is the same loss seen from the other side."""
+    owner, _ = make_alias_pair(graph)
+
+    result = await content.delete_page(owner["uuid"])
+
+    assert result.verified is False
+    assert "ALIAS relation" in (result.diagnostic or "")
+
+
+async def test_an_acknowledged_alias_delete_proceeds_and_says_what_broke(
+        graph, content):
+    _, alias_page = make_alias_pair(graph)
+
+    result = await content.delete_page(
+        alias_page["uuid"], acknowledge_alias_loss=True)
+
+    assert result.verified is True
+    assert "alias relation(s) were broken" in (result.diagnostic or "")
+
+
+async def test_an_ordinary_page_still_deletes_without_the_alias_flag(
+        graph, content):
+    """The guard must not become a toll on every delete."""
+    page = graph.add("Plain", None, None, name="plain", tags=[PAGE_CLASS_ID])
+
+    result = await content.delete_page(page["uuid"])
+
+    assert result.verified is True
 
 
 # ------------------------------------------------------- outline formatting

@@ -89,8 +89,22 @@ UUID and original title with instructions to undo.
 ### Deleting
 
 ```
-deletePage(page_uuid, acknowledge_reference_rewrite=false)
+deletePage(page_uuid, acknowledge_reference_rewrite=false,
+                      acknowledge_alias_loss=false)
 ```
+
+Recycles rather than destroys — see below. Inbound references are NOT
+rewritten, so `acknowledge_reference_rewrite` is required when anything links
+to it; run `findBacklinks` first and report what will be left pointing at a
+page nobody can find.
+
+`acknowledge_alias_loss` is required when the page is in an ALIAS relation,
+in either direction. Treat this one as a harder stop than the reference
+acknowledgement: a reference can be repointed afterwards, while `alias` is a
+built-in property outside the writable namespace, so an alias relation broken
+here cannot be rebuilt through this API at all. And no count reveals it —
+check `pageStats` for `is_alias_of` and `aliases` before deciding that an
+empty page is a dead stub.
 
 **This recycles rather than destroys.** The page keeps its UUID, tags, refs and
 blocks, gains `:logseq.property/deleted-at`, and drops out of `listPages`. It

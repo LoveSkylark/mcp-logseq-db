@@ -8,21 +8,7 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
-### Instruction 6 — Alias visibility on `pageStats`
 
-**Signature:** add `is_alias_of?: uuid` and `aliases?: uuid[]`.
-
-**Why:** nothing in the counts reveals that a page is a functioning alias. I found `Abilties` only because `findBacklinks` happened to show a property holder.
-
-**Addresses:** a silent data-loss path. An empty page with one ref looks exactly like a dead stub and is one `deletePage` from breaking a working alias — and `alias` is a built-in property outside the sandbox, so you can't repair it afterwards.
-
-**Works with:** all duplicate triage. `Mechanics` also carries two aliases.
-
-**Implementation:** read `:logseq.property/alias` in both directions.
-
-**Concerns:** also make `deletePage` refuse on an alias holder without an explicit acknowledgement, the way it does for references. Stats alone rely on the caller looking.
-
-**Done when:** `pageStats` on `Abilties` shows its alias relationship to `Attribute`.
 
 ---
 
