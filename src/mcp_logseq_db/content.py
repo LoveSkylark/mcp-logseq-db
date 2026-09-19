@@ -1453,6 +1453,7 @@ class VerifiedContent(VerifiedWriteHelpers):
 
     # ------------------------------------------------------------- outlines
 
+    @serialized_write
     async def create_page_of_blocks(
         self,
         page_uuid: str,
@@ -1555,83 +1556,6 @@ class VerifiedContent(VerifiedWriteHelpers):
         children = await self._query_list(query, "Child lookup")
         children.sort(key=lambda c: str(c.get("order", "")))
         return children
-
-    # --------------------------------------------------------- batch engine
-
-    @serialized_write
-
-    async def _verify_edit(self, operation: dict[str, Any]) -> dict[str, Any]:
-        expected = operation["data"]["title"]
-        entity = await poll_readback(
-            self._client,
-            lambda: self._entity_by_uuid(operation["id"]),
-            lambda value: value.get("title") == expected,
-        )
-        if entity.get("title") != expected:
-            raise RuntimeError(
-                f"Block edit did not take effect for {operation['id']}; the "
-                "call returned without error but the title is unchanged"
-            )
-        await self._verify_title_uuid_refs(entity, expected)
-        return entity
-
-    async def _candidates_for(
-        self, operation: dict[str, Any]
-    ) -> list[dict[str, Any]]:
-        """
-        Entities a newly added one could be confused with.
-
-        For a block that is its prospective siblings; for a page it is every
-        entity sharing the title. Narrowing to siblings is what lets two
-        sections each hold a child called "Notes".
-        """
-        title = operation["data"]["title"]
-        if operation["entityType"] != "block":
-            return await self._entities_by_title(title)
-        siblings = await self._children_of(operation["data"]["page-id"])
-        return [s for s in siblings if s.get("title") == title]
-
-    async def _verify_add(
-        self, operation: dict[str, Any], before: set[int]
-    ) -> dict[str, Any]:
-        title = operation["data"]["title"]
-        matches = await poll_readback(
-            self._client,
-            lambda: self._candidates_for(operation),
-            lambda values: any(e["id"] not in before for e in values),
-        )
-        created = [e for e in matches if e["id"] not in before]
-        if len(created) != 1:
-            scope = ("under the requested parent"
-                     if operation["entityType"] == "block" else "in the graph")
-            hint = ("check the parent UUID"
-                    if operation["entityType"] == "block"
-                    else "check whether the title is already taken")
-            raise RuntimeError(
-                f"Expected one new {operation['entityType']} titled {title!r} "
-                f"{scope}, found {len(created)}. This API reports success for "
-                f"writes that do nothing; {hint}."
-            )
-        entity = created[0]
-
-        if operation["entityType"] == "page":
-            if not entity.get("name"):
-                raise RuntimeError("Created entity is not a page")
-            return entity
-
-        # A block's parent is whatever `page-id` named -- a page or a block.
-        parent = await self._entity_by_uuid(operation["data"]["page-id"])
-        if self._reference_id(entity.get("parent")) != parent["id"]:
-            raise RuntimeError(
-                "Created block is not parented to the requested target")
-        expected_page = (
-            parent["id"] if parent.get("name")
-            else self._reference_id(parent.get("page"))
-        )
-        if self._reference_id(entity.get("page")) != expected_page:
-            raise RuntimeError("Created block has the wrong owning page")
-        await self._verify_title_uuid_refs(entity, title)
-        return entity
 
     # --------------------------------------------------------------- shared
 
