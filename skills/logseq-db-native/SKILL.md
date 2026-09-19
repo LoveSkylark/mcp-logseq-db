@@ -56,6 +56,25 @@ Resolve titles to identifiers **before** any write, and never select a
 destructive target from an ambiguous result. The resolver tools return
 `found: false` with candidates rather than guessing; treat that as a stop.
 
+**A title being unresolvable is not the same as a title being free.** The two
+paths disagree deliberately:
+
+- `getPageUUID` is recycle-BLIND. A recycled page does not resolve, because a
+  link resolving to a page the user deleted is worse than a miss.
+- `createPage` and `renamePage` are recycle-AWARE. The entity survives
+  recycling, so the title is still taken and both refuse it. They also count
+  blocks, tags and properties — all four share one title space.
+
+So `getPageUUID` reporting `found: false` does **not** mean you can write that
+title. Call `isTitleAvailable(title)` first, which runs the writers' own check
+and reports `available` plus `held_by` — each holder's UUID, `kind`, and
+`recycled`. Do not attempt to reconcile the two by treating either as wrong;
+the fix is to ask the right one.
+
+This matters because recycling is not reversible: a page recycled in the
+belief that its title would be released still holds it, and there is no
+undo.
+
 ## A page is a block
 
 Pages, blocks, tags, and properties share one entity store. A page carries
@@ -507,9 +526,10 @@ subtree.
 
 ## Tools
 
-**Reads** — `capabilities`, `getPageUUID`, `inspectPage`, `pageStats`,
-`getBlockUUID`, `getBlock`, `getBlockTree`, `findBacklinks`, `findOrphans`,
-`getTagUUID`, `getTag`, `getTagUsers`, `getPropertyIndent`, `getProperyUsers`
+**Reads** — `capabilities`, `getPageUUID`, `isTitleAvailable`, `inspectPage`,
+`pageStats`, `getBlockUUID`, `getBlock`, `getBlockTree`, `findBacklinks`,
+`findOrphans`, `getTagUUID`, `getTag`, `getTagUsers`, `getPropertyIndent`,
+`getProperyUsers`
 
 **Lists** (no arguments) — `listPages`, `listJournals`, `listTags`,
 `listProperties`, `listClosedValues`, `listOrphanTags`,

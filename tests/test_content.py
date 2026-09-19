@@ -20,6 +20,7 @@ from mcp_logseq_db.content import VerifiedContent, _parse_outline
 
 PAGE_CLASS_ID = 4
 PROPERTY_CLASS_ID = 3
+TAG_CLASS_ID = 2
 
 
 def order_key(value: float) -> str:
@@ -52,6 +53,10 @@ class FakeGraph:
                  entity_id=PAGE_CLASS_ID)
         self.add("Property", None, None, name="property",
                  ident=":logseq.class/Property", entity_id=PROPERTY_CLASS_ID)
+        # Present because classifying what holds a title has to tell a tag
+        # from a block, and an unresolvable class ident is a hard error.
+        self.add("Tag", None, None, name="tag", ident=":logseq.class/Tag",
+                 entity_id=TAG_CLASS_ID)
         self.page = self.add("TEST-PAGE", None, None, name="test-page",
                              tags=[PAGE_CLASS_ID])
 
@@ -1233,6 +1238,97 @@ async def test_counted_page_listing_excludes_recycled_pages(graph, content):
     rows = {r["title"]: r for r in result["pages"]}
     assert "Gone" not in rows
     assert rows["TEST-PAGE"]["content_blocks"] == 1
+
+
+# ------------------------------------------------ title availability
+#
+# The two resolution paths disagree on purpose, and the disagreement caused
+# real damage: a page recycled in the belief the title would be released,
+# found mid-repair to be still holding it, with recycling not reversible.
+# getPageUUID is recycle-BLIND so a link never resolves to a deleted page;
+# the writers are recycle-AWARE because the entity survives. Both are right.
+# These tests pin that isTitleAvailable answers with the WRITERS' rule.
+
+async def test_a_free_title_is_available(content):
+    result = await content.is_title_available("Nothing Holds This")
+
+    assert result["available"] is True
+    assert result["held_by"] == []
+
+
+async def test_a_live_page_holds_its_title(graph, content):
+    result = await content.is_title_available("TEST-PAGE")
+
+    assert result["available"] is False
+    assert result["held_by"][0]["kind"] == "page"
+    assert result["held_by"][0]["uuid"] == graph.page["uuid"]
+    assert result["held_by"][0]["recycled"] is False
+
+
+async def test_a_recycled_page_still_holds_its_title(graph, content):
+    """The acceptance case. getPageUUID reports this same title as not found,
+    which is correct and is exactly what misled a repair."""
+    recycled = graph.add("Creativity", None, None, name="creativity",
+                         tags=[PAGE_CLASS_ID],
+                         extra={":logseq.property/deleted-at": 1758240000})
+
+    result = await content.is_title_available("Creativity")
+
+    assert result["available"] is False
+    assert result["held_by"][0]["recycled"] is True
+    assert result["held_by"][0]["uuid"] == recycled["uuid"]
+    assert "RECYCLED" in result["diagnostic"]
+    # And the divergence it exists to explain, in the same graph state.
+    assert (await content.get_page_uuid("Creativity"))["found"] is False
+
+
+async def test_availability_agrees_with_what_the_writer_does(graph, content):
+    """The guarantee that matters: one rule, asked twice. If these ever
+    disagree, the tool is worse than useless -- it would license the write
+    that then fails."""
+    graph.add("Creativity", None, None, name="creativity",
+              tags=[PAGE_CLASS_ID],
+              extra={":logseq.property/deleted-at": 1758240000})
+
+    assert (await content.is_title_available("Creativity"))[
+        "available"] is False
+    with pytest.raises(ValueError, match="already exists"):
+        await content.create_page("Creativity")
+
+
+async def test_a_block_holds_a_title_too(graph, content):
+    """Surprising, and the writers' rule, so it is reported: a plain block
+    with this title makes createPage refuse."""
+    await content.create_block(graph.page["uuid"], "Just A Block")
+
+    result = await content.is_title_available("Just A Block")
+
+    assert result["available"] is False
+    assert result["held_by"][0]["kind"] == "block"
+    assert result["held_by"][0]["recycled"] is False
+
+
+async def test_a_tag_holding_a_title_is_reported_as_a_tag(graph, content):
+    """createPage refuses a title a tag holds, so the kind has to be named --
+    the remedy for a tag clash is different from the remedy for a page one."""
+    graph.add("Shared Name", None, None, ident=":user.class/shared-abc",
+              tags=[TAG_CLASS_ID])
+
+    result = await content.is_title_available("Shared Name")
+
+    assert result["available"] is False
+    assert result["held_by"][0]["kind"] == "tag"
+
+
+async def test_every_holder_of_a_duplicated_title_is_reported(graph, content):
+    """held_by is a list because untangling duplicates is one of the reasons
+    to call this, and reporting one of two holders would hide the problem."""
+    graph.add("Twin", None, None, name="twin", tags=[PAGE_CLASS_ID])
+    graph.add("Twin", None, None, name="twin", tags=[PAGE_CLASS_ID])
+
+    result = await content.is_title_available("Twin")
+
+    assert len(result["held_by"]) == 2
 
 
 # --------------------------------------------- outline is the batching path

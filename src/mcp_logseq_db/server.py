@@ -143,8 +143,13 @@ def create_server(
 
     @server.tool(name="getPageUUID", structured_output=True)
     async def get_page_uuid(title: str) -> dict[str, Any]:
-        """Resolve a page title to exactly one UUID. Accepts the display title or the lowercased name. Recycled pages do not resolve, and a title held only by a tag resolves to nothing rather than to the tag. Returns found=false with candidates when two live pages share a title, rather than guessing a write target."""
+        """Resolve a page title to exactly one UUID. Accepts the display title or the lowercased name. RECYCLED PAGES DO NOT RESOLVE, deliberately -- a link must never point at a page the user deleted -- so a title this reports as not found may still be TAKEN for writing. Use isTitleAvailable before a rename or a creation. A title held only by a tag resolves to nothing rather than to the tag. Returns found=false with candidates when two live pages share a title, rather than guessing a write target."""
         return await content().get_page_uuid(title)
+
+    @server.tool(name="isTitleAvailable", structured_output=True)
+    async def is_title_available(title: str) -> dict[str, Any]:
+        """Can this title be written? Uses the exact check createPage and renamePage make, so its answer cannot disagree with theirs. Returns available, and when taken, held_by with each holder's uuid, kind (page, tag, block or property -- all four share one title space) and whether it is RECYCLED. Recycling does not release a title: the entity survives, so the writers still refuse it while getPageUUID reports the same title as not found. That is deliberate on both sides -- a recycled page must not resolve or a link would point at a deleted page -- and this tool is how you see it. Call it before any rename or page creation, and when a duplicate-title repair needs to know what actually holds a name."""
+        return await content().is_title_available(title)
 
     @server.tool(name="inspectPage", structured_output=True)
     async def inspect_page(
@@ -588,7 +593,12 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
     contracts = {
         "get_page_uuid": (
             "Pass the page's display title. If several pages share it, use "
-            "inspectPage with a UUID instead."
+            "inspectPage with a UUID instead. A title reported as not found "
+            "may still be taken for writing -- recycled pages do not resolve "
+            "here; check isTitleAvailable."
+        ),
+        "is_title_available": (
+            "Pass a title, not a UUID or an ident."
         ),
         "inspect_page": (
             "Pass an exact page UUID and one of: page, blocks, tags, "

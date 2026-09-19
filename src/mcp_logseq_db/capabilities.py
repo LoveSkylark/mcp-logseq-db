@@ -120,6 +120,7 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     # Pages
     "getPageUUID":          ("logseq.DB.getPage",
                              "logseq.DB.datascriptQuery"),
+    "isTitleAvailable":     ("logseq.DB.datascriptQuery",),
     "inspectPage":          ("logseq.DB.datascriptQuery",),
     "createPage":           ("logseq.DB.createPage",),
     "renamePage":           ("logseq.DB.renamePage",),
@@ -275,10 +276,32 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "createPage": (
         "A title that already exists is rejected rather than duplicated; "
         "verification could not otherwise tell the new page from the old.",
+        "The check counts recycled pages, and blocks and tags as well as "
+        "pages. isTitleAvailable reports the same answer with the holder.",
+    ),
+    "isTitleAvailable": (
+        "Uses the write path's own check, so it cannot disagree with what "
+        "createPage and renamePage will do.",
+        "A RECYCLED page still holds its title -- the entity survives -- so a "
+        "title getPageUUID reports as not found can still be refused by a "
+        "write. Both behaviours are deliberate; this tool is where the "
+        "difference is visible.",
+        "Pages, tags, blocks and properties share one title space, so a "
+        "holder may be any of the four.",
+    ),
+    "getPageUUID": (
+        "Recycle-BLIND by design: a recycled page does not resolve, because "
+        "a link resolving to a deleted page is worse than a miss. A title "
+        "reported as not found may still be taken for writing.",
+        "Two live pages sharing a title return found=false with candidates "
+        "rather than a guessed write target.",
     ),
     "renamePage": (
         "Verified by UUID, not by the new title -- reading back by title "
         "cannot distinguish a rename from a second page being created.",
+        "The clash check counts recycled pages, so a title whose only holder "
+        "is recycled is still refused. isTitleAvailable reports that before "
+        "the attempt.",
     ),
     "deletePage": (
         "Recycles rather than destroys: the page keeps its UUID, tags, refs "

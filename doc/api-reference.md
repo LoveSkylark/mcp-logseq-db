@@ -278,6 +278,7 @@ the error names the level that stopped.
 | Tool | Route | Status |
 | --- | --- | --- |
 | `getPageUUID(title)` | `getPage`, then `datascriptQuery` | verified |
+| `isTitleAvailable(title)` | `datascriptQuery` | verified |
 | `inspectPage(uuid, detail)` | `datascriptQuery` (per selector) | verified |
 | `pageStats(uuid)` | `datascriptQuery` | verified |
 | `findBacklinks(uuid)` | `datascriptQuery` | verified |
@@ -328,6 +329,28 @@ rather than guessing.
 If that returns nothing, the same query against `:block/name` with the title
 lowercased is tried — `:block/name` is the normalized form, so the exact string
 Logseq stores will not match `:block/title`.
+
+### Resolving is not the same as checking availability
+
+`getPageUUID` filters recycled pages out; `createPage` and `renamePage` do not,
+because a recycled entity still exists and still holds its title. So the same
+title can be unresolvable and unwritable at once. Both behaviours are
+deliberate — a resolver that returned recycled pages would let a link point at
+a deleted page — and `isTitleAvailable` exists so the difference is visible
+rather than discovered by a failed write.
+
+It runs the writers' query, which is broader than the resolver's in two ways:
+no recycled filter, and no Page-class filter, so a block or a tag holding the
+title counts.
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?entity [*]) ...] :where [?entity :block/title \"$TITLE\"]]"]}
+```
+
+Holders are classified by what they carry: `:block/name` means page, otherwise
+the `:block/tags` entry for `:logseq.class/Tag` or `:logseq.class/Property`
+decides, and anything else is a block. Those two class ids are resolved only
+when a holder is not a page, so the common cases cost one query.
 
 `detail` selects what comes back, and the options are **not** interchangeable:
 

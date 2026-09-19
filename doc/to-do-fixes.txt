@@ -6,27 +6,6 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
-
----
-
-### Instruction 3 — `listJournals(with_counts: true)`
-
-**Signature:** add `with_counts?: boolean`; when set, each entry carries `own_blocks`, `content_blocks`, `refs`.
-
-**Why:** triaging which journals hold content currently costs one `pageStats` per journal.
-
-**Addresses:** pure call-count waste on the most common opening move of any migration.
-
-**Works with:** journal triage; would extend naturally to `listPages`.
-
-**Implementation:** one query joining journals to block counts, rather than N round trips.
-
-**Concerns:** on a large graph `listPages(with_counts)` could get slow — cap it or paginate. Keep it opt-in so the cheap listing stays cheap.
-
-**Done when:** one call replaces ~50.
-
-**Evidence:** I spent roughly 50 `pageStats` calls this session purely deciding which journals were worth reading.
-
 ---
 
 ### Instruction 4 — `isTitleAvailable(title)` **[pair with 5]**

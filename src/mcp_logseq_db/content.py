@@ -62,6 +62,7 @@ MAX_COUNTED_ROWS = 500
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
 PAGE_CLASS = ":logseq.class/Page"
+TAG_CLASS = ":logseq.class/Tag"
 
 # getPage detail selectors. Each answers a different question; they are not
 # interchangeable. A page's own tags and its blocks' tags live in different
@@ -224,6 +225,110 @@ class VerifiedContent(VerifiedWriteHelpers):
              "[?page :block/tags ?class] "
              f"[?page :block/title {json.dumps(title)}]]", page_class])
         return count == 1
+
+    async def is_title_available(self, title: str) -> dict[str, Any]:
+        """
+        Can this title be written, and if not, what holds it?
+
+        THE DIVERGENCE THIS EXISTS TO EXPOSE. `get_page_uuid` is deliberately
+        recycle-blind: a recycled page must not resolve, or a link would
+        silently point at a page the user deleted. The write path is
+        deliberately recycle-aware: recycling keeps the entity, so the title
+        is still taken and `createPage` and `renamePage` both refuse it.
+
+        Both behaviours are correct. Neither was discoverable, and the gap
+        between them is expensive: a page recycled in the belief that its
+        title would be released, discovered mid-repair to be still holding
+        it, with recycling not reversible.
+
+        This uses the WRITERS' rule -- `_entities_by_title`, the same call
+        `create_page` and `rename_page` make -- so its answer cannot drift
+        from theirs. That rule is broader than pages in two ways worth
+        knowing: it counts recycled entities, and it counts blocks, tags and
+        properties, because all four share one title space.
+
+        `held_by` is a LIST rather than a single holder. Duplicate titles are
+        one of the conditions this is used to untangle, and reporting one of
+        two holders would hide the thing being looked for.
+        """
+        self._validate_title(title)
+        holders = await self._entities_by_title(title)
+        if not holders:
+            return {
+                "title": title,
+                "available": True,
+                "held_by": [],
+                "diagnostic": (
+                    "No entity holds this title. Pages, tags, blocks and "
+                    "properties share one title space, and all four were "
+                    "checked."),
+            }
+
+        kinds = await self._title_holder_kinds(holders)
+        held_by = [
+            {
+                "uuid": holder.get("uuid"),
+                "title": holder.get("title"),
+                "kind": kind,
+                "recycled": (
+                    holder.get(":logseq.property/deleted-at") is not None),
+            }
+            for holder, kind in zip(holders, kinds)
+        ]
+
+        recycled_only = all(h["recycled"] for h in held_by)
+        diagnostic = (
+            f"{len(held_by)} entity(s) hold this title: "
+            + ", ".join(sorted({h["kind"] for h in held_by}))
+            + ". Pages, tags, blocks and properties share one title space."
+        )
+        if recycled_only:
+            diagnostic += (
+                " Every holder is RECYCLED. Recycling does not release a "
+                "title -- the entity survives with its UUID, so createPage "
+                "and renamePage both refuse it. getPageUUID reports the same "
+                "title as not found, which is deliberate and not a "
+                "contradiction: a recycled page must not resolve, or a link "
+                "would point at a page the user deleted. listRecycled shows "
+                "what is holding it.")
+        return {
+            "title": title,
+            "available": False,
+            "held_by": held_by,
+            "diagnostic": diagnostic,
+        }
+
+    async def _title_holder_kinds(
+        self, holders: list[dict[str, Any]]
+    ) -> list[str]:
+        """
+        Classify each holder as page, tag, property or block.
+
+        `:block/name` identifies a page without a query. The class ids for tag
+        and property are resolved only if some holder is not a page, so the
+        common answers -- nothing, or one page -- stay a single query.
+        """
+        if all(holder.get("name") for holder in holders):
+            return ["page"] * len(holders)
+
+        tag_class = await self._class_id(TAG_CLASS)
+        property_class = await self._class_id(PROPERTY_CLASS)
+
+        kinds = []
+        for holder in holders:
+            if holder.get("name"):
+                kinds.append("page")
+                continue
+            classes = {
+                self._reference_id(t) for t in (holder.get("tags") or [])
+            }
+            if tag_class in classes:
+                kinds.append("tag")
+            elif property_class in classes:
+                kinds.append("property")
+            else:
+                kinds.append("block")
+        return kinds
 
     async def get_page(
         self, page_uuid: str, detail: str = "page"

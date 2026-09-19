@@ -23,9 +23,10 @@ still true.
 
 **Reads**
 
-`capabilities` · `getPageUUID` · `inspectPage` · `pageStats` · `getBlockUUID` ·
-`getBlock` · `getBlockTree` · `findBacklinks` · `findOrphans` · `getTagUUID` ·
-`getTag` · `getTagUsers` · `getPropertyIndent` · `getProperyUsers`
+`capabilities` · `getPageUUID` · `isTitleAvailable` · `inspectPage` ·
+`pageStats` · `getBlockUUID` · `getBlock` · `getBlockTree` · `findBacklinks` ·
+`findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
+`getPropertyIndent` · `getProperyUsers`
 
 **Lists** — no arguments, each returns a whole kind
 
@@ -164,6 +165,21 @@ their order for no benefit.
 **Recycled pages survive deletion**, keeping their UUID, tags, and blocks, so
 `listPages` excludes them explicitly and `listRecycled` shows them. Inbound
 references are not rewritten.
+
+**A recycled page still holds its title, and the two resolution paths disagree
+about that on purpose.** `getPageUUID` will not resolve a recycled page — a
+link resolving to a page the user deleted is worse than a miss — so it reports
+such a title as not found. `createPage` and `renamePage` both refuse it, because
+the entity is still there. Both behaviours are right; neither was discoverable,
+and the gap cost a repair: a page recycled in the belief the title would be
+released, found mid-repair to be still holding it, with recycling not
+reversible.
+
+`isTitleAvailable(title)` closes that. It runs the write path's own check and
+reports `available`, plus `held_by` with each holder's UUID, kind and whether
+it is recycled. Call it before any rename or page creation. Note the kinds:
+pages, tags, blocks and properties share one title space, so a plain block
+with the title you want is enough to make `createPage` refuse.
 
 ## Install
 

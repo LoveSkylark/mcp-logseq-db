@@ -21,8 +21,15 @@ title and nothing else. There is no `upsertNode`. Even a generic upsert would
 not help — upsert *resolves on* the identity attribute, so a different UUID
 selects a different entity rather than renaming one.
 
-**Deleting does not free a UUID.** Recycling keeps the UUID, tags, refs and
-blocks. A title is released for reuse, an identity never is.
+**Deleting frees nothing.** Recycling keeps the UUID, tags, refs and blocks,
+and it keeps the TITLE: the entity survives, so `createPage` and `renamePage`
+both still refuse that title. An earlier version of this file said a title was
+"released for reuse" — it is not, and acting on that cost a repair. What makes
+it hard to notice is that `getPageUUID` reports such a title as not found,
+which is correct for a resolver and reads as "free". Ask
+`isTitleAvailable(title)` instead: it uses the writers' check and reports
+`held_by` with `recycled: true`. Never recycle a page expecting to reuse its
+title — there is no undo, and the title stays taken.
 
 **Empty does not mean safe.** The most common serious error is recycling an
 empty page that is the target of live references. Content and identity land on

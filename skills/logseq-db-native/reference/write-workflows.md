@@ -34,7 +34,11 @@ createPage(title)
 ```
 
 A title already held by any page, tag or block is rejected — the three share
-one title space.
+one title space, and the check counts RECYCLED pages too, since recycling
+keeps the entity. Call `isTitleAvailable(title)` first if the title might be
+taken: it runs this same check and names the holder, including whether it is
+recycled. `getPageUUID` returning `found: false` is not evidence the title is
+free — it is recycle-blind by design.
 
 Routed through `logseq.DB.createPage`, not `upsertNodes`. Two reasons:
 `upsertNodes` fails outright on synced graphs, returning "The Imported EDN has
@@ -60,7 +64,9 @@ original UUID is re-read and its title compared. The check also confirms
 look like success.
 
 A title another entity already holds is rejected, for the same reason as
-`createPage`.
+`createPage` — and on the same recycle-aware check, so a title whose only
+holder is a recycled page is refused. `isTitleAvailable(new_title)` reports
+that before the attempt.
 
 ### Deleting
 
