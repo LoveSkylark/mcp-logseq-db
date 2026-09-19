@@ -93,6 +93,39 @@ function Test-EngineReady($engine) {
            "Start Docker Desktop and try again.")
 }
 
+function Resolve-LocalPython {
+    <#
+        Return the interpreter to run pytest with, as a command plus any
+        leading arguments.
+
+        `py -3.13 -m pytest` is preferred because the launcher PINS the
+        version, so -Python means something. Without the launcher there is
+        nothing to pin with, so each candidate is TRIED rather than trusted by
+        name: `python` is the command on Windows and may be a stale Python 2
+        elsewhere, `python3` is the norm on macOS and Linux and does not exist
+        on Windows at all. Whichever reports 3.11 or newer first wins, so the
+        order is a preference and not a requirement.
+
+        Trying only `python3` is what made this script fail on a machine with a
+        perfectly good Python 3.13 on PATH as `python`.
+    #>
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        return @{ Command = "py"; Arguments = @("-$Python"); Pinned = $true }
+    }
+    foreach ($name in @("python", "python3")) {
+        if (-not (Get-Command $name -ErrorAction SilentlyContinue)) { continue }
+        $version = (& $name -c `
+            "import sys; print('{}.{}'.format(*sys.version_info))") 2>$null
+        if ($LASTEXITCODE -eq 0 -and $version -and
+            [version]$version -ge [version]"3.11") {
+            return @{ Command = $name; Arguments = @();
+                      Pinned = $false; Version = $version }
+        }
+    }
+    throw ("No Python 3.11+ interpreter found on PATH. Looked for the py " +
+           "launcher, then python, then python3.")
+}
+
 Push-Location $root
 try {
     $marker = if ($Live) { @() } else { @("-m", "not live") }
@@ -151,13 +184,31 @@ try {
 
     # `py -X -m pytest` rather than a bare `pytest`: the launcher pins the
     # interpreter, and -m guarantees the pytest that runs belongs to it.
-    Write-Host "Running tests with Python $Python..." -ForegroundColor Cyan
-    if (Get-Command py -ErrorAction SilentlyContinue) {
-        & py "-$Python" -m pytest -q @marker @PytestArgs
+    $interpreter = Resolve-LocalPython
+
+    if ($interpreter.Pinned) {
+        Write-Host "Running tests with Python $Python..." -ForegroundColor Cyan
     }
     else {
-        & python3 -m pytest -q @marker @PytestArgs
+        # -Python cannot be honoured without the launcher, so say which
+        # interpreter is actually being used rather than echoing the request.
+        $reported = $interpreter.Version
+        Write-Host ("Running tests with $($interpreter.Command) " +
+                    "$reported (no py launcher, so -Python is ignored)...") `
+            -ForegroundColor Cyan
+        if ($reported -and $reported -ne $Python) {
+            Write-Host ("Requested Python $Python but only $reported is " +
+                        "available. Install the py launcher, or use " +
+                        "-Container to pin a version.") -ForegroundColor Yellow
+        }
     }
+
+    # Built up rather than splatted inline: an empty $PytestArgs concatenated
+    # into an array contributes a $null element, which pytest receives as an
+    # empty path argument and rejects.
+    $argv = @($interpreter.Arguments) + @("-m", "pytest", "-q") + $marker
+    if ($PytestArgs) { $argv += $PytestArgs }
+    & $interpreter.Command @argv
     exit $LASTEXITCODE
 }
 finally {
