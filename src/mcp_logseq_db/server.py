@@ -157,35 +157,45 @@ def create_server(
         return await content().get_page(page_uuid, detail)
 
     @server.tool(name="createPage", structured_output=True)
-    async def create_page(title: str, dry_run: bool = False) -> dict[str, Any]:
-        """Create one page. Routed through logseq.DB.createPage, which is idempotent on title -- unlike upsertNodes, which fails outright on synced graphs. A title already held by any page, tag or block is rejected, since the three share one title space."""
-        return (await content().create_page(title, dry_run=dry_run)).to_dict()
+    async def create_page(
+        title: str, dry_run: bool = False, verbose: bool = True
+    ) -> dict[str, Any]:
+        """Create one page. Routed through logseq.DB.createPage, which is idempotent on title -- unlike upsertNodes, which fails outright on synced graphs. A title already held by any page, tag or block is rejected, since the three share one title space. verbose=false returns identity and position only."""
+        return (await content().create_page(
+            title, dry_run=dry_run)).to_dict(verbose)
 
     @server.tool(name="renamePage", structured_output=True)
-    async def rename_page(page_uuid: str, new_title: str) -> dict[str, Any]:
-        """Rename a page and verify by UUID. Reading back by title would not distinguish a rename from Logseq creating a second page and leaving the original alone."""
+    async def rename_page(
+        page_uuid: str, new_title: str, verbose: bool = True
+    ) -> dict[str, Any]:
+        """Rename a page and verify by UUID. Reading back by title would not distinguish a rename from Logseq creating a second page and leaving the original alone. verbose=false returns identity and position only."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
-        return (await content().rename_page(page_uuid, new_title)).to_dict()
+        return (await content().rename_page(
+            page_uuid, new_title)).to_dict(verbose)
 
     @server.tool(name="deletePage", structured_output=True)
     async def delete_page(
-        page_uuid: str, acknowledge_reference_rewrite: bool = False
+        page_uuid: str,
+        acknowledge_reference_rewrite: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Delete a page. On this build it recycles rather than destroys: the page keeps its UUID, tags and blocks and stops appearing in listPages. Inbound references are NOT rewritten, so acknowledge_reference_rewrite is required when any entity links to it."""
+        """Delete a page. On this build it recycles rather than destroys: the page keeps its UUID, tags and blocks and stops appearing in listPages. Inbound references are NOT rewritten, so acknowledge_reference_rewrite is required when any entity links to it. Keep verbose=true here -- the envelope lists the referring entities, which is the record of what now points at a page nobody can find."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return (await content().delete_page(
             page_uuid,
             acknowledge_reference_rewrite=acknowledge_reference_rewrite
-        )).to_dict()
+        )).to_dict(verbose)
 
     @server.tool(name="clearPage", structured_output=True)
-    async def clear_page(page_uuid: str) -> dict[str, Any]:
-        """Delete every block on a page, keeping the page itself along with its tags and property values. One call per top-level block, since the API has no batch delete."""
+    async def clear_page(
+        page_uuid: str, verbose: bool = True
+    ) -> dict[str, Any]:
+        """Delete every block on a page, keeping the page itself along with its tags and property values. One call per top-level block, since the API has no batch delete. LEAVE verbose=true unless you have the content elsewhere: previous_entities is the only remaining record of what was destroyed, and it is what lets you diff an import against the originals. verbose=false reduces it to a count."""
         page_uuid = require_uuid(
             page_uuid, role="page_uuid", hint="getPageUUID")
-        return (await content().clear_page(page_uuid)).to_dict()
+        return (await content().clear_page(page_uuid)).to_dict(verbose)
 
     @server.tool(name="importPage", structured_output=True)
     async def import_page(
@@ -267,27 +277,36 @@ def create_server(
 
     @server.tool(name="createBlock", structured_output=True)
     async def create_block(
-        parent_uuid: str, title: str, dry_run: bool = False
+        parent_uuid: str,
+        title: str,
+        dry_run: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Create one block. parent_uuid may be a page UUID (top-level block) or a block UUID (nested child). Only the title can be set at creation; tags and position are follow-up calls. The block is appended after the parent's existing children."""
+        """Create one block. parent_uuid may be a page UUID (top-level block) or a block UUID (nested child). Only the title can be set at creation; tags and position are follow-up calls. The block is appended after the parent's existing children. verbose=false returns identity and position only, which is all a creation tells you that you did not already know."""
         return (await content().create_block(
-            parent_uuid, title, dry_run=dry_run)).to_dict()
+            parent_uuid, title, dry_run=dry_run)).to_dict(verbose)
 
     @server.tool(name="createPageofBlocks", structured_output=True)
     async def create_page_of_blocks(
-        page_uuid: str, outline: str, dry_run: bool = False
+        page_uuid: str,
+        outline: str,
+        dry_run: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Build an indented outline on a page. Structure comes from INDENTATION ONLY -- a leading markdown bullet is stripped, anything else becomes part of the title. Costs one call per parent that has children. The whole outline is validated before the first write, so a malformed one commits nothing."""
+        """Build an indented outline on a page. Structure comes from INDENTATION ONLY -- a leading markdown bullet is stripped, anything else becomes part of the title. Costs one call per parent that has children. The whole outline is validated before the first write, so a malformed one commits nothing. verbose=false returns a UUID per created block instead of the whole block, which matters here because the titles echoed back are the outline you just sent."""
         return await content().create_page_of_blocks(
-            page_uuid, outline, dry_run=dry_run)
+            page_uuid, outline, dry_run=dry_run, verbose=verbose)
 
     @server.tool(name="updateBlock", structured_output=True)
     async def update_block(
-        block_uuid: str, title: str, dry_run: bool = False
+        block_uuid: str,
+        title: str,
+        dry_run: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Edit one block's title. Does not create, move, nest, or delete."""
+        """Edit one block's title. Does not create, move, nest, or delete. verbose=true returns the block before and after, which is worth having when Logseq rewrote what you sent -- it parses content on write, so [[X]] comes back as [[uuid]]. verbose=false when you only need to know it landed."""
         return (await content().update_block(
-            block_uuid, title, dry_run=dry_run)).to_dict()
+            block_uuid, title, dry_run=dry_run)).to_dict(verbose)
 
     @server.tool(name="moveBlock", structured_output=True)
     async def move_block(
@@ -296,20 +315,23 @@ def create_server(
         placement: Literal[
             "child", "last-child", "before", "after"
         ] = "child",
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Move a block and its subtree relative to a target. placement=child PREPENDS under the target, so moving several blocks with it reverses their order -- use last-child to APPEND, which is what relocating a sequence needs. Both accept a page target, moving the block to the page's top level; before and after place it as a sibling and need a block target. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed; last-child additionally confirms the block ended up last."""
+        """Move a block and its subtree relative to a target. placement=child PREPENDS under the target, so moving several blocks with it reverses their order -- use last-child to APPEND, which is what relocating a sequence needs. Both accept a page target, moving the block to the page's top level; before and after place it as a sibling and need a block target. The API returns nothing on a move, so the result is verified by reading the block back and checking its parent, its owning page, and that descendants followed; last-child additionally confirms the block ended up last. PASS verbose=false when chaining moves: a move changes position, not content, so the full envelope costs the block's own text twice to tell you a parent id."""
         block_uuid = require_uuid(
             block_uuid, role="block_uuid", hint="getBlockUUID")
         target_uuid = require_uuid(
             target_uuid, role="target_uuid",
             hint="getBlockUUID or getPageUUID")
         return (await content().move_block(
-            block_uuid, target_uuid, placement=placement)).to_dict()
+            block_uuid, target_uuid, placement=placement)).to_dict(verbose)
 
     @server.tool(name="removeBlock", structured_output=True)
-    async def remove_block(block_uuid: str) -> dict[str, Any]:
-        """Delete a block and its entire subtree, then verify every UUID in that subtree is absent."""
-        return (await content().remove_block(block_uuid)).to_dict()
+    async def remove_block(
+        block_uuid: str, verbose: bool = True
+    ) -> dict[str, Any]:
+        """Delete a block and its entire subtree, then verify every UUID in that subtree is absent. verbose=true returns the subtree as it was, which is the only record of what was deleted; verbose=false reduces it to a count."""
+        return (await content().remove_block(block_uuid)).to_dict(verbose)
 
     # ------------------------------------------------------------- tags
 
@@ -332,27 +354,32 @@ def create_server(
 
     @server.tool(name="creatTag", structured_output=True)
     async def creat_tag(
-        title: str, options: dict[str, Any] | None = None
+        title: str,
+        options: dict[str, Any] | None = None,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Create a tag. The ident is assigned by Logseq, not derived from the title, and is returned in verified_state -- read it rather than constructing it. Tags and pages share one title space, so a title an existing page holds is refused."""
-        return (await mutations().create_tag(title, options)).to_dict()
+        """Create a tag. The ident is assigned by Logseq, not derived from the title, and is returned in verified_state -- read it rather than constructing it. Tags and pages share one title space, so a title an existing page holds is refused. verbose=false still returns the ident, since that is the point of the call."""
+        return (await mutations().create_tag(title, options)).to_dict(verbose)
 
     @server.tool(name="deleteTag", structured_output=True)
     async def delete_tag(
         tag_uuid: str,
         acknowledge_child_reparent: bool = False,
         acknowledge_detach: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
         """Delete one tag entity. Everything carrying the tag loses it, so acknowledge_detach is required when any page or block holds it, and acknowledge_child_reparent when child tags would be reparented. Run getTagUsers first to see what is affected."""
         tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
         return (await mutations().delete_tag(
             tag_uuid,
             acknowledge_child_reparent=acknowledge_child_reparent,
-            acknowledge_detach=acknowledge_detach)).to_dict()
+            acknowledge_detach=acknowledge_detach)).to_dict(verbose)
 
     @server.tool(name="addTag", structured_output=True)
-    async def add_tag(target_uuid: str, tag_uuid: str) -> dict[str, Any]:
-        """Attach an existing tag to a page or a block. target_uuid may be either. Both arguments are UUIDs; the target comes first."""
+    async def add_tag(
+        target_uuid: str, tag_uuid: str, verbose: bool = True
+    ) -> dict[str, Any]:
+        """Attach an existing tag to a page or a block. target_uuid may be either. Both arguments are UUIDs; the target comes first. verbose=false is usually right: the envelope otherwise returns the whole target entity, whose content is unrelated to the tag being added."""
         # Validate both before either lookup, so a call with the arguments
         # swapped or a title in one slot names the offending argument rather
         # than failing halfway through.
@@ -360,16 +387,20 @@ def create_server(
             target_uuid, role="target_uuid",
             hint="getPageUUID or getBlockUUID")
         tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
-        return (await mutations().add_tag(target_uuid, tag_uuid)).to_dict()
+        return (await mutations().add_tag(
+            target_uuid, tag_uuid)).to_dict(verbose)
 
     @server.tool(name="removeTag", structured_output=True)
-    async def remove_tag(target_uuid: str, tag_uuid: str) -> dict[str, Any]:
+    async def remove_tag(
+        target_uuid: str, tag_uuid: str, verbose: bool = True
+    ) -> dict[str, Any]:
         """Detach one tag from a page or a block. Other tags on the target are untouched and the tag entity survives. Both arguments are UUIDs; the target comes first."""
         target_uuid = require_uuid(
             target_uuid, role="target_uuid",
             hint="getPageUUID or getBlockUUID")
         tag_uuid = require_uuid(tag_uuid, role="tag_uuid", hint="getTagUUID")
-        return (await mutations().remove_tag(target_uuid, tag_uuid)).to_dict()
+        return (await mutations().remove_tag(
+            target_uuid, tag_uuid)).to_dict(verbose)
 
     # -------------------------------------------------------- properties
 
@@ -388,19 +419,22 @@ def create_server(
         title: str,
         schema: dict[str, Any],
         options: dict[str, Any] | None = None,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Create a property definition. Pass a plain title, never a namespaced ident -- spaces are stripped from it, so "MCPT Check" becomes MCPTCheck. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen. The stored type is verified against the requested one."""
+        """Create a property definition. Pass a plain title, never a namespaced ident -- spaces are stripped from it, so "MCPT Check" becomes MCPTCheck. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen. The stored type is verified against the requested one. verbose=false still returns the assigned ident, which every other property tool needs."""
         return (await mutations().create_property(
-            title, schema, options)).to_dict()
+            title, schema, options)).to_dict(verbose)
 
     @server.tool(name="deleteProperty", structured_output=True)
     async def delete_property(
-        property_ident: str, acknowledge_value_loss: bool = False
+        property_ident: str,
+        acknowledge_value_loss: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
         """Delete a property definition graph-wide, taking every value with it. Not reversible -- recreating mints a new entity and the old values do not return. acknowledge_value_loss is required when anything holds a value; run getProperyUsers first to see what is affected."""
         return (await mutations().delete_property(
             property_ident,
-            acknowledge_value_loss=acknowledge_value_loss)).to_dict()
+            acknowledge_value_loss=acknowledge_value_loss)).to_dict(verbose)
 
     @server.tool(name="addProperty", structured_output=True)
     async def add_property(
@@ -408,18 +442,19 @@ def create_server(
         property_ident: str,
         value: Any,
         options: dict[str, Any] | None = None,
+        verbose: bool = True,
     ) -> dict[str, Any]:
-        """Set a property value on a page or a block. target_uuid may be either. Reference-typed properties take an entity id, not a literal; closed enums such as Status take one of the entities from listClosedValues. Only properties in this plugin's own namespace can be written."""
+        """Set a property value on a page or a block. target_uuid may be either. Reference-typed properties take an entity id, not a literal; closed enums such as Status take one of the entities from listClosedValues. Only properties in this plugin's own namespace can be written. verbose=true returns the target entity, which is how you see the stored value; verbose=false when you only need to know it landed."""
         return (await mutations().set_property(
-            target_uuid, property_ident, value, options)).to_dict()
+            target_uuid, property_ident, value, options)).to_dict(verbose)
 
     @server.tool(name="removeProperty", structured_output=True)
     async def remove_property(
-        target_uuid: str, property_ident: str
+        target_uuid: str, property_ident: str, verbose: bool = True
     ) -> dict[str, Any]:
         """Clear a property value from a page or a block. The property definition survives and other targets keep their values -- use deleteProperty to remove the definition itself."""
         return (await mutations().clear_property(
-            target_uuid, property_ident)).to_dict()
+            target_uuid, property_ident)).to_dict(verbose)
 
     # ------------------------------------------------------------ lists
     # Each takes no arguments and returns the whole of one kind.

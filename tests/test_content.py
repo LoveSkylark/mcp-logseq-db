@@ -9,6 +9,7 @@ failure mode this API actually has.
 """
 
 import itertools
+import json
 import re
 from typing import Any
 
@@ -1010,6 +1011,98 @@ async def test_last_child_reports_a_move_that_did_not_reach_the_end(graph):
 
     assert result.verified is False
     assert "not last" in (result.diagnostic or "")
+
+
+# ------------------------------------------------------- terse responses
+#
+# The verification path is unchanged: every write below still reads back and
+# still reports the same `verified`. What terse removes is the SERIALISED
+# payload, which for a write envelope is the block's own content twice over --
+# once as previous_entities and once as verified_entities.
+
+LONG_PROSE = (
+    "The archivists of the lower vault kept their ledgers in a hand nobody "
+    "living could read, which is how the inventory came to be argued about "
+    "rather than consulted. " * 12
+)
+
+
+async def test_terse_move_does_not_echo_the_block_text(graph, content):
+    """The acceptance case: moving a long block should cost roughly its
+    identifiers, not its prose."""
+    block = (await content.create_block(
+        graph.page["uuid"], LONG_PROSE)).verified_entities[0]
+    target = (await content.create_block(
+        graph.page["uuid"], "Target")).verified_entities[0]
+
+    result = await content.move_block(block["uuid"], target["uuid"])
+    terse = result.to_dict(verbose=False)
+
+    assert terse["verified"] is True
+    assert terse["uuid"] == block["uuid"]
+    assert terse["parent"] == target["id"]
+    assert terse["page"] == graph.page["id"]
+    assert LONG_PROSE not in json.dumps(terse)
+    # The verbose form is what it is being compared against, and it carries
+    # the prose twice.
+    assert json.dumps(result.to_dict()).count("archivists") >= 2
+    assert len(json.dumps(terse)) < 400
+
+
+async def test_terse_still_verifies_and_stays_actionable_on_failure(graph):
+    """Shaping must not soften a failure. A caller cannot re-run a write to
+    get detail, so the terse form keeps the observed entities -- as digests."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    first = (await verified.create_block(
+        graph.page["uuid"], LONG_PROSE)).verified_entities[0]
+    second = (await verified.create_block(
+        graph.page["uuid"], "Second")).verified_entities[0]
+    client.write_effective = False
+
+    result = await verified.move_block(second["uuid"], first["uuid"])
+    terse = result.to_dict(verbose=False)
+
+    assert terse["verified"] is False
+    assert "silent no-op" in terse["diagnostic"]
+    assert terse["observed"][0]["uuid"] == second["uuid"]
+    assert "title" not in terse["observed"][0]
+    # The read-back happened either way.
+    assert any(m == "logseq.DB.datascriptQuery" for m, _ in client.calls)
+
+
+async def test_clear_page_keeps_the_record_of_what_it_destroyed(graph, content):
+    """clearPage's payload is the only remaining copy of the deleted text, so
+    verbose stays the default here and terse reduces it to a count."""
+    await content.create_block(graph.page["uuid"], LONG_PROSE)
+
+    result = await content.clear_page(graph.page["uuid"])
+
+    assert LONG_PROSE in json.dumps(result.to_dict())
+    terse = result.to_dict(verbose=False)
+    assert LONG_PROSE not in json.dumps(terse)
+    assert terse["previous_count"] == 1
+
+
+async def test_terse_outline_returns_uuids_not_the_outline_back(graph, content):
+    result = await content.create_page_of_blocks(
+        graph.page["uuid"], "Alpha\n    Beta\n", verbose=False)
+
+    assert result["created_count"] == 2
+    assert all(set(block) <= {"uuid", "ident", "parent", "page", "order"}
+               for block in result["created"])
+    assert "Alpha" not in json.dumps(result)
+
+
+async def test_terse_page_creation_reports_no_parent(graph, content):
+    """A page has no parent, and the absence is information -- so the key is
+    present and null rather than missing."""
+    result = await content.create_page("Fresh Page")
+    terse = result.to_dict(verbose=False)
+
+    assert terse["verified"] is True
+    assert terse["parent"] is None
+    assert "order" not in terse
 
 
 # --------------------------------------------- outline is the batching path

@@ -47,7 +47,7 @@ from typing import Any
 
 import httpx
 
-from ._shared import VerifiedWriteHelpers
+from ._shared import VerifiedWriteHelpers, entity_digest, entity_digests
 from .client import LogseqDBClient, poll_readback, serialized_write
 
 MAX_SUBTREE_NODES = 1000
@@ -74,8 +74,42 @@ class ContentResult:
     previous_entities: tuple[dict[str, Any], ...] = ()
     observed_entities: tuple[dict[str, Any], ...] = ()
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self, verbose: bool = True) -> dict[str, Any]:
+        """
+        The envelope, in full or reduced to what a caller acts on.
+
+        Terse is SHAPING ONLY. The write still read back, still compared, and
+        still reports the same `verified` -- the difference is that the entity
+        payload is not serialised. That matters because the payload is the
+        content itself, twice: `previous_entities` and `verified_entities` both
+        carry the block, so moving a page of prose costs its own text twice
+        over to learn one boolean and a parent id.
+
+        Counts replace collections rather than being dropped, because "the
+        subtree was 38 blocks" is the part of a destructive result a caller
+        needs, and it costs an integer. On a FAILURE the observed entities are
+        digested rather than counted: a caller cannot safely re-run the write
+        to get detail, so the terse form has to stay actionable.
+        """
+        if verbose:
+            return asdict(self)
+
+        primary = self.verified_entities[0] if self.verified_entities else None
+        body: dict[str, Any] = {
+            "verified": self.verified,
+            **entity_digest(primary),
+            "diagnostic": self.diagnostic,
+        }
+        if len(self.verified_entities) > 1:
+            body["verified_count"] = len(self.verified_entities)
+        if self.previous_entities:
+            body["previous_count"] = len(self.previous_entities)
+        if self.recovered_after_timeout:
+            body["recovered_after_timeout"] = True
+        if not self.verified and self.observed_entities:
+            body["observed"] = entity_digests(self.observed_entities)
+            body["observed_count"] = len(self.observed_entities)
+        return body
 
 
 class VerifiedContent(VerifiedWriteHelpers):
@@ -1543,6 +1577,7 @@ class VerifiedContent(VerifiedWriteHelpers):
         outline: str,
         *,
         dry_run: bool = False,
+        verbose: bool = True,
     ) -> dict[str, Any]:
         """
         Build an indented outline on a page.
@@ -1625,7 +1660,12 @@ class VerifiedContent(VerifiedWriteHelpers):
             "page_uuid": page_uuid,
             "levels": depth_max + 1,
             "calls": parent_count,
-            "created": created,
+            # The outline was supplied by the caller, so echoing every created
+            # block's title back is the one payload they already have.
+            **({"created": created} if verbose else {
+                "created_count": len(created),
+                "created": entity_digests(created),
+            }),
         }
 
     async def _children_of(self, parent_uuid: str) -> list[dict[str, Any]]:

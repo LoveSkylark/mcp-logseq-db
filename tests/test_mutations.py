@@ -10,6 +10,7 @@ Two properties of this API shape most of these tests:
 """
 
 import itertools
+import json
 import re
 from typing import Any
 
@@ -122,7 +123,11 @@ class FakeClient:
         return None
 
     def _upsertProperty(self, title, schema=None, options=None):
-        ident = f":plugin.property._test_plugin/{title}"
+        # Spaces are stripped from the title to form the ident -- "MCPT Check"
+        # becomes MCPTCheck. Modelled because an ident containing a space is
+        # not a valid keyword, and the code now rejects one rather than
+        # interpolating it into a query.
+        ident = f":plugin.property._test_plugin/{title.replace(' ', '')}"
         return self.graph.add(
             title, ident=ident, tags=[PROPERTY_CLASS_ID],
             extra={":logseq.property/type": (schema or {}).get("type",
@@ -626,3 +631,35 @@ async def test_a_genuinely_wrong_value_is_still_caught(graph):
     with pytest.raises(MutationVerificationError, match="not "):
         await VerifiedMutations(client).set_property(  # type: ignore[arg-type]
             graph.page["uuid"], NODE_PROP, existing["id"])
+
+
+# ------------------------------------------------------- terse responses
+#
+# A tag or property write returns the whole TARGET entity as evidence, and a
+# target is usually a block -- so the envelope carries text that has nothing
+# to do with the write. Shaping removes the payload, not the verification.
+
+async def test_terse_tag_write_drops_the_target_text(graph, mutations):
+    long_block = graph.add(
+        "A block whose body is long enough to dominate the response " * 10,
+        parent=graph.page["id"], page=graph.page["id"])
+
+    result = await mutations.add_tag(long_block["uuid"], graph.tag["uuid"])
+    terse = result.to_dict(verbose=False)
+
+    assert terse["verified"] is True
+    assert terse["uuid"] == long_block["uuid"]
+    assert "dominate the response" not in json.dumps(terse)
+    assert "dominate the response" in json.dumps(result.to_dict())
+
+
+async def test_terse_property_creation_still_returns_the_ident(
+        graph, mutations):
+    """The ident is assigned by Logseq and is the only way to address the
+    property afterwards, so terse keeps it. Dropping it would make the tool
+    useless in its cheap mode."""
+    result = await mutations.create_property("Effort Estimate", {"type": "number"})
+    terse = result.to_dict(verbose=False)
+
+    assert terse["verified"] is True
+    assert terse["ident"].endswith("/EffortEstimate")

@@ -138,6 +138,41 @@ And when a tool does return something proportional to the damage — a plan, a
 list of orphans — read the summary rather than the list unless you intend to
 act on each item.
 
+**Every write tool takes `verbose`, and it defaults to true.** A write
+envelope carries the target entity TWICE — `previous_entities` and
+`verified_entities`, or `previous_state` and `verified_state` — so moving a
+block of prose costs that prose twice over to tell you a parent id.
+`verbose: false` returns identity and position only: `verified`, `uuid`,
+`parent`, `page`, `order`, `diagnostic`, plus the assigned `ident` where there
+is one.
+
+The verification is unchanged either way. The tool still reads the target back
+and still compares; `verified` means the same thing. Only the payload is left
+unserialised.
+
+Pass `verbose: false` when the content is not the point of the call:
+
+- `moveBlock` above all, and especially when chaining moves — a move changes
+  position, not text
+- `addTag`, `removeTag`, `addProperty`, `removeProperty` — the target's body
+  has nothing to do with the relation being written
+- `createBlock` and `createPageofBlocks` — the titles echoed back are the ones
+  you just sent
+
+Keep `verbose: true` when the payload is the only copy of something:
+
+- `clearPage` and `removeBlock` — `previous_entities` is the sole remaining
+  record of what was destroyed, and the thing that lets you diff an import
+  against the originals afterwards
+- `deletePage` — the envelope lists what still points at a page nobody can
+  now find
+- `updateBlock` — Logseq parses content on write, so the stored title need not
+  equal what you sent; the before/after pair is how you see that
+
+On a failure, terse keeps the observed entities as digests rather than
+collapsing them to a count, because a write cannot safely be re-run to get
+detail.
+
 This also means slowness is not cost. A sweep that takes a minute of internal
 calls is cheap; the same work as individual tool calls is not.
 

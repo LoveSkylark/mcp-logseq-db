@@ -81,6 +81,25 @@ A corollary worth stating, since it is counter-intuitive: **slowness is not
 cost**. A graph-wide sweep may take minutes of internal calls and still be far
 cheaper than doing a fraction of it by hand.
 
+## Terse write results
+
+Every write tool takes `verbose`, defaulting to `true` for compatibility. The
+envelope carries the target entity twice — before and after — which is the
+point when you need to see what Logseq stored, and pure overhead when you do
+not. Moving a 400-word block returns that block's text twice to tell you a
+parent id.
+
+`verbose: false` returns `verified`, `uuid`, `parent`, `page`, `order`,
+`diagnostic`, and the assigned `ident` where there is one. **The verification
+path is unchanged** — the write is still read back and still compared, and
+`verified` means exactly what it did. Only the payload is left unserialised.
+On a failure the observed entities are kept as digests rather than reduced to
+a count, since a write cannot safely be repeated to get detail.
+
+It is per call rather than a global default, because for `clearPage`,
+`removeBlock` and `deletePage` the payload is the only surviving record of
+what was destroyed or what still points at it.
+
 ## Limits worth knowing up front
 
 **Property writes are sandboxed.** Only `plugin.property.<caller-id>/*` is

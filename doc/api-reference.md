@@ -25,6 +25,20 @@ one returns success while doing nothing:
 
 ---
 
+## Verified writes
+
+Every write tool takes `verbose`, default `true`. Terse mode
+(`verbose: false`) shapes the RESPONSE only: the write still issues its
+mutation, still reads the target back, still compares, and still reports the
+same `verified`. What it drops is the entity payload, which a write envelope
+carries twice — before and after — and which for a block write is the block's
+own text. Terse returns `verified`, `uuid`, `parent`, `page`, `order`,
+`diagnostic`, and `ident` where one was assigned; on a failure it keeps the
+observed entities as the same digests, because a write cannot safely be
+repeated to get detail.
+
+---
+
 ## Tags
 
 A tag must exist before it can be attached. Attaching to a page and to a block

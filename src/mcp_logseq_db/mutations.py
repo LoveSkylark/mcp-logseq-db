@@ -43,7 +43,7 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from ._shared import VerifiedWriteHelpers
+from ._shared import VerifiedWriteHelpers, entity_digest, entity_digests
 from .client import LogseqDBClient, poll_readback, serialized_write
 from .identifiers import require_ident
 
@@ -69,8 +69,29 @@ class MutationResult:
     verified: bool = True
     observed_state: Any = None
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self, verbose: bool = True) -> dict[str, Any]:
+        """
+        The envelope, in full or reduced to what a caller acts on.
+
+        Terse is shaping only -- see `ContentResult.to_dict`. Here the payload
+        is `verified_state`, the whole target entity, which for a tag or
+        property write is a block whose text has nothing to do with the write.
+        """
+        if verbose:
+            return asdict(self)
+        body: dict[str, Any] = {
+            "verified": self.verified,
+            **entity_digest(self.verified_state),
+            "diagnostic": self.diagnostic,
+        }
+        if self.recovered_after_timeout:
+            body["recovered_after_timeout"] = True
+        if not self.verified and self.observed_state is not None:
+            body["observed"] = (
+                entity_digests(self.observed_state)
+                if isinstance(self.observed_state, list)
+                else entity_digest(self.observed_state))
+        return body
 
 
 class MutationVerificationError(RuntimeError):

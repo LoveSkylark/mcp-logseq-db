@@ -4,27 +4,7 @@ Ordered so each instruction is independently shippable. Phase 1 is cheap and saf
 
 Every item traces to something that actually cost us in this session, noted under *Evidence*.
 
----
 
-## Phase 1 — Low-hanging fruit
-
-### Instruction 1 — `placement: "last-child"` on `moveBlock`
-
-**Signature:** add `"last-child"` to the existing `placement` enum.
-
-**Why:** `child` prepends. There is currently no way to append to a page or parent without first knowing the last sibling's UUID, which costs a read. Worse, the default behaviour silently reverses a sequence when you move siblings left-to-right.
-
-**Addresses:** a footgun with no safe alternative. Not a documentation gap — no amount of documentation makes "the obvious call reverses your content" acceptable.
-
-**Works with:** every journal-to-page migration; any multi-block relocation.
-
-**Implementation:** compute the max `:block/order` among the target's children and generate a key after it. The fractional-index logic already exists for `after`.
-
-**Concerns:** none material. Purely additive; existing `child` semantics unchanged. Keep `child` as-is rather than redefining it, or you break callers.
-
-**Done when:** moving three blocks in source order with `last-child` yields source order at the destination.
-
-**Evidence:** reversed content on three pages before I noticed the `Zz` < `a0` ordering. Cost 3 repair calls plus the reading to detect it.
 
 ---
 

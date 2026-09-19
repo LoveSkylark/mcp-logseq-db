@@ -8,6 +8,59 @@ import httpx
 
 from .identifiers import require_uuid
 
+# Keys a terse digest keeps. Enough to act on the result -- identify the
+# entity, see where it landed, see where it sits among its siblings -- and
+# nothing proportional to content.
+#
+# `ident` earns its place: for a tag or property it IS the identity, assigned
+# by Logseq rather than derived from the title, and the whole instruction is
+# to read it back rather than construct it. A terse mode that dropped it would
+# make createProperty unusable.
+DIGEST_KEYS = ("uuid", "ident", "parent", "page", "order")
+
+
+def entity_digest(entity: Any) -> dict[str, Any]:
+    """
+    An entity reduced to identity and position.
+
+    Read-back verification is right; echoing the payload back is not. A write
+    envelope carries the entity TWICE, before and after, so a moved block of
+    prose costs its own text twice over for a result whose informational
+    content is "it landed, here". Titles, refs, tags and property values are
+    dropped; `:db/id` is dropped too, since it is renumbered when a graph is
+    rebuilt and must never be persisted.
+
+    References are flattened to the id they point at, because `{"id": 1234}`
+    around every value doubles the size of the one part a caller reads.
+    """
+    if not isinstance(entity, dict):
+        # Nothing was observed. The structural keys are still present, so a
+        # caller reading result["uuid"] gets None rather than a KeyError.
+        return {"uuid": None, "parent": None, "page": None}
+    digest: dict[str, Any] = {}
+    for key in DIGEST_KEYS:
+        value = entity.get(key)
+        if value is None and key not in ("uuid", "parent", "page"):
+            # Structural keys are reported even when absent, because their
+            # absence is information -- a page has no parent. `ident` and
+            # `order` are simply not applicable to most entities, and a null
+            # per write adds up for nothing.
+            continue
+        digest[key] = (value.get("id") if isinstance(value, dict) else value)
+    return digest
+
+
+def entity_digests(entities: Any, *, limit: int = 20) -> list[dict[str, Any]]:
+    """
+    Digests for a collection, bounded.
+
+    Bounded because the collections that matter here are unbounded: a cleared
+    page or a deleted subtree can be hundreds of entities, and a terse mode
+    that grows with the damage is not terse.
+    """
+    items = [e for e in (entities or []) if isinstance(e, dict)]
+    return [entity_digest(e) for e in items[:limit]]
+
 
 class VerifiedWriteHelpers:
     """UUID validation, write-scope checks, and ambiguous-write handling."""

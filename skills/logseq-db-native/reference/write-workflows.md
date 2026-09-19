@@ -7,6 +7,22 @@ Every write returns `verified`, `verified_state`, and on failure
 though no error was raised — this API reports success for calls that do
 nothing, so the read-back is the only evidence.
 
+## verbose
+
+Every write tool takes `verbose`, default `true`. The envelope carries the
+target entity twice, before and after, so a write to a long block returns that
+block's text twice over.
+
+`verbose: false` returns identity and position only — `verified`, `uuid`,
+`parent`, `page`, `order`, `diagnostic`, plus `ident` where one was assigned.
+The write is still read back and still compared; only the payload is dropped.
+
+Use it for `moveBlock`, `addTag`, `removeTag`, `addProperty`,
+`removeProperty`, `createBlock` and `createPageofBlocks`. Keep the default for
+`clearPage`, `removeBlock` and `deletePage`, where the payload is the only
+record of what was destroyed, and for `updateBlock`, where the before/after
+pair is how you see what Logseq did to the content you sent.
+
 ---
 
 ## Pages
