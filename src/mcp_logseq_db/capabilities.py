@@ -298,6 +298,18 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     "listPages": (
         "Excludes recycled pages, which keep the Page class and would "
         "otherwise appear live.",
+        "with_counts adds own_blocks, content_blocks and refs per page in "
+        "four queries total, rather than one pageStats per page. It returns "
+        "an envelope with total/counted/truncated instead of a bare list, and "
+        "is capped at 500 pages per call.",
+    ),
+    "listJournals": (
+        "Newest first, so a cap drops the oldest rather than an arbitrary "
+        "slice.",
+        "with_counts is the cheap way to find which journals hold content: "
+        "four queries however many journals exist. own_blocks includes seeded "
+        "and trailing empty blocks, so content_blocks is the figure to pair "
+        "with refs.",
     ),
     "listRecycled": (
         "Recycled pages keep their UUID, tags and refs. Backlinks to them are "

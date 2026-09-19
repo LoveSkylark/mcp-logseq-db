@@ -255,6 +255,41 @@ class FakeClient:
             ident = query.split(":db/ident ")[1].split("]")[0]
             return next((e["id"] for e in self.graph.entities.values()
                          if e.get("ident") == ident), None)
+        # ---- page listings and their count aggregates ---------------------
+        # Placed before the generic branches below, which would otherwise
+        # match on :block/page and return entities where rows are expected.
+        if ":block/journal-day" in query and ":find [(pull ?page" in query:
+            return [e for e in self.graph.entities.values()
+                    if e.get("journal-day")]
+        if "(missing? $ ?page :logseq.property/deleted-at)" in query:
+            return [e for e in self.graph.entities.values()
+                    if e.get("name")
+                    and any(t.get("id") == params[0]
+                            for t in e.get("tags", []))
+                    and e.get(":logseq.property/deleted-at") is None]
+        if "(count ?block)" in query and ":in $ [?page ...]" in query:
+            wanted = set(params[0])
+            empty_only = '[?block :block/title ""]' in query
+            rows: dict[int, int] = {}
+            for entity in self.graph.entities.values():
+                page_id = (entity.get("page") or {}).get("id")
+                if page_id not in wanted:
+                    continue
+                if empty_only and entity.get("title") != "":
+                    continue
+                rows[page_id] = rows.get(page_id, 0) + 1
+            # A page with no blocks does not appear in the join at all, which
+            # is the case the merge has to treat as zero.
+            return [[page_id, n] for page_id, n in rows.items()]
+        if "(count ?holder)" in query and ":block/refs ?target" in query:
+            wanted = set(params[0])
+            rows = {}
+            for entity in self.graph.entities.values():
+                for ref in entity.get("refs", []) or []:
+                    target = ref.get("id") if isinstance(ref, dict) else None
+                    if target in wanted:
+                        rows[target] = rows.get(target, 0) + 1
+            return [[target, n] for target, n in rows.items()]
         if ":block/_parent" in query and "#uuid" in query:
             uuid = query.split('#uuid "')[1].split('"')[0]
             root = self.graph.entities.get(uuid)
@@ -1103,6 +1138,101 @@ async def test_terse_page_creation_reports_no_parent(graph, content):
     assert terse["verified"] is True
     assert terse["parent"] is None
     assert "order" not in terse
+
+
+# ------------------------------------------------ counted page listings
+#
+# Triaging which journals hold content cost one pageStats per journal -- about
+# fifty calls to answer one question. The counted listing is four queries
+# however many journals there are, so the tests below care about the CALL
+# COUNT as much as the numbers.
+
+def add_journal(graph, day: int, title: str):
+    return graph.add(title, None, None, name=title.lower(),
+                     tags=[PAGE_CLASS_ID], extra={"journal-day": day})
+
+
+async def test_journal_listing_stays_cheap_by_default(graph, content):
+    """The bare listing keeps its old shape -- a list, no counts -- so adding
+    the option does not make the cheap call expensive."""
+    add_journal(graph, 20260101, "Jan 1st, 2026")
+
+    journals = await content.list_journals()
+
+    assert isinstance(journals, list)
+    assert [j["title"] for j in journals] == ["Jan 1st, 2026"]
+    assert "own_blocks" not in journals[0]
+
+
+async def test_journal_counts_cost_four_calls_not_one_per_journal(graph):
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    add_journal(graph, 20260101, "Jan 1st, 2026")
+    second = add_journal(graph, 20260102, "Jan 2nd, 2026")
+    add_journal(graph, 20260103, "Jan 3rd, 2026")
+    graph.add("real content", second["id"], second["id"])
+    graph.add("", second["id"], second["id"])
+    referrer = graph.add("points at it", graph.page["id"], graph.page["id"])
+    referrer["refs"] = [{"id": second["id"]}]
+
+    result = await verified.list_journals(with_counts=True)
+
+    queries = [m for m, _ in client.calls if m == "logseq.DB.datascriptQuery"]
+    assert len(queries) == 4      # the listing, then three aggregates
+    assert result["total"] == 3
+    assert result["truncated"] is False
+
+    rows = {r["title"]: r for r in result["journals"]}
+    assert rows["Jan 2nd, 2026"]["own_blocks"] == 2
+    assert rows["Jan 2nd, 2026"]["content_blocks"] == 1
+    assert rows["Jan 2nd, 2026"]["refs"] == 1
+    # A journal with nothing on it is absent from every join, and the absence
+    # has to read as zero rather than as a missing key.
+    assert rows["Jan 3rd, 2026"]["own_blocks"] == 0
+    assert rows["Jan 3rd, 2026"]["refs"] == 0
+
+
+async def test_journals_come_back_newest_first(graph, content):
+    """So a cap drops the oldest rather than an arbitrary slice."""
+    add_journal(graph, 20260101, "Jan 1st, 2026")
+    add_journal(graph, 20260307, "Mar 7th, 2026")
+    add_journal(graph, 20251114, "Nov 14th, 2025")
+
+    result = await content.list_journals(with_counts=True)
+
+    assert [r["journal-day"] for r in result["journals"]] == [
+        20260307, 20260101, 20251114]
+
+
+async def test_counted_listing_reports_truncation(graph, content):
+    for day in (20260101, 20260102, 20260103):
+        add_journal(graph, day, f"Day {day}")
+
+    result = await content.list_journals(with_counts=True, limit=2)
+
+    assert result["counted"] == 2
+    assert result["total"] == 3
+    assert result["truncated"] is True
+    assert "pageStats" in result["diagnostic"]
+
+
+async def test_a_meaningless_limit_is_refused(content):
+    with pytest.raises(ValueError, match="positive integer"):
+        await content.list_journals(limit=0)
+
+
+async def test_counted_page_listing_excludes_recycled_pages(graph, content):
+    """Recycled pages keep the Page class, so they would otherwise appear
+    live -- and a triage listing is exactly where that would mislead."""
+    graph.add("Gone", None, None, name="gone", tags=[PAGE_CLASS_ID],
+              extra={":logseq.property/deleted-at": 1})
+    await content.create_block(graph.page["uuid"], "something")
+
+    result = await content.list_pages(with_counts=True)
+
+    rows = {r["title"]: r for r in result["pages"]}
+    assert "Gone" not in rows
+    assert rows["TEST-PAGE"]["content_blocks"] == 1
 
 
 # --------------------------------------------- outline is the batching path

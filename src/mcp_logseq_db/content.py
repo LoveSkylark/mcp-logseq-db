@@ -52,6 +52,12 @@ from .client import LogseqDBClient, poll_readback, serialized_write
 
 MAX_SUBTREE_NODES = 1000
 
+# Pages given counts in one `list_pages(with_counts=True)` call. The query
+# cost is flat -- four calls whatever the graph size -- but four numbers per
+# page is not, and a listing that quietly grew to thousands of rows would
+# reintroduce the cost counts were added to remove.
+MAX_COUNTED_ROWS = 500
+
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
@@ -627,6 +633,162 @@ class VerifiedContent(VerifiedWriteHelpers):
                    "so is never 0 on a page that was created through this "
                    "API." if empty else "")),
         }
+
+    # ------------------------------------------------------ page listings
+
+    async def list_journals(
+        self, *, with_counts: bool = False, limit: int | None = None
+    ) -> Any:
+        """
+        Journal pages, newest first, optionally with block and reference
+        counts.
+
+        Deciding which journals hold anything worth reading is the opening
+        move of most migrations, and it cost one `pageStats` per journal --
+        around fifty calls to answer one question. With `with_counts` the
+        whole answer is four queries regardless of how many journals exist:
+        the listing, then three aggregates joined back by entity id.
+
+        Sorted by `:block/journal-day` descending, so a cap drops the oldest
+        rather than an arbitrary slice.
+        """
+        pages = await self._query_list(
+            "[:find [(pull ?page [:db/id :block/uuid :block/name "
+            ":block/title :block/journal-day]) ...] "
+            ":where [?page :block/journal-day _]]",
+            "Journal listing")
+        pages.sort(key=lambda p: p.get("journal-day") or 0, reverse=True)
+        return await self._counted_listing(
+            pages, key="journals", with_counts=with_counts, limit=limit)
+
+    async def list_pages(
+        self, *, with_counts: bool = False, limit: int | None = None
+    ) -> Any:
+        """
+        Live pages, optionally with block and reference counts.
+
+        Recycled pages are excluded -- they keep the Page class and would
+        otherwise appear live.
+
+        The same four-query shape as `list_journals`, but a graph has far more
+        pages than journals, so the counted form is capped: see
+        `_counted_listing`.
+        """
+        pages = await self._query_list(
+            "[:find [(pull ?page [:db/id :block/uuid :block/name "
+            ":block/title]) ...] :in $ ?class :where "
+            "[?page :block/name] [?page :block/tags ?class] "
+            "[(missing? $ ?page :logseq.property/deleted-at)]]",
+            "Page listing", await self._class_id(PAGE_CLASS))
+        pages.sort(key=lambda p: str(p.get("title") or "").lower())
+        return await self._counted_listing(
+            pages, key="pages", with_counts=with_counts, limit=limit)
+
+    async def _counted_listing(
+        self,
+        pages: list[dict[str, Any]],
+        *,
+        key: str,
+        with_counts: bool,
+        limit: int | None,
+    ) -> Any:
+        """
+        Return a listing, with counts attached if asked for.
+
+        Without `with_counts` this returns the bare list it always returned,
+        so the cheap listing stays cheap and its shape does not change.
+
+        With counts it returns an envelope, because a capped result has to be
+        able to say so. The cap exists for `list_pages` on a large graph: the
+        QUERY cost is flat, but four numbers per page is not, and a listing
+        that quietly grew to thousands of rows would reintroduce the cost this
+        was meant to remove. Truncation is reported rather than silent, and
+        the diagnostic names the way to get the rest.
+        """
+        if limit is not None and (not isinstance(limit, int) or limit < 1):
+            raise ValueError("limit must be a positive integer")
+
+        if not with_counts:
+            return pages[:limit] if limit else pages
+
+        total = len(pages)
+        ceiling = limit or MAX_COUNTED_ROWS
+        counted = pages[:ceiling]
+        truncated = total > len(counted)
+
+        own, empty, refs = await self._count_indexes(
+            [p["id"] for p in counted if isinstance(p.get("id"), int)])
+
+        rows = []
+        for page in counted:
+            page_id = page.get("id")
+            own_blocks = own.get(page_id, 0)
+            empty_blocks = empty.get(page_id, 0)
+            rows.append({
+                **page,
+                "own_blocks": own_blocks,
+                "content_blocks": own_blocks - empty_blocks,
+                "refs": refs.get(page_id, 0),
+            })
+
+        body: dict[str, Any] = {
+            key: rows,
+            "total": total,
+            "counted": len(rows),
+            "truncated": truncated,
+            "diagnostic": (
+                "own_blocks includes the empty block createPage seeds and any "
+                "trailing empty block, so content_blocks is the figure to "
+                "pair with refs when judging whether a page carries "
+                "anything."),
+        }
+        if truncated:
+            body["diagnostic"] += (
+                f" Counts cover the first {len(rows)} of {total}; raise or "
+                "set limit for a different slice, or use pageStats for "
+                "specific pages.")
+        return body
+
+    async def _count_indexes(
+        self, page_ids: list[int]
+    ) -> tuple[dict[int, int], dict[int, int], dict[int, int]]:
+        """
+        Own-block, empty-block and inbound-reference counts, by entity id.
+
+        Three aggregate queries rather than three per page. Each is bound to
+        the ids being listed with `:in $ [?page ...]`, so the response is one
+        row per listed page rather than one per page in the graph.
+
+        A page with no blocks does not appear in the join at all, which is why
+        these are merged with `.get(id, 0)` rather than zipped -- the absence
+        IS the zero, and a positional merge would silently shift every count
+        by one.
+
+        The attributes match `page_stats` exactly, so the two cannot disagree.
+        """
+        if not page_ids:
+            return {}, {}, {}
+
+        def index(rows: list[Any]) -> dict[int, int]:
+            return {
+                row[0]: row[1] for row in rows
+                if isinstance(row, list) and len(row) == 2
+                and isinstance(row[0], int) and isinstance(row[1], int)
+            }
+
+        own = index(await self._query_list(
+            "[:find ?page (count ?block) :in $ [?page ...] "
+            ":where [?block :block/page ?page]]",
+            "Own block counts", page_ids))
+        empty = index(await self._query_list(
+            "[:find ?page (count ?block) :in $ [?page ...] "
+            ":where [?block :block/page ?page] [?block :block/title \"\"]]",
+            "Empty block counts", page_ids))
+        refs = index(await self._query_list(
+            "[:find ?target (count ?holder) :in $ [?target ...] "
+            ":where [?holder :block/refs ?target]]",
+            "Inbound reference counts", page_ids))
+        return own, empty, refs
 
     async def find_block_tree(
         self,

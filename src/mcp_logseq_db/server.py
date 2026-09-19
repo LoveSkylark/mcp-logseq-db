@@ -59,11 +59,11 @@ from .importer import VerifiedImport
 from .mutations import MutationVerificationError, VerifiedMutations
 from .settings import Settings
 
-# Class idents, resolved to :db/id at call time. Integer ids are not stable
-# across a rebuilt graph, so nothing here hardcodes 2, 3 or 4.
-PAGE_CLASS = ":logseq.class/Page"
+# Class ident, resolved to a :db/id at call time. Integer ids are not stable
+# across a rebuilt graph, so nothing here hardcodes 2, 3 or 4. Only the Tag
+# class is needed at this layer now -- the page and property listings moved
+# into content.py and mutations.py, which resolve their own.
 TAG_CLASS = ":logseq.class/Tag"
-PROPERTY_CLASS = ":logseq.class/Property"
 
 
 def create_server(
@@ -457,25 +457,25 @@ def create_server(
             target_uuid, property_ident)).to_dict(verbose)
 
     # ------------------------------------------------------------ lists
-    # Each takes no arguments and returns the whole of one kind.
+    # Each returns the whole of one kind. Most take no arguments; the two page
+    # listings take with_counts, which is opt-in so the cheap listing stays
+    # cheap.
 
     @server.tool(name="listPages")
-    async def list_pages() -> Any:
-        """List all live pages. Recycled pages are excluded -- they keep the Page class and would otherwise appear live."""
-        return await query(
-            "[:find [(pull ?page [:db/id :block/uuid :block/name "
-            ":block/title]) ...] :in $ ?class :where "
-            "[?page :block/name] [?page :block/tags ?class] "
-            "[(missing? $ ?page :logseq.property/deleted-at)]]",
-            await class_id(PAGE_CLASS))
+    async def list_pages(
+        with_counts: bool = False, limit: int | None = None
+    ) -> Any:
+        """List all live pages. Recycled pages are excluded -- they keep the Page class and would otherwise appear live. with_counts adds own_blocks, content_blocks and refs to each entry, which costs four queries in total rather than one pageStats per page; it returns an envelope with total/counted/truncated instead of a bare list, and is capped at 500 pages per call because four numbers per page adds up on a large graph. Pair content_blocks with refs to judge whether a page carries anything."""
+        return await content().list_pages(
+            with_counts=with_counts, limit=limit)
 
     @server.tool(name="listJournals")
-    async def list_journals() -> Any:
-        """List all journal pages, with their journal day as an integer date."""
-        return await query(
-            "[:find [(pull ?page [:db/id :block/uuid :block/name "
-            ":block/title :block/journal-day]) ...] "
-            ":where [?page :block/journal-day _]]")
+    async def list_journals(
+        with_counts: bool = False, limit: int | None = None
+    ) -> Any:
+        """List all journal pages, newest first, with their journal day as an integer date. with_counts adds own_blocks, content_blocks and refs to each entry -- use it to decide which journals hold anything worth reading, which otherwise costs one pageStats per journal. It stays four queries however many journals there are, and returns an envelope with total/counted/truncated instead of a bare list. own_blocks counts seeded and trailing empty blocks, so content_blocks is the figure to pair with refs."""
+        return await content().list_journals(
+            with_counts=with_counts, limit=limit)
 
     @server.tool(name="listTags")
     async def list_tags() -> Any:

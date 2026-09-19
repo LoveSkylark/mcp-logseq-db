@@ -362,7 +362,8 @@ Declared-but-unset properties, via the page's classes:
 
 ## Lists
 
-Each takes no arguments and returns the whole of one kind.
+Each returns the whole of one kind. Most take no arguments; the two page
+listings take `with_counts` and `limit`.
 
 Class markers appear throughout: `:logseq.class/Tag` is `:db/id` 2,
 `Property` 3, `Page` 4 on a typical graph. **Resolve them by ident rather than
@@ -380,11 +381,37 @@ explicitly or they appear live.
 ```
 
 **`listJournals`** — `:block/journal-day` is an integer date that sorts
-chronologically.
+chronologically. The tool returns them newest first.
 
 ```json
 {"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?p [:db/id :block/uuid :block/name :block/title :block/journal-day]) ...] :where [?p :block/journal-day _]]"]}
 ```
+
+Both take `with_counts`, which attaches `own_blocks`, `content_blocks` and
+`refs` to each entry. It is three aggregate queries on top of the listing —
+four calls in total, whatever the number of pages — rather than one
+`pageStats` per page. Each aggregate binds the listed ids with
+`:in $ [?page ...]`, so the response is one row per listed page rather than
+one per page in the graph:
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find ?page (count ?block) :in $ [?page ...] :where [?block :block/page ?page]]", [846, 847]]}
+```
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find ?page (count ?block) :in $ [?page ...] :where [?block :block/page ?page] [?block :block/title \"\"]]", [846, 847]]}
+```
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find ?target (count ?holder) :in $ [?target ...] :where [?holder :block/refs ?target]]", [846, 847]]}
+```
+
+A page with no blocks does not appear in the join at all, so the absence is
+read as zero rather than merged positionally. The attributes are the same ones
+`pageStats` counts, so the two cannot disagree.
+
+With `with_counts` the result is an envelope — the list under `pages` or
+`journals`, plus `total`, `counted` and `truncated` — because the counted form
+is capped at 500 rows and a capped result has to be able to say so. Without
+it, both return the bare list they always returned.
 
 **`listTags`** and **`listProperties`** use dedicated methods:
 

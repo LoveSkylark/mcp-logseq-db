@@ -31,9 +31,17 @@ to delete. Always pair a block count with a reference count.
 
 ## Counting cheaply
 
-`pageStats(page_uuid)` is the counting primitive. It returns integers only, so
-its cost does not depend on how large the page is — the whole point of the
-tool, and what makes a full-graph audit affordable.
+Start with a counted LISTING, not a per-page read.
+`listPages(with_counts=true)` and `listJournals(with_counts=true)` attach
+`own_blocks`, `content_blocks` and `refs` to every entry in four queries
+total, which covers the whole first triage pass — which pages hold content,
+and which of the empty ones are referred to anyway. `listPages` is capped at
+500 rows per call, so a larger graph needs `limit` and successive slices.
+
+`pageStats(page_uuid)` is then the per-page primitive, for the pages the
+listing singled out. It returns integers only, so its cost does not depend on
+how large the page is — the whole point of the tool, and what made a
+full-graph audit affordable before the listings could do it in bulk.
 
 - `own_blocks` — blocks whose `:block/page` is this page. This is "does the
   page have content".

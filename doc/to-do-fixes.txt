@@ -6,25 +6,6 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
----
-
-### Instruction 2 — Terse response mode
-
-**Signature:** `verbose?: boolean` (default `true` for compatibility) on every write tool. When false, return `{verified, uuid, parent, page, order, diagnostic}` only.
-
-**Why:** every write echoes the full entity twice — `previous_entities` and `verified_entities` — including complete block text. Read-back verification is right; echoing it back is not.
-
-**Addresses:** the single largest cost in this session. Two moves of long prose blocks consumed more budget than twenty moves of short ones.
-
-**Works with:** `moveBlock` above all, then `updateBlock`, `addTag`, `createBlock`. `clearPage` especially — it returned the full text of 38 deleted blocks.
-
-**Implementation:** response shaping only. No change to the verification path — still read back and compare, just don't serialise the payload.
-
-**Concerns:** `clearPage`'s verbose output turned out to be *useful* — it let me diff my transcription against the originals after import. So make terse opt-in per call, not a global default, and consider keeping `clearPage` verbose by default since its payload is the only record of what was destroyed.
-
-**Done when:** a `moveBlock` on a 400-word block returns under ~200 tokens.
-
-**Evidence:** this is why chained `moveBlock` became unaffordable for the Feb 2026 rewrite and we took the import route with its transcription risk. Fix this and that trade-off disappears.
 
 ---
 

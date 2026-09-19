@@ -75,7 +75,12 @@ inside the server and returns one summary; building the same page with
 So the tools that loop internally are the cheap ones. `repairLinks()` with no
 page argument sweeps the whole graph. `importPage` builds a page from markdown
 in one call. `clearPage` loops `removeBlock` itself. `pageStats` returns counts
-rather than content.
+rather than content. And `listJournals(with_counts=true)` attaches block and
+reference counts to every journal in four queries, where deciding which
+journals hold anything otherwise costs one `pageStats` per journal — the usual
+opening move of a migration, and around fifty calls to answer one question.
+`listPages` takes the same option, capped at 500 pages per call. Both are
+opt-in, so the bare listing stays as cheap as it was.
 
 A corollary worth stating, since it is counter-intuitive: **slowness is not
 cost**. A graph-wide sweep may take minutes of internal calls and still be far

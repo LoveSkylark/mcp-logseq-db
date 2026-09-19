@@ -132,7 +132,22 @@ So prefer the tool that loops internally over the loop you write yourself:
 - `repairLinks()` with no page over one call per page
 - `importPage` over a `createBlock` per line
 - `pageStats` over `inspectPage` when you only need counts
+- `listJournals(with_counts=true)` over a `pageStats` per journal
 - `clearPage` over a `removeBlock` per block
+
+**Triage with counts, not with reads.** `listJournals(with_counts=true)` and
+`listPages(with_counts=true)` attach `own_blocks`, `content_blocks` and `refs`
+to each entry in four queries total, however many pages there are. Deciding
+which journals are worth reading otherwise costs one `pageStats` per journal,
+which is the most common opening move of a migration and was around fifty
+calls to answer one question. Pair `content_blocks` with `refs`: a journal
+with `content_blocks: 0` holds nothing but its seeded empty block, whatever
+`own_blocks` says.
+
+Both stay opt-in, so the bare listing is unchanged and still cheap. With
+counts they return an envelope — the list under `journals` or `pages`, plus
+`total`, `counted` and `truncated` — because `listPages` is capped at 500 per
+call and a capped result has to be able to say so.
 
 And when a tool does return something proportional to the damage — a plan, a
 list of orphans — read the summary rather than the list unless you intend to
