@@ -4,8 +4,13 @@
 | --- | --- |
 | [`architecture.md`](architecture.md) | Why the server is built the way it is. Read this first. |
 | [`api-reference.md`](api-reference.md) | What each tool does and the raw HTTP call behind it. |
-| [`data-model.md`](data-model.md) | How a Logseq DB graph is shaped, and which queries reach what. |
 | [`logseq-api-surface.md`](logseq-api-surface.md) | The full Logseq plugin API, and why most of it is not exposed. |
+| [`archive/`](archive/README.md) | Superseded documents, kept for the record. Nothing there is current. |
+
+How a DB graph is shaped, and which queries reach what, is covered by
+`api-reference.md` (the queries) and
+[`../skills/logseq-db-native/reference/data-modeling.md`](../skills/logseq-db-native/reference/data-modeling.md)
+(the modelling). There is no `data-model.md`; this table used to link one.
 
 Related, elsewhere in the repo: [`../tests/README.md`](../tests/README.md) for
 the suite, [`../scripts/README.md`](../scripts/README.md) for the live checks.
@@ -36,8 +41,14 @@ contained a `[[uuid]]` artifact from being pasted through the Logseq editor.
 
 `structure.txt` — its capability table recorded methods as verified that later
 turned out not to work, and marked others rejected that do. Facts that survive
-live testing now live in `api-reference.md`; the graph shape moved to
-`data-model.md`.
+live testing now live in `api-reference.md`; the graph shape moved to the
+skill's `reference/data-modeling.md`.
+
+`API refrence.md` — a near-duplicate of `api-reference.md` from the
+`upsertNodes` era, one typo away from the file that replaced it, which is how
+two contradictory references stayed in this folder. Moved to
+[`archive/`](archive/README.md) rather than deleted, because what it got wrong
+is the useful part.
 
 `api-tools.txt` — a flat dump of every plugin API. Kept as
 `logseq-api-surface.md`, with the reason each method is or is not reachable.

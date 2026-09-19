@@ -92,7 +92,7 @@ async def test_probing_can_be_skipped_without_claiming_availability() -> None:
     assert states["removeBlock"] is State.UNKNOWN
     assert states["addTag"] is State.UNKNOWN
     # Reads are still probed, so they remain conclusive.
-    assert states["getPage"] is State.AVAILABLE
+    assert states["getPageUUID"] is State.AVAILABLE
 
 
 # ------------------------------------------------------------- verdicts
@@ -134,8 +134,8 @@ async def test_a_silent_null_is_unknown_and_never_unavailable() -> None:
 
 
 async def test_a_tool_is_unavailable_if_any_route_it_needs_is() -> None:
-    """createPageofBlocks needs upsertNodes AND datascriptQuery. The worst
-    state across routes wins rather than the best."""
+    """createPageofBlocks needs insertBatchBlock AND datascriptQuery. The
+    worst state across routes wins rather than the best."""
     client = ProbeClient({
         "logseq.DB.insertBatchBlock": Exception(
             "Editing a page, tag or property isn't supported yet"),
@@ -145,7 +145,7 @@ async def test_a_tool_is_unavailable_if_any_route_it_needs_is() -> None:
     states = {t.name: t.state for t in result.tools}
 
     assert states["createPageofBlocks"] is State.UNAVAILABLE
-    assert states["getPage"] is State.AVAILABLE     # unaffected route
+    assert states["getPageUUID"] is State.AVAILABLE   # unaffected route
 
 
 # -------------------------------------------------------------- reporting
@@ -239,6 +239,11 @@ def test_every_route_has_probe_arguments() -> None:
 
 
 def test_write_probes_cover_every_write_route() -> None:
-    assert "logseq.DB.upsertNodes" in WRITE_PROBE_METHODS
+    """upsertNodes is deliberately absent: it fails on synced graphs and no
+    tool routes through it, so probing it would report on a method nothing
+    can reach."""
+    assert "logseq.DB.upsertNodes" not in WRITE_PROBE_METHODS
+    assert "logseq.DB.insertBlock" in WRITE_PROBE_METHODS
+    assert "logseq.DB.createPage" in WRITE_PROBE_METHODS
     assert "logseq.DB.renamePage" in WRITE_PROBE_METHODS
     assert "logseq.DB.datascriptQuery" not in WRITE_PROBE_METHODS

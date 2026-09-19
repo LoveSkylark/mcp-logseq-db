@@ -25,6 +25,7 @@ The one to run after changing anything in `src/`, and after a Logseq upgrade.
 ```bash
 python scripts/live_reliability.py             # read-only, safe anywhere
 python scripts/live_reliability.py --write     # also exercises write paths
+python scripts/live_reliability.py --explore   # probe the open questions
 python scripts/live_reliability.py --skip-reliability   # contract only
 ```
 
@@ -40,19 +41,32 @@ corresponds to something that was once wrong:
 | Check | Why it is there |
 | --- | --- |
 | `getBlock`, `removeBlock`, `updateBlock` reachable | A hardcoded capability list called all three rejected. Block deletion was routed through a CLI for months because of it. |
-| `edit` + `page` still unsupported | If this changes, page editing gains a route and the operation table needs updating. |
-| `operation` is still `add`\|`edit` | There is no retraction verb, which is why tag removal cannot go through `upsertNodes`. |
-| `data` still rejects `parent-id` | The allowlist is closed. If it opens, `createBlock` can take more than a title. |
+| `createPage`, `insertBlock`, `insertBatchBlock`, `moveBlock`, `renamePage` reachable | Every write tool sits on these, and each one replaced an `upsertNodes` path. |
 | `upsertProperty` rejects a namespaced title | The namespace comes from caller identity and cannot be chosen. |
 | Recycled pages still queryable | They keep the Page class, so every page listing must exclude them explicitly. |
+
+Three checks were dropped when `upsertNodes` left the allowlist: that
+`edit`+`page` was unsupported, that `operation` was still `add`\|`edit`, and
+that `data` rejected `parent-id`. All three described the contract of a route
+nothing uses any more. `upsertNodes` itself cannot be usefully probed
+read-only, because it fails on **synced** graphs and succeeds on local ones.
 
 Read-only mode probes write methods with deliberately invalid arguments. A
 validation error proves a method exists without mutating anything.
 
-`--write` adds the two findings that need a real write: that `page-id` accepts
-a **block** UUID and nests, and that a page **name** in `page-id` reports
-success while writing nothing. It works on a scratch page and recycles it
-afterwards; nothing existing is touched.
+`--write` adds the findings that need a real write: that `createPage` is
+idempotent on title, that `insertBlock` returns the entity it created, that a
+**block** UUID as the parent nests *and* leaves `:block/page` pointing at the
+page, that a page **name** as the parent reports success while writing
+nothing, that `moveBlock` reparents and then no-ops on a repeat, and that
+`deletePage` accepts a UUID and recycles rather than destroys. It works on a
+scratch page and recycles it afterwards; nothing existing is touched.
+
+`--explore` reports rather than checks: which `logseq.DB.*` routes would close
+the remaining gaps in the tool surface (tag inheritance, tag-level property
+declaration), and which property namespaces exist in this graph. With
+`--write` it also creates one property to discover this caller's assigned
+namespace id, and leaves it in place.
 
 Failures are collected rather than raised, so one stale belief does not hide
 the rest. Exit code is non-zero if any check failed.

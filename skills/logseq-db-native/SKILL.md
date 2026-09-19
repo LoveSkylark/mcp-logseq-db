@@ -335,8 +335,9 @@ Three behaviours matter when using it directly:
   reverses them. Use `after <previous sibling>` for all but the first.
 - **A move carries the subtree**, and descendants' `:block/page` follows.
 
-Those three are already encoded in `repairOrphans`; you only need them when
-moving blocks by hand.
+Those three matter whenever you move blocks, and there is no bulk repair tool
+that hides them — the one that used to exist was removed for the reason given
+under `:block/page` above.
 
 `removeBlock` deletes the subtree and verifies every descendant is gone.
 
@@ -378,10 +379,11 @@ skips the ones that do not exist, because Logseq mints a tag for any `#name`
 it parses on write. Create the tag deliberately with `creatTag` first, or pass
 `acknowledge_tag_creation` once the user has approved the specific names.
 
-`creatTag(title)` creates one. Its
-ident is deterministic — `:plugin.class.<caller>/<Title>`, spaces stripped — so
-it need not be read back. Tags made in the Logseq UI land under `user.class/*`
-and DO carry a random suffix.
+`creatTag(title)` creates one. **The ident is assigned by Logseq rather than
+derived from the title** — tags made in the UI land under `user.class/*` with a
+random suffix — so read the ident out of `verified_state` and keep it, rather
+than constructing it from the title. The tool reads it back for exactly this
+reason.
 
 Tags and pages share one title space, so `creatTag` refuses a title an existing
 page holds, and `createPage` refuses one a tag holds.
@@ -389,11 +391,17 @@ page holds, and `createPage` refuses one a tag holds.
 `addTag(target, tag)` and `removeTag(target, tag)` take two UUIDs, **target
 first**. Removal affects that one relation only.
 
-`deleteTag` works and cascades cleanly: `:block/tags` and `:block/refs` are
-cleared on everything that carried the tag. Because that touches many entities
-and cannot be undone, it requires `acknowledge_detach` when anything holds the
-tag, and `acknowledge_child_reparent` when child tags would move. Run
-`getTagUsers` first and report what will be affected.
+`deleteTag` runs on an **unverified route**: it goes through `deletePage`,
+which has never been confirmed against a tag and whose identifier type is
+unknown there. The read-back is the only thing standing between that and a
+false success, so check `verified` and report `verified: false` as a failure
+rather than as a caveat.
+
+When it does work it cascades: `:block/tags` and `:block/refs` are cleared on
+everything that carried the tag. Because that touches many entities and cannot
+be undone, it requires `acknowledge_detach` when anything holds the tag, and
+`acknowledge_child_reparent` when child tags would move. Run `getTagUsers`
+first and report what will be affected.
 
 ## Constraints worth stating to the user
 
@@ -467,10 +475,11 @@ Destructive tools require an acknowledgement when anything is affected:
 (`acknowledge_value_loss`). Report what will be affected and let the user
 decide — do not set these on their behalf.
 
-Call only these names. Never emit a raw `logseq.*` method. If tools such as
-`upsert_nodes`, `insert_block`, `move_block`, `add_page_tag`, or
-`get_page_data` appear, an older server is running — stop and say so rather
-than adapting.
+Call only these names. Never emit a raw `logseq.*` method. The snake_case
+names of an older build — `upsert_nodes`, `insert_block`, `add_page_tag`,
+`get_page_data`, `create_many_blocks`, `repair_orphans` — are gone. If any of
+them appears, or a `getPage` or `createManyBlocks`, an older server is running:
+stop and say so rather than adapting.
 
 ## Reference files
 
@@ -483,6 +492,9 @@ Read before the matching work, not otherwise:
 - `reference/troubleshooting.md` — ambiguous results, timeouts,
   `writes_disabled`, and what a silent no-op looks like. Read when a write
   reports `verified=false`.
+- `reference/repair.md` — duplicate titles, split identities, stranded tags and
+  properties, and the triage that comes before any of it. Read before
+  repairing a damaged graph.
 
 ## Reporting
 

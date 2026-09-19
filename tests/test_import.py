@@ -193,8 +193,10 @@ class FakeClient:
             return self._insert_batch(*args)
         if method == "logseq.DB.insertBlock":
             return self._insert(*args)
-        if method == "logseq.DB.upsertNodes":
-            return self._upsert(*args)
+        if method == "logseq.DB.createPage":
+            return self._create_page(*args)
+        if method == "logseq.DB.getPage":
+            return self._get_page(*args)
         if method == "logseq.DB.updateBlock":
             return self._update(*args)
         if method == "logseq.DB.datascriptQuery":
@@ -231,15 +233,27 @@ class FakeClient:
     def _insert(self, target_uuid, title, options=None):
         return self._insert_batch(target_uuid, [{"content": title}])[0]
 
-    def _upsert(self, operations, options=None):
-        if options and options.get("dry-run"):
-            return "ok"
-        for op in operations:
-            if op["entityType"] == "page":
-                self.graph.add(op["data"]["title"],
-                               name=op["data"]["title"].lower(),
-                               tags=[PAGE_CLASS_ID])
-        return {"page": len(operations)}
+    def _create_page(self, title, properties=None):
+        """Idempotent on title, and seeds one empty first block -- both real
+        behaviours of the route page creation now takes. upsertNodes is
+        deliberately unhandled: it fails on synced graphs and nothing routes
+        through it, so a call here means something regressed."""
+        existing = next((e for e in self.graph.entities.values()
+                         if e.get("name") == str(title).lower()), None)
+        if existing is not None:
+            return dict(existing)
+        page = self.graph.add(title, name=str(title).lower(),
+                              tags=[PAGE_CLASS_ID])
+        self.graph.add("", page["id"], page["id"])
+        return dict(page)
+
+    def _get_page(self, identifier):
+        """Accepts a name OR a uuid, as the real method does."""
+        found = self.graph.entities.get(identifier)
+        if found is None:
+            found = next((e for e in self.graph.entities.values()
+                          if e.get("name") == str(identifier).lower()), None)
+        return dict(found) if found else None
 
     def _update(self, block_uuid, title):
         self._parse(self.graph.entities[block_uuid], title)
@@ -271,12 +285,6 @@ class FakeClient:
                     pages.add(next(u for u, x in self.graph.entities.items()
                                    if x["id"] == e["page"]["id"]))
             return sorted(pages)
-        if False:
-            return [e["page"] and self.graph.entities[
-                next(u for u, x in self.graph.entities.items()
-                     if x["id"] == e["page"]["id"])]["uuid"]
-                for e in self.graph.entities.values()
-                if "{{link:" in (e.get("title") or "") and e.get("page")]
         if ":find [?title ...]" in query:
             return [e["title"] for e in self.graph.entities.values()
                     if e.get("name")]
@@ -505,4 +513,6 @@ async def test_graph_wide_scan_reaches_tag_only_pages(graph):
 
     with_tags = await verified.repair_links(include_tags=True, dry_run=True)
     assert with_tags["pages_scanned"] == 1
-    assert with_tags["tags"] == ["fix"]
+    # The tag does not exist, so it is reported as missing rather than
+    # rewritten -- Logseq would mint it on write.
+    assert with_tags["tags_missing"] == ["fix"]

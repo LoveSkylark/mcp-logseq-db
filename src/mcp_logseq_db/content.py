@@ -50,18 +50,12 @@ import httpx
 from ._shared import VerifiedWriteHelpers
 from .client import LogseqDBClient, poll_readback, serialized_write
 
-MAX_BATCH_OPERATIONS = 100
 MAX_SUBTREE_NODES = 1000
 
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
 PAGE_CLASS = ":logseq.class/Page"
-
-UUID_PATTERN = re.compile(
-    r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
-    r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z"
-)
 
 # getPage detail selectors. Each answers a different question; they are not
 # interchangeable. A page's own tags and its blocks' tags live in different
@@ -1664,39 +1658,6 @@ class VerifiedContent(VerifiedWriteHelpers):
     @staticmethod
     def _reference_id(value: Any) -> int | None:
         return value.get("id") if isinstance(value, dict) else None
-
-    @staticmethod
-    def _reference_ids(references: Any) -> set[int]:
-        if not isinstance(references, list):
-            return set()
-        return {
-            r["id"] for r in references
-            if isinstance(r, dict) and isinstance(r.get("id"), int)
-        }
-
-    async def _verify_title_uuid_refs(
-        self, entity: dict[str, Any], title: str
-    ) -> None:
-        referenced = {
-            m.group(1).lower()
-            for m in re.finditer(r"\[\[(" + UUID_PATTERN.pattern[2:-2] + r")\]\]",
-                                 title)
-        }
-        if not referenced:
-            return
-        known = {
-            r.get("uuid", "").lower()
-            for r in entity.get("refs", [])
-            if isinstance(r, dict) and r.get("uuid")
-        }
-        query = "[:find ?uuid . :in $ ?entity :where [?entity :block/uuid ?uuid]]"
-        for reference_id in self._reference_ids(entity.get("refs", [])):
-            value = await self._client.call(
-                "logseq.DB.datascriptQuery", [query, reference_id])
-            if isinstance(value, str):
-                known.add(value.lower())
-        if not referenced <= known:
-            raise RuntimeError("Block title UUID reference verification failed")
 
 
 # Node-structure attributes that are also Property-class entities, so a filter

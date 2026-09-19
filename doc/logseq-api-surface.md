@@ -9,7 +9,9 @@ time".
 ## Reachable
 
 Every entry is used by at least one tool. A method no tool needs is not in the
-allowlist, so the list doubles as a dependency inventory.
+allowlist, so the list doubles as a dependency inventory — which is why
+`getCurrentGraph` was dropped: it sat here reading as a dependency while
+nothing called it.
 
 | Method | Used by |
 | --- | --- |
@@ -18,7 +20,7 @@ allowlist, so the list doubles as a dependency inventory.
 | `getTagsByName` | `getTagUUID` |
 | `getAllTags` | `listTags` |
 | `getAllProperties` | `listProperties` |
-| `upsertNodes` | `createPage` |
+| `createPage` | `createPage` |
 | `insertBlock` | `createBlock` |
 | `insertBatchBlock` | `createPageofBlocks`, `importPage` |
 | `moveBlock` | `moveBlock` |
@@ -30,7 +32,7 @@ allowlist, so the list doubles as a dependency inventory.
 | `addBlockTag` / `removeBlockTag` | `addTag` / `removeTag` |
 | `upsertProperty` / `removeProperty` | `createProperty` / `deleteProperty` |
 | `upsertBlockProperty` / `removeBlockProperty` | `addProperty` / `removeProperty` |
-| `getAppInfo`, `checkCurrentIsDbGraph`, `getCurrentGraph` | `capabilities` |
+| `getAppInfo`, `checkCurrentIsDbGraph` | `capabilities` |
 
 ## Not reachable, and why
 
@@ -48,6 +50,17 @@ carried over request/response HTTP at all.
 limited to build a safe contract on. `exportEdn` returns the whole graph
 unbounded; `importEdn` replaces it. `setFileContent` writes raw files, which
 sidesteps every guarantee this server makes.
+
+**`upsertNodes` is out of the allowlist.** It fails on SYNCED graphs — "The
+Imported EDN has N validation error(s)" for a write its own dry run accepts —
+while `createPage`, `insertBlock`, `insertBatchBlock`, `updateBlock` and
+`createTag` all succeed against the same graph. Local graphs are unaffected,
+which is why it went unnoticed for so long. Block creation had already moved
+off it for a second reason: it writes its single `page-id` into both
+`:block/parent` and `:block/page`, so a block parent produced a child whose
+owning page was the parent block. It is listed here rather than deleted because
+an earlier design treated it as the general mutation primitive, and someone
+reading that design needs to find out why it is gone.
 
 **Untested, so unexposed.** `prependBlockInPage`, `addPropertyValueChoices`,
 `newBlockUUID`.

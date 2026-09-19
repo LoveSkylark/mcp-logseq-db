@@ -21,18 +21,23 @@ are unaffected, which is why it went unnoticed. Block creation had already
 moved off it for a different reason: it writes its single `page-id` into both
 `:block/parent` and `:block/page`.
 
-`write_and_verify` is the point of this module. This API returns success for
-calls that do nothing -- a wrong identifier type, an unresolvable name, or an
-unsupported combination all produce `null` or a stock acknowledgement. A write
-that is not read back is a write whose outcome is unknown, so verification is
-built into the write path rather than left to each caller.
+`write_scope` and `poll_readback` are the point of this module. This API
+returns success for calls that do nothing -- a wrong identifier type, an
+unresolvable name, or an unsupported combination all produce `null` or a stock
+acknowledgement -- so a write that is not read back is a write whose outcome is
+unknown. Verification itself lives in the write paths (`content`, `mutations`,
+`importer`) rather than here, because each has to report WHAT it observed:
+previous state, observed state, and the diagnostic that tells "nothing
+happened" from "something else happened". What this module owns is the two
+parts they share -- serialising a mutation with its read-back, and retrying the
+read-back without ever retrying the write.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from functools import wraps
 from typing import Any
@@ -49,8 +54,10 @@ from .access import WriteAccessPolicy
 _CONNECTION_METHODS = frozenset({
     "logseq.DB.getAppInfo",             # capabilities
     "logseq.DB.checkCurrentIsDbGraph",  # capabilities
-    "logseq.DB.getCurrentGraph",        # capabilities
 })
+# `getCurrentGraph` was here and nothing called it. The allowlist doubles as a
+# dependency inventory, so an entry no tool reaches is worse than useless: it
+# reads as evidence the method is in use.
 
 _READ_METHODS = frozenset({
     # Every getPage/getBlockUUID/list*/find* tool routes here.
@@ -110,23 +117,6 @@ class LogseqAPIError(RuntimeError):
 
 class WriteCircuitOpenError(RuntimeError):
     """Raised when an earlier ambiguous timeout has blocked later writes."""
-
-
-class UnverifiedWriteError(RuntimeError):
-    """
-    Raised when a write returned successfully but the read-back did not show
-    the expected state.
-
-    This is the characteristic failure of this API, not an edge case: a wrong
-    identifier type produces exactly this shape. Both the observed state and
-    the state before the write are attached so a caller can tell "nothing
-    happened" from "something else happened".
-    """
-
-    def __init__(self, message: str, *, before: Any = None, after: Any = None):
-        super().__init__(message)
-        self.before = before
-        self.after = after
 
 
 ClientFactory = Callable[..., httpx.AsyncClient]
@@ -258,48 +248,6 @@ class LogseqDBClient:
         if last_error is not None:
             raise last_error
         return last_value
-
-    # ---------------------------------------------------------------- write
-
-    async def write_and_verify(
-        self,
-        method: str,
-        args: list[Any],
-        *,
-        reader: Callable[[], Awaitable[Any]],
-        predicate: Callable[[Any], bool],
-        description: str,
-    ) -> Any:
-        """
-        Perform a write and prove it happened.
-
-        The response is deliberately ignored as evidence. `null` is returned by
-        writes that succeeded and by writes that silently did nothing, so it
-        carries no information; only the read-back does.
-
-        `reader` is snapshotted before the write so the failure message can
-        distinguish "unchanged" from "changed unexpectedly". It must be
-        idempotent -- it is retried, the write never is.
-        """
-        async with self.write_scope():
-            try:
-                before = await reader()
-            except Exception:  # noqa: BLE001 -- a missing target is a valid before
-                before = None
-
-            await self.call(method, args)
-
-            after = await self.poll_readback(reader, predicate)
-            if not predicate(after):
-                raise UnverifiedWriteError(
-                    f"{description}: the call returned without error but the "
-                    "read-back does not show the expected state. This usually "
-                    "means an identifier of the wrong type was supplied -- "
-                    "this API reports success for writes that do nothing.",
-                    before=before,
-                    after=after,
-                )
-            return after
 
     # ----------------------------------------------------------------- call
 

@@ -153,8 +153,6 @@ removeBlock(block_uuid)
 not just the root. Subtrees over 1000 nodes are refused rather than partially
 deleted — it will not delete what it cannot verify.
 
-There is **no move**. No route exists for it.
-
 ---
 
 ## Properties
@@ -231,8 +229,9 @@ mints a new entity and the old values do not return.
 Run `getProperyUsers(ident)` first. An empty result makes this safe; anything
 else is data you are about to destroy.
 
-This route is **untested**. The UUID form is confirmed to do nothing; whether
-the ident form works has not been established. Check `verified`.
+This route is **unverified**. The UUID form is confirmed to do nothing; whether
+the ident form works has not been established. Check `verified` — `false` here
+means the definition is still in place, not that the values are half gone.
 
 ---
 
@@ -244,8 +243,9 @@ the ident form works has not been established. Check `verified`.
 creatTag(title)
 ```
 
-The ident carries a random suffix (`:user.class/xzy-bc0auNqC`), so it cannot be
-derived from the title and must be read back.
+The ident is assigned by Logseq rather than derived from the title — ones made
+in the UI carry a random suffix (`:user.class/xzy-bc0auNqC`) — so take it from
+`verified_state` rather than constructing it.
 
 ### Attaching and detaching
 

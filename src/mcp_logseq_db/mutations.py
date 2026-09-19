@@ -45,6 +45,7 @@ from typing import Any
 
 from ._shared import VerifiedWriteHelpers
 from .client import LogseqDBClient, poll_readback, serialized_write
+from .identifiers import require_ident
 
 # Fallback when the client carries no configured prefix. This is the namespace
 # FAMILY, not this caller's own namespace -- it admits another plugin's
@@ -927,14 +928,13 @@ class VerifiedMutations(VerifiedWriteHelpers):
         Built-ins such as `alias` and `tags` carry bare idents with no
         namespace, but nothing in this surface writes them, so the stricter
         form is correct here and catches a UUID passed by mistake.
+
+        Delegates to `require_ident` because the checked value does not stop
+        at the API: an ident is interpolated into Datascript query text, which
+        an attribute position gives no way to parameterise. A colon and a
+        slash were not enough to make that safe.
         """
-        if (not isinstance(value, str) or not value.startswith(":")
-                or "/" not in value):
-            raise ValueError(
-                "Expected an exact namespaced property ident such as "
-                ":plugin.property.my_plugin/Effort, not a title or a UUID"
-            )
-        return value
+        return require_ident(value)
 
     @staticmethod
     def _reference_ids(references: Any) -> set[int]:

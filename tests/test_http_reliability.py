@@ -21,7 +21,6 @@ from mcp_logseq_db.client import (
     LogseqAPIError,
     LogseqDBClient,
     LogseqProtocolError,
-    UnverifiedWriteError,
     WriteCircuitOpenError,
     serialized_write,
 )
@@ -170,18 +169,21 @@ async def test_malformed_response_does_not_poison_next_request() -> None:
 
 
 async def test_plain_text_response_is_accepted_for_declared_methods() -> None:
+    """datascriptQuery is the only method declared as plain-text-capable, and
+    it is the one that actually returns text/plain. Pinning it here keeps the
+    branch honest: a method NOT in PLAIN_TEXT_METHODS must raise instead."""
     outcomes: list[Outcome] = [
         httpx.Response(
             200,
-            text="Dry run: Added: {:page 1}.",
+            text="#datascript/DB {...}",
             headers={"content-type": "text/plain; charset=utf-8"},
         )
     ]
 
     result = await make_client(outcomes, []).call(
-        "logseq.DB.upsertNodes", [[], {"dry-run": True}])
+        "logseq.DB.datascriptQuery", ["[:find ?e :where [?e :block/uuid]]"])
 
-    assert result == "Dry run: Added: {:page 1}."
+    assert result == "#datascript/DB {...}"
 
 
 # ----------------------------------------------------------- retry policy
@@ -252,59 +254,12 @@ async def test_write_timeout_blocks_later_writes_but_allows_readback() -> None:
     assert lifecycle == ["created", "closed"] * 2
 
 
-# --------------------------------------------------------- write_and_verify
-
-class EffectClient(LogseqDBClient):
-    """A client whose write has a recorded effect, or none at all."""
-
-    def __init__(self, *, effective: bool) -> None:
-        super().__init__("http://127.0.0.1:12315", "token", readback_delay=0)
-        self.effective = effective
-        self.state = "before"
-
-    async def call(self, method: str, args: list[Any]) -> Any:
-        if self.effective:
-            self.state = "after"
-        # What Logseq actually returns from a write: nothing useful, and the
-        # same nothing whether or not the write landed.
-        return None
-
-
-async def test_write_and_verify_accepts_a_write_that_took_effect() -> None:
-    client = EffectClient(effective=True)
-
-    async def reader():
-        return client.state
-
-    result = await client.write_and_verify(
-        "logseq.DB.removeBlock", ["x"],
-        reader=reader,
-        predicate=lambda v: v == "after",
-        description="remove block x",
-    )
-    assert result == "after"
-
-
-async def test_write_and_verify_rejects_a_silent_no_op() -> None:
-    """The defining failure of this API: HTTP 200, null body, nothing done.
-    Only the read-back can tell that apart from success."""
-    client = EffectClient(effective=False)
-
-    async def reader():
-        return client.state
-
-    with pytest.raises(UnverifiedWriteError) as caught:
-        await client.write_and_verify(
-            "logseq.DB.removeBlock", ["x"],
-            reader=reader,
-            predicate=lambda v: v == "after",
-            description="remove block x",
-        )
-
-    assert caught.value.before == "before"
-    assert caught.value.after == "before"
-    assert "wrong type" in str(caught.value)
-
+# ------------------------------------------------- read-back and serialising
+#
+# Verification itself lives in content.py / mutations.py / importer.py, which
+# build the envelope reporting WHAT was observed. What the client owns is the
+# two shared parts: polling an idempotent read, and holding the write lock
+# across a mutation and its read-back. Both are tested here.
 
 async def test_readback_polling_accepts_delayed_state() -> None:
     client = LogseqDBClient(

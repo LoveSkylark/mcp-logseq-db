@@ -49,12 +49,17 @@ much as the rejection, because a caller who passed a title where a UUID
 belonged needs to be told which mistake they made.
 
 **`test_http_reliability.py`** — transport. Failure isolation, retry policy,
-the write circuit breaker, `write_and_verify`, and the wire contract. No write
-is ever retried: a timed-out write may already have been applied, so retrying
-could double it.
+the write circuit breaker, read-back polling, write-scope serialisation, and
+the wire contract. No write is ever retried: a timed-out write may already have
+been applied, so retrying could double it.
 
-**`test_content.py`** — pages and blocks. Creation, nesting, batching,
-outlines, subtree deletion, reads.
+**`test_content.py`** — pages and blocks. Creation, nesting, outlines, moving,
+subtree deletion, reads, and the orphan/stats reporting.
+
+**`test_import.py`** — markdown parsing, reference escaping, whole-page import,
+and the `repairLinks` pass that follows it. The escaping is the load-bearing
+part: Logseq mints a page for any `[[X]]` it parses on write, so an unescaped
+import creates a stub for every target that does not exist yet.
 
 **`test_mutations.py`** — tags and property values. Every operation that
 accepts a target is tested against both a page and a block, because a page *is*
@@ -102,7 +107,8 @@ running and `LOGSEQ_API_TOKEN` set.
 Live tests answer a different question from the rest of the suite. These files
 check that the code does what we think; a live test checks that our model of
 Logseq is still right. Every wrong assumption found so far — that `removeBlock`
-was unavailable, that `page-id` only accepted pages, that property writes were
-unrestricted — was invisible to the fakes, because the fakes encoded the same
-wrong assumption the code did. Markers are strict, so a typo'd one is a
-collection error rather than a silently skipped test.
+was unavailable, that the parent argument only accepted pages, that property
+writes were unrestricted, that `upsertNodes` worked on every graph — was
+invisible to the fakes, because the fakes encoded the same wrong assumption the
+code did. Markers are strict, so a typo'd one is a collection error rather than
+a silently skipped test.

@@ -14,9 +14,10 @@ that goes stale stays invisible to them. Every wrong assumption found so far
 was of this kind:
 
     removeBlock was reported unavailable; it works
-    page-id was assumed to mean "page"; it is a parent pointer
+    the parent argument was assumed to mean "page"; it takes either kind
     property writes were assumed unrestricted; they are namespaced
     a success response was treated as evidence; it is not
+    upsertNodes was assumed to work everywhere; it fails on synced graphs
 
 A contract check that starts failing means Logseq changed, or we were wrong.
 Either way the fakes are now lying and the code needs revisiting.
@@ -162,38 +163,30 @@ async def contract(client: LogseqDBClient, settings: Settings) -> None:
         else:
             fail(f"{method} is reachable", verdict)
 
-    # upsertNodes accepts exactly three combinations. A fourth appearing means
-    # the operation table in the architecture doc is out of date.
-    verdict = await probe(settings, "logseq.DB.upsertNodes", [[{
-        "operation": "edit", "entityType": "page",
-        "id": NIL_UUID, "data": {"title": "x"}}]])
-    if verdict == "unsupported":
-        ok("edit+page is still unsupported")
-    else:
-        fail("edit+page is still unsupported",
-             f"got {verdict} -- page editing may now be possible")
+    # The routes everything now depends on. `createBlock`, `importPage`,
+    # `createPageofBlocks`, `moveBlock` and the page tools all sit on these,
+    # and each replaced an `upsertNodes` path.
+    for method, args in (
+        ("logseq.DB.createPage", [""]),
+        ("logseq.DB.insertBlock", [BAD_ARG, BAD_ARG, {}]),
+        ("logseq.DB.insertBatchBlock", [BAD_ARG, [], {}]),
+        ("logseq.DB.moveBlock", [BAD_ARG, BAD_ARG, {}]),
+        ("logseq.DB.renamePage", [BAD_ARG, BAD_ARG]),
+    ):
+        verdict = await probe(settings, method, args)
+        if verdict in ("exists", "null", "responded"):
+            ok(f"{method} is reachable", verdict)
+        else:
+            fail(f"{method} is reachable", verdict)
 
-    # The operation vocabulary. No retraction verb is why tag removal cannot
-    # go through upsertNodes.
-    response = await raw_call(settings, "logseq.DB.upsertNodes", [[{
-        "operation": BAD_ARG, "entityType": BAD_ARG,
-        "id": NIL_UUID, "data": {}}]], 10)
-    if "add or edit" in response.text:
-        ok("operation vocabulary is still add|edit")
-    else:
-        fail("operation vocabulary is still add|edit",
-             response.text.strip()[:160])
-
-    # `data` is a closed allowlist. If parent-id is ever accepted, nesting has
-    # a second route and createBlock's contract can be widened.
-    response = await raw_call(settings, "logseq.DB.upsertNodes", [[{
-        "operation": "add", "entityType": "block",
-        "data": {"page-id": NIL_UUID, "title": "x", "parent-id": NIL_UUID}}]], 10)
-    if "disallowed" in response.text.lower():
-        ok("data allowlist still rejects parent-id")
-    else:
-        fail("data allowlist still rejects parent-id",
-             response.text.strip()[:160])
+    # upsertNodes is deliberately out of the client allowlist: it fails on
+    # SYNCED graphs with "The Imported EDN has N validation error(s)" for a
+    # write its own dry run accepts. That cannot be probed read-only -- a
+    # local graph accepts it and a synced one does not -- so what used to be
+    # three contract checks on its operation vocabulary and `data` allowlist
+    # are gone. They described the contract of a route nothing uses. If you
+    # need them, they are in git history alongside the design they belonged
+    # to.
 
     # The property sandbox. If this stops holding, user-namespace properties
     # become writable and a whole class of tool constraints can be dropped.
@@ -225,81 +218,163 @@ async def writes(client: LogseqDBClient, settings: Settings) -> None:
     Nothing here touches existing content. The page is recycled at the end;
     recycling preserves the entity, so it stays queryable rather than
     vanishing -- see the note printed on completion.
+
+    Every call goes through a route the tool surface actually uses. An earlier
+    version of this function drove everything through `upsertNodes`, which is
+    no longer in the client allowlist -- so `--write` raised before it checked
+    anything.
     """
     print("\n=== writes (scratch page) ===")
     marker = uuid.uuid4().hex[:8]
     title = f"MCP live check {marker}"
 
-    await client.call("logseq.DB.upsertNodes", [
-        [{"operation": "add", "entityType": "page", "data": {"title": title}}],
-        {"dry-run": False}])
-    page = await client.call("logseq.DB.datascriptQuery", [
-        "[:find (pull ?page [:db/id :block/uuid]) . :where "
-        f"[?page :block/name] [?page :block/title {json.dumps(title)}]]"])
-    if not isinstance(page, dict):
-        fail("scratch page created", "page not found after creation")
-        return
-    page_uuid = page["uuid"]
-    ok("scratch page created", page_uuid)
+    async def entity(entity_uuid: str) -> dict[str, Any] | None:
+        found = await client.call("logseq.DB.datascriptQuery", [
+            "[:find (pull ?e [*]) . :where "
+            f"[?e :block/uuid #uuid \"{entity_uuid}\"]]"])
+        return found if isinstance(found, dict) else None
 
     async def children_of(parent_uuid: str) -> list[dict[str, Any]]:
         return await client.call("logseq.DB.datascriptQuery", [
-            "[:find [(pull ?child [:db/id :block/uuid :block/title]) ...] "
-            f":where [?parent :block/uuid #uuid \"{parent_uuid}\"] "
+            "[:find [(pull ?child [:db/id :block/uuid :block/title "
+            ":block/order {:block/parent [:db/id]} {:block/page [:db/id]}]) "
+            f"...] :where [?parent :block/uuid #uuid \"{parent_uuid}\"] "
             "[?child :block/parent ?parent]]"]) or []
 
-    # A block parented by the page.
-    await client.call("logseq.DB.upsertNodes", [
-        [{"operation": "add", "entityType": "block",
-          "data": {"page-id": page_uuid, "title": "parent block"}}],
-        {"dry-run": False}])
-    top = [b for b in await children_of(page_uuid)
-           if b["title"] == "parent block"]
-    if not top:
+    def uuid_of(response: Any) -> str | None:
+        if isinstance(response, list):
+            response = response[0] if response else None
+        if isinstance(response, dict) and isinstance(response.get("uuid"), str):
+            return response["uuid"]
+        return None
+
+    created = await client.call("logseq.DB.createPage", [title])
+    page_uuid = uuid_of(created)
+    if page_uuid:
+        ok("createPage returns the created page", page_uuid)
+    else:
+        page = await client.call("logseq.DB.datascriptQuery", [
+            "[:find (pull ?page [:db/id :block/uuid]) . :where "
+            f"[?page :block/name] [?page :block/title {json.dumps(title)}]]"])
+        page_uuid = uuid_of(page)
+        info("createPage returned no usable entity; resolved by title instead")
+    if not page_uuid:
+        fail("scratch page created", "page not found after creation")
+        return
+    page = await entity(page_uuid)
+    page_id = page.get("id") if page else None
+
+    # Idempotent on title: this is what makes createPage safe to call twice
+    # and why the duplicate guard in create_page is no longer load-bearing.
+    again = await client.call("logseq.DB.createPage", [title])
+    if uuid_of(again) in (page_uuid, None):
+        ok("createPage is still idempotent on title")
+    else:
+        fail("createPage is still idempotent on title",
+             f"a second call returned {uuid_of(again)}")
+
+    # A block parented by the page. insertBlock RETURNS the entity, which is
+    # what removed the read-back cycle from outline building.
+    top_response = await client.call(
+        "logseq.DB.insertBlock", [page_uuid, "parent block", {"sibling": False}])
+    top_uuid = uuid_of(top_response)
+    if top_uuid:
+        ok("insertBlock returns the created entity", top_uuid)
+    else:
+        top = [b for b in await children_of(page_uuid)
+               if b["title"] == "parent block"]
+        top_uuid = top[0]["uuid"] if top else None
+        fail("insertBlock returns the created entity",
+             "nothing usable came back; fell back to a read")
+    if not top_uuid:
         fail("top-level block created", "not present after write")
         return
-    ok("top-level block created")
 
-    # THE finding: page-id accepts a BLOCK uuid and nests. If this fails,
-    # nested creation has no HTTP route and createBlock's contract is wrong.
-    await client.call("logseq.DB.upsertNodes", [
-        [{"operation": "add", "entityType": "block",
-          "data": {"page-id": top[0]["uuid"], "title": "nested block"}}],
-        {"dry-run": False}])
-    nested = [b for b in await children_of(top[0]["uuid"])
-              if b["title"] == "nested block"]
-    if nested:
-        ok("page-id accepts a block uuid and nests")
+    # THE finding: the parent argument accepts a BLOCK uuid and nests, and
+    # insertBlock sets :block/parent and :block/page INDEPENDENTLY. upsertNodes
+    # wrote its single page-id into both, which produced a real child whose
+    # owning page was its parent block -- invisible to every page-scoped query.
+    nested_uuid = uuid_of(await client.call(
+        "logseq.DB.insertBlock", [top_uuid, "nested block", {"sibling": False}]))
+    nested = await entity(nested_uuid) if nested_uuid else None
+    if nested is None:
+        fail("a block uuid as parent nests", "the child was not created")
     else:
-        fail("page-id accepts a block uuid and nests",
-             "the child was not created under the block")
+        parent_id = (nested.get("parent") or {}).get("id")
+        owning_page = (nested.get("page") or {}).get("id")
+        top = await entity(top_uuid)
+        if parent_id == (top or {}).get("id") and owning_page == page_id:
+            ok("a block uuid as parent nests, and ownership stays with the page")
+        else:
+            fail("a block uuid as parent nests, and ownership stays with the "
+                 "page", f"parent={parent_id} page={owning_page}")
+
+    # A batch of siblings in one call, in the order they were written.
+    batch = await client.call("logseq.DB.insertBatchBlock", [
+        page_uuid, [{"content": "batch one"}, {"content": "batch two"}],
+        {"sibling": False}])
+    batch_uuids = [e["uuid"] for e in (batch if isinstance(batch, list) else [])
+                   if isinstance(e, dict) and isinstance(e.get("uuid"), str)]
+    if len(batch_uuids) == 2:
+        ok("insertBatchBlock returns one entity per requested block")
+    else:
+        fail("insertBatchBlock returns one entity per requested block",
+             f"asked for 2, got {len(batch_uuids)}")
 
     # A name where a uuid belongs: success, and nothing written. This is the
     # failure mode the whole verification layer exists for.
-    await client.call("logseq.DB.upsertNodes", [
-        [{"operation": "add", "entityType": "block",
-          "data": {"page-id": title, "title": "should not exist"}}],
-        {"dry-run": False}])
+    await client.call(
+        "logseq.DB.insertBlock", [title, "should not exist", {"sibling": False}])
     stray = await client.call("logseq.DB.datascriptQuery", [
         '[:find (count ?block) . :where '
         '[?block :block/title "should not exist"]]'])
     if not stray:
-        ok("a page NAME as page-id still fails silently",
+        ok("a page NAME as the parent still fails silently",
             "reported success, wrote nothing")
     else:
-        fail("a page NAME as page-id still fails silently",
+        fail("a page NAME as the parent still fails silently",
              "it created a block -- names may now resolve")
 
+    # Moving, which this file once recorded as having no route at all.
+    if nested_uuid and batch_uuids:
+        await client.call("logseq.DB.moveBlock",
+                          [nested_uuid, batch_uuids[0], {"children": True}])
+        moved = await entity(nested_uuid)
+        target = await entity(batch_uuids[0])
+        if moved and target and (moved.get("parent") or {}).get("id") == target.get("id"):
+            ok("moveBlock reparents a block")
+        else:
+            fail("moveBlock reparents a block", "the parent did not change")
+
+        # And the no-op: moving it to the parent it already has changes
+        # nothing and still returns null, which is why the tool reports that
+        # as verified=false rather than as success.
+        await client.call("logseq.DB.moveBlock",
+                          [nested_uuid, batch_uuids[0], {"children": True}])
+        unchanged = await entity(nested_uuid)
+        if unchanged and moved and unchanged.get("order") == moved.get("order"):
+            ok("moveBlock still no-ops when the position would not change")
+        else:
+            info("a repeated move changed :block/order; the no-op behaviour "
+                 "may have changed")
+
     # Deletion, and that it takes the subtree.
-    await client.call("logseq.DB.removeBlock", [top[0]["uuid"]])
-    remaining = await children_of(page_uuid)
-    if not any(b["title"] == "parent block" for b in remaining):
+    await client.call("logseq.DB.removeBlock", [top_uuid])
+    if await entity(top_uuid) is None:
         ok("removeBlock deleted the block over HTTP")
     else:
         fail("removeBlock deleted the block over HTTP", "still present")
 
-    await client.call("logseq.DB.deletePage", [title])
-    info(f"scratch page recycled: {title}")
+    # By UUID, which is the form the tool sends. Recycling, not destruction.
+    await client.call("logseq.DB.deletePage", [page_uuid])
+    recycled = await entity(page_uuid)
+    if recycled is None:
+        info(f"scratch page {title} is gone entirely, not recycled")
+    elif recycled.get(":logseq.property/deleted-at") is not None:
+        ok("deletePage accepts the page UUID and recycles", page_uuid)
+    else:
+        fail("deletePage accepts the page UUID and recycles",
+             "the page is still live; the UUID form may do nothing")
     info("recycling preserves the entity, so it remains queryable")
 
 
@@ -312,45 +387,32 @@ async def explore(client: LogseqDBClient, settings: Settings,
 
     Nothing here is a pass/fail check -- these report what the API does so a
     decision can be made. Findings that turn out to be stable belong in
-    `contract` afterwards, where a regression would be caught.
+    `contract` afterwards, where a regression would be caught. Block movement
+    graduated that way: it was explored here, then confirmed, and the checks
+    for it now live in `contract` and `writes`.
     """
-    print("\n=== explore: block movement ===")
+    print("\n=== explore: unexposed routes ===")
 
-    # A move is conceptually two attribute writes: :block/parent and
-    # :block/order. The question is only whether any route accepts them.
-    for label, data in (
-        ("edit+block with page-id",
-         {"title": "x", "page-id": NIL_UUID}),
-        ("edit+block with order",
-         {"title": "x", "order": "a0"}),
-        ("edit+block with parent-id",
-         {"title": "x", "parent-id": NIL_UUID}),
-        ("edit+block with block/parent",
-         {"title": "x", "block/parent": NIL_UUID}),
-    ):
-        response = await raw_call(settings, "logseq.DB.upsertNodes", [[{
-            "operation": "edit", "entityType": "block",
-            "id": NIL_UUID, "data": data}]], 10)
-        body = response.text.strip()[:150]
-        if "disallowed" in body.lower():
-            info(f"{label}: rejected as a disallowed key")
-        elif "invalid" in body.lower() or "missing" in body.lower():
-            ok(f"{label}: key ACCEPTED by the schema", body)
-        else:
-            info(f"{label}: {body}")
-
-    # Methods that might move a block directly. None is in the client
-    # allowlist, so these go through raw_call.
-    for method, probe_args in (
-        ("logseq.DB.moveBlock", [NIL_UUID, NIL_UUID, {}]),
-        ("logseq.DB.insertBatchBlock", [NIL_UUID, [], {}]),
-        ("logseq.DB.prependBlockInPage", [NIL_UUID, BAD_ARG]),
+    # Block movement used to be the open question here, and this section
+    # probed four `upsertNodes` edit+block shapes plus three candidate
+    # methods looking for a route. `moveBlock` is the route, and it is
+    # verified on every placement -- so what is left are the methods that
+    # would close the remaining gaps in the tool surface.
+    for method, probe_args, would_support in (
+        ("logseq.DB.addTagExtends", [NIL_UUID, NIL_UUID],
+         "tag inheritance -- a tag's parent"),
+        ("logseq.DB.addTagProperty", [NIL_UUID, NIL_UUID],
+         "the property slots a tag declares"),
+        ("logseq.DB.prependBlockInPage", [NIL_UUID, BAD_ARG],
+         "insertion at the top of a page"),
+        ("logseq.DB.addPropertyValueChoices", [NIL_UUID, []],
+         "closed values on a property this caller owns"),
     ):
         verdict = await probe(settings, method, probe_args)
         if verdict == "unsupported":
             info(f"{method}: not available")
         elif verdict == "exists":
-            ok(f"{method}: EXISTS -- a move route may be possible", verdict)
+            ok(f"{method}: EXISTS -- would support {would_support}", verdict)
         else:
             info(f"{method}: {verdict}")
 
@@ -422,7 +484,7 @@ async def main() -> int:
     parser.add_argument("--write", action="store_true",
                         help="also exercise write paths on a scratch page")
     parser.add_argument("--explore", action="store_true",
-                        help="probe open questions: block movement, property "
+                        help="probe open questions: unexposed routes, property "
                              "namespaces. Read-only unless --write is also set.")
     parser.add_argument("--skip-reliability", action="store_true")
     args = parser.parse_args()

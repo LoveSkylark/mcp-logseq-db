@@ -31,14 +31,14 @@ A tag must exist before it can be attached. Attaching to a page and to a block
 are the same operation — a page **is** a block in the DB — so there is one
 `addTag`, not two.
 
-Tag idents carry a random suffix (`:user.class/xzy-bc0auNqC`), so they cannot
-be constructed from the title and must be read back after creation.
+Tag idents are assigned by Logseq rather than derived from the title — ones
+created in the UI carry a random suffix (`:user.class/xzy-bc0auNqC`) — so read
+the ident back after creation rather than constructing it.
 
 Removing a tag removes that one relation. The target's other tags and the tag
-entity itself are untouched. There is no `upsertNodes` route for removal:
-`operation` offers only `add` and `edit`, with no retraction verb, so a removal
-expressed as an upsert would mean overwriting the whole tag set — and risking
-the loss of `:logseq.class/Page`.
+entity itself are untouched. There is no single-call "set the tag list" route,
+and that is just as well: overwriting the whole set risks dropping
+`:logseq.class/Page` and with it the target's page identity.
 
 Tags declare property slots via `:logseq.property.class/properties`. A page
 tagged with a class inherits those properties as *available* — declared, but
@@ -49,7 +49,7 @@ with no value until one is assigned.
 | `getTagUUID(title)` | `getTagsByName` | probable |
 | `getTag(uuid)` | `datascriptQuery` | verified |
 | `getTagUsers(uuid)` | `datascriptQuery` | verified |
-| `creatTag(title)` | `createTag` | untested |
+| `creatTag(title)` | `createTag` | probable — creation observed by read-back; the assigned ident shape is not pinned |
 | `deleteTag(uuid)` | `deletePage` | **untested — identifier type unconfirmed** |
 | `addTag(target, tag)` | `addBlockTag` | probable |
 | `removeTag(target, tag)` | `removeBlockTag` | **verified** |
@@ -94,16 +94,21 @@ take different identifiers and different tools.
 > `:logseq.property/` are also outside the sandbox.
 
 Plugin idents are deterministic (`:plugin.property._test_plugin/<Title>`, no
-suffix) so they can be constructed client-side. User and tag idents get random
-suffixes and must be looked up.
+suffix), so they are predictable — but read the one returned in
+`verified_state` rather than assembling it, since Logseq normalizes titles.
+User and tag idents get random suffixes and must be looked up.
 
 Types: `default` (text), `number`, `string`, `datetime`, `checkbox`, `url`,
 `node`, `page`, `class`, `property`, `map`. Reference types take an entity id,
 not a literal. Properties also carry a cardinality — `one` replaces on write,
 `many` adds to a set.
 
-`Status` and `Priority` are closed enums; their permitted values are listed in
-`:property/closed-values` and a write must use one of those entities.
+`Status` and `Priority` are closed enums. Their permitted values are reported
+by `getAllProperties` as `:property/closed-values`, but **no such datom
+exists** — the list is synthesised from the reverse of
+`:block/closed-value-property`, which lives on each value pointing back at its
+property. Query the real attribute, as `listClosedValues` does, and pass one of
+those value entities on a write.
 
 | Tool | Route | Status |
 | --- | --- | --- |
@@ -123,11 +128,19 @@ this to properties — tags carry idents too and would otherwise match.
 
 Everything holding a value, with the value in raw and resolved form —
 reference types store an entity id, scalars store a literal, and one query has
-to serve both.
+to serve both. The value is deliberately **not** pulled: `pull` needs an entity
+id, and checkbox and datetime properties store literals inline, so pulling made
+the query 500 with *"Expected number or lookup ref for entity id, got true"* —
+which left those properties undeletable. Entity ids in the result are resolved
+by a second query instead.
 
 ```json
-{"method": "logseq.DB.datascriptQuery", "args": ["[:find (pull ?e [:db/id :block/uuid :block/title :block/name]) ?v (pull ?v [:db/id :db/ident :block/title]) :where [?e $IDENT ?v]]"]}
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find (pull ?holder [:db/id :block/uuid :block/title :block/name {:block/page [:db/id :block/uuid :block/title]}]) ?value :where [?holder $IDENT ?value]]"]}
 ```
+
+The ident is interpolated into the query text rather than passed as a
+parameter, because an attribute position takes no `:in` binding. That is why
+every ident is shape-checked at the boundary before it gets here.
 
 Create a definition. The first argument is a plain **title** — a namespaced
 string is rejected as a page name (`Page name can't include "/"`).
@@ -156,37 +169,48 @@ recreating mints a new entity.
 
 ## Blocks
 
-`upsertNodes` accepts exactly three combinations: `add`+`page`, `add`+`block`,
-`edit`+`block`. `edit`+`page` returns *"Editing a page, tag or property isn't
-supported yet"*. There is no removal operation at all.
+Block writes go through `insertBlock` and `insertBatchBlock`, **not**
+`upsertNodes`. `upsertNodes` fails outright on synced graphs — "The Imported
+EDN has N validation error(s)" for a write its own dry run accepts — and it
+writes its single `page-id` into both `:block/parent` and `:block/page`, so a
+block parent produced a child whose owning page was the parent block. It is out
+of the client allowlist entirely; see `archive/` for what it used to say here.
 
-> **`page-id` is a parent pointer, not a page pointer.** A page UUID makes a
-> top-level block; a **block** UUID nests. One field, both behaviours — which
-> is why nested creation needs no separate route.
+> **The parent may be a page or a block.** `insertBlock` takes the target's
+> UUID: a page UUID makes a top-level block, a block UUID nests. One argument,
+> both behaviours — which is why nested creation needs no separate route.
+> `{"sibling": false}` is what makes it a child rather than a neighbour.
 
-`data` is a **closed allowlist**: only `page-id` and `title`. `parent-id` is
-rejected as a disallowed key, and so are `tags` and `order`. Tagging and
-positioning are follow-up calls.
+Only the title can be set at creation. Tags, properties and position are
+follow-up calls.
 
-The new block's UUID is assigned by Logseq and **not returned**. Read it back
-if you need it.
+Unlike `upsertNodes`, `insertBlock` and `insertBatchBlock` **return the
+entities they created**, so a new UUID is known without a follow-up read —
+which is what removed the read-back cycle from outline building.
 
 | Tool | Route | Status |
 | --- | --- | --- |
 | `getBlockUUID(page_uuid)` | `datascriptQuery` | verified |
 | `getBlock(uuid)` | `getBlock` | **verified** |
-| `createBlock(parent, title)` | `upsertNodes` add+block | **verified, nesting included** |
+| `getBlockTree(uuid)` | `datascriptQuery` | verified |
+| `createBlock(parent, title)` | `insertBlock` | **verified, nesting included** |
+| `createPageofBlocks(page, outline)` | `insertBatchBlock` per parent | **verified** |
 | `updateBlock(uuid, title)` | `updateBlock` | **verified** |
+| `moveBlock(uuid, target, placement)` | `moveBlock` | **verified, all placements** |
 | `removeBlock(uuid)` | `removeBlock` | **verified** |
-| `createManyBlocks([...])` | `upsertNodes`, batched | **verified** |
-| `createPageofBlocks(outline)` | `upsertNodes` + `datascriptQuery` per level | probable |
 
-Every block on a page, at any depth. `:block/page` rather than
-`:block/parent` — parent reaches one level, page reaches all of them.
+Every block on a page, at any depth. This walks `:block/parent` recursively
+rather than scoping to `:block/page`: on some graphs a block's `:block/page`
+points at an ancestor block, and a page-scoped query misses it even though
+Logseq displays it normally.
 
 ```json
-{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?b [:db/id :block/uuid :block/title :block/order {:block/parent [:block/uuid]}]) ...] :in $ ?page :where [?b :block/page ?page]]", 846]}
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find (pull ?root [:db/id :block/uuid :block/title :block/name :block/order {:block/parent [:db/id :block/uuid]} {:block/page [:db/id :block/uuid]} {:block/_parent ...}]) . :where [?root :block/uuid #uuid \"$PAGE_UUID\"]]"]}
 ```
+
+The pull pattern must name the attributes it wants: `...` recurses the *whole*
+pattern, so a pattern of only `{:block/_parent ...}` returns nodes carrying no
+id, uuid or title — which reads as an empty page rather than as an error.
 
 ```json
 {"method": "logseq.DB.getBlock", "args": ["$BLOCK_UUID"]}
@@ -198,20 +222,33 @@ Every block on a page, at any depth. `:block/page` rather than
 {"method": "logseq.DB.updateBlock", "args": ["$BLOCK_UUID", "$TITLE"]}
 ```
 
-Create one, or many in a single call:
+Create one, or a whole level of siblings in a single call:
 
 ```json
-{"method": "logseq.DB.upsertNodes", "args": [[{"operation": "add", "entityType": "block", "data": {"page-id": "$PARENT_UUID", "title": "$TITLE"}}]]}
+{"method": "logseq.DB.insertBlock", "args": ["$PARENT_UUID", "$TITLE", {"sibling": false}]}
+```
+```json
+{"method": "logseq.DB.insertBatchBlock", "args": ["$PARENT_UUID", [{"content": "$TITLE"}, {"content": "$TITLE"}], {"sibling": false}]}
 ```
 
-`createPageofBlocks` is three calls per two levels — create a level, read back
-the UUIDs Logseq assigned, create the next. The read-back is structural:
-creation returns no UUIDs and `page-id` will not resolve a title, so children
-cannot name their parents until the level above exists. Cost is 2d−1 calls for
-depth *d*, independent of width.
+Move a block and its subtree. `{"children": true}` places it under the target
+(prepending); `{"before": true|false}` places it as a sibling. The method
+returns nothing whether it moved the block or did nothing, so the outcome comes
+from reading the block back — its parent, its owning page, and whether
+descendants followed.
 
-Titles must be unique among **siblings**, because that is the scope
-verification searches. Two sections may each have a child called `Notes`.
+```json
+{"method": "logseq.DB.moveBlock", "args": ["$BLOCK_UUID", "$TARGET_UUID", {"children": true}]}
+```
+
+`createPageofBlocks` costs **one call per parent that has children** — not
+2d−1. Because each batch response carries the entities it created, a parent's
+UUID is known before its own children are inserted, so there is no
+create/read-back/create cycle. Duplicate titles among siblings are fine for the
+same reason: nothing has to identify a new block by its title.
+
+It is not atomic. A failure at the third level leaves the first two committed;
+the error names the level that stopped.
 
 ---
 
@@ -219,16 +256,54 @@ verification searches. Two sections may each have a child called `Notes`.
 
 | Tool | Route | Status |
 | --- | --- | --- |
-| `getPageUUID(title)` | `datascriptQuery` | verified |
-| `getPage(uuid, detail)` | `datascriptQuery` | verified |
+| `getPageUUID(title)` | `getPage`, then `datascriptQuery` | verified |
+| `inspectPage(uuid, detail)` | `datascriptQuery` (per selector) | verified |
+| `pageStats(uuid)` | `datascriptQuery` | verified |
+| `findBacklinks(uuid)` | `datascriptQuery` | verified |
+| `findOrphans(uuid)` | `datascriptQuery` | verified |
+| `createPage(title)` | `createPage` | **verified** |
+| `renamePage(uuid, title)` | `renamePage` | **verified** |
+| `deletePage(uuid)` | `deletePage` | **verified — recycles; UUID tried first, name second** |
+| `clearPage(uuid)` | `removeBlock`, looped | **verified** |
+| `importPage(target, markdown)` | `insertBatchBlock` + `datascriptQuery` | **verified** |
+| `repairLinks(...)` | `updateBlock` + `datascriptQuery` | **verified** |
 
-Resolve a title. Returns `found: false` with candidates when ambiguous rather
-than guessing — page titles are not unique, and picking a write target from a
-fuzzy match is how the wrong entity gets modified.
+`createPage` is idempotent on title: calling it twice returns the same entity
+rather than a duplicate. Its second argument is a **properties map, not
+options** — passing `{"dry-run": true}` creates the page anyway *and* mints a
+`dry-run` property in the caller's namespace, so there is no server-side dry run
+here.
+
+It also seeds every new page with one empty block, which is why a block count
+on a page made through this API is never 0.
 
 ```json
-{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?p [:db/id :block/uuid :block/name :block/title]) ...] :where [?p :block/name] [?p :block/title \"$TITLE\"]]"]}
+{"method": "logseq.DB.createPage", "args": ["$TITLE"]}
 ```
+```json
+{"method": "logseq.DB.renamePage", "args": ["$PAGE_UUID", "$NEW_TITLE"]}
+```
+```json
+{"method": "logseq.DB.deletePage", "args": ["$PAGE_UUID"]}
+```
+
+`deletePage` **recycles**: the page keeps its UUID, tags, refs and blocks,
+gains `:logseq.property/deleted-at`, and drops out of `listPages`. Inbound
+references are not rewritten.
+
+Resolve a title. `getPage` accepts a name or a UUID and is tried first, but its
+result is checked twice before being trusted — it returns recycled pages, and a
+title held only by a tag must resolve to nothing rather than to the tag. The
+query below is the fallback, and the only path that can see every match and so
+report ambiguity rather than guessing.
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?page [:db/id :block/uuid :block/name :block/title :logseq.property/deleted-at]) ...] :in $ ?class :where [?page :block/tags ?class] [?page :block/title \"$TITLE\"]]", 4]}
+```
+
+If that returns nothing, the same query against `:block/name` with the title
+lowercased is tried — `:block/name` is the normalized form, so the exact string
+Logseq stores will not match `:block/title`.
 
 `detail` selects what comes back, and the options are **not** interchangeable:
 
@@ -297,10 +372,15 @@ chronologically.
 ```
 
 **`listClosedValues`** — required before setting `Status`, `Priority`, or any
-enum property.
+enum property. Note the attribute: `:block/closed-value-property` lives on each
+VALUE, pointing back at its property. `:property/closed-values` is what
+`getAllProperties` reports and matches nothing on any graph, and
+`:closed-value-property` is what a probe sees because responses strip the
+`:block/` prefix. Three attempts, each reading a response as if it described
+the schema.
 
 ```json
-{"method": "logseq.DB.datascriptQuery", "args": ["[:find (pull ?p [:db/ident :block/title]) (pull ?v [:db/id :db/ident :block/title]) :where [?p :property/closed-values ?v]]"]}
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find (pull ?prop [:db/id :db/ident :block/title]) (pull ?value [:db/id :db/ident :block/title :logseq.property/value :block/order]) :where [?value :block/closed-value-property ?prop]]"]}
 ```
 
 **`listOrphanTags`** — tags nothing carries.
@@ -338,13 +418,20 @@ query is a discovery probe rather than a working list.
 
 ## No tool covers these
 
-Working routes with nothing exposing them: creating a page (`upsertNodes`
-add+page), renaming one (`renamePage`), deleting or recycling one
-(`deletePage`), and clearing a page's blocks without deleting the page (a loop
-over `removeBlock`, since no batch delete exists).
+Tag inheritance and tag-level property declaration. `addTagExtends`,
+`removeTagExtends`, `addTagProperty` and `removeTagProperty` have working
+routes and no tool, so a tag's parent and its declared property slots can be
+read but not written. `setBlockIcon` and `removeBlockIcon` are the same case
+with less at stake.
 
-**Moving a block has no identified route at all.** `insertBatchBlock` and
-`prependBlockInPage` remain untested.
+Everything else that was listed here — creating, renaming, deleting and
+clearing a page, and moving a block — now has a tool. The moving entry in
+particular said "no identified route at all"; `moveBlock` is verified on every
+placement, including across pages.
+
+`prependBlockInPage`, `addPropertyValueChoices` and `newBlockUUID` remain
+untested and unexposed. See `logseq-api-surface.md` for the rest of the API and
+why it is out of reach.
 
 ---
 

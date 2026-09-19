@@ -92,7 +92,7 @@ read-back. `probable`: the route is right but this exact call was not run.
 | `getTagUUID` | `getTagsByName` | probable |
 | `getTag` | `datascriptQuery` | verified |
 | `getTagUsers` | `datascriptQuery` | verified |
-| `creatTag` | `createTag` | untested |
+| `creatTag` | `createTag` | probable — creation observed by read-back; the assigned ident shape is not pinned |
 | `deleteTag` | `deletePage` | untested — identifier type unknown |
 | `addTag` | `addBlockTag` | probable |
 | `removeTag` | `removeBlockTag` | **verified** |
@@ -114,18 +114,28 @@ read-back. `probable`: the route is right but this exact call was not run.
 |---|---|---|
 | `getBlockUUID` | `datascriptQuery` | verified |
 | `getBlock` | `getBlock` | **verified** |
-| `createBlock` | `upsertNodes` add+block | **verified**, nested included |
+| `getBlockTree` | `datascriptQuery` | verified |
+| `createBlock` | `insertBlock` | **verified**, nested included |
+| `createPageofBlocks` | `insertBatchBlock`, one call per parent | **verified** |
 | `updateBlock` | `updateBlock` | **verified** |
+| `moveBlock` | `moveBlock` | **verified**, all placements, across pages |
 | `removeBlock` | `removeBlock` | **verified** |
-| `createManyBlocks` | `upsertNodes`, batched | **verified** |
-| `createPageofBlocks` | `upsertNodes` + `datascriptQuery`, per level | probable |
 
 ### Pages
 
 | Tool | Route | Status |
 |---|---|---|
-| `getPageUUID` | `datascriptQuery` | verified |
-| `getPage` | `datascriptQuery` (per detail selector) | verified |
+| `getPageUUID` | `getPage`, then `datascriptQuery` | verified |
+| `inspectPage` | `datascriptQuery` (per detail selector) | verified |
+| `pageStats` | `datascriptQuery` | verified |
+| `findBacklinks` | `datascriptQuery` | verified |
+| `findOrphans` | `datascriptQuery` | verified |
+| `createPage` | `createPage` | **verified** |
+| `renamePage` | `renamePage` | **verified** |
+| `deletePage` | `deletePage` | **verified** — recycles; UUID tried first, name second |
+| `clearPage` | `removeBlock`, looped | **verified** |
+| `importPage` | `insertBatchBlock` + `datascriptQuery` | **verified** |
+| `repairLinks` | `updateBlock` + `datascriptQuery` | **verified** |
 
 ### Lists
 
@@ -144,9 +154,17 @@ current query is a discovery probe rather than a working list.
 methods. The rest use queries because the dedicated equivalents either do not
 exist or return everything unfiltered.
 
-**`updateBlock` and `upsertNodes` edit+block both work.** The old design would
-have called that redundancy to be eliminated. Keep both: `upsertNodes` batches
-and `updateBlock` does not, so they differ in throughput, not semantics.
+**`upsertNodes` is no longer a route at all.** It fails on SYNCED graphs —
+"The Imported EDN has N validation error(s)" for a write its own dry run
+accepts — while `createPage`, `insertBlock`, `insertBatchBlock`, `updateBlock`
+and `createTag` all succeed against the same graph. Block creation had already
+moved off it for a second reason: it writes its single `page-id` into both
+`:block/parent` and `:block/page`, so a block parent produced a child whose
+owning page was the parent block — a real child that no page-scoped query could
+see. It is out of the client allowlist, which is what keeps it from creeping
+back. The three-combination limit described above is therefore history, kept
+because it explains why the old design's fallback ordering described a
+structure that did not exist.
 
 **`getBlock`, `updateBlock` and `removeBlock` were all listed as rejected** by
 the previous capability implementation. All three work. See §8.
@@ -157,14 +175,21 @@ Working routes that nothing currently exposes:
 
 | Route | Would support |
 |---|---|
-| `upsertNodes` add+page | create a page |
-| `renamePage` | rename a page |
-| `deletePage` | delete or recycle a page |
-| `removeBlock`, looped | clear a page without deleting it |
+| `addTagExtends` / `removeTagExtends` | a tag's parent — tag inheritance |
+| `addTagProperty` / `removeTagProperty` | the property slots a tag declares |
+| `setBlockIcon` / `removeBlockIcon` | an icon on a block or page |
 
-**`move block` has no identified route at all.** `insertBatchBlock` and
-`prependBlockInPage` remain untested, and the CLI fallback previously assumed
-for it rested on the capability list that turned out to be wrong.
+Tag inheritance and tag-level property declaration are the notable gaps: both
+have working routes, and a caller can read a tag's parent and its declared
+slots but cannot write either.
+
+Everything else that was listed here — creating, renaming, deleting and
+clearing a page — now has a tool. **Moving a block, which this section once
+recorded as having "no identified route at all", goes through `moveBlock` and
+is verified on every placement including across pages.** `insertBatchBlock`,
+also listed as untested, now backs both `importPage` and `createPageofBlocks`.
+That pair is the reason §8 exists: both were written off on the strength of a
+capability list that was wrong.
 
 ## 4. Identifier discipline
 
@@ -174,13 +199,14 @@ Each entity kind has one canonical key. Passing the wrong one fails silently.
 |---|---|---|
 | block | `:block/uuid` | |
 | page | `:block/uuid` | a page **is** a block; same methods apply |
-| tag | UUID for relations, `:db/ident` for lookups | ident carries a random suffix; must be read back |
+| tag | UUID for relations, `:db/ident` for lookups | the ident is assigned by Logseq, not derived from the title; read it back |
 | property | `:db/ident` | UUID fails silently |
 | `:db/id` | queries only | integers are not stable across rebuilds; never persist |
 
-**Names are never identifiers.** `page-id` does not resolve page names.
-`removeProperty` does not accept a title. Name lookup is a separate,
-explicit resolution step that must return exactly one match or fail.
+**Names are never identifiers.** No argument resolves page names —
+`upsertNodes`'s `page-id` notably looked as if it might. `removeProperty` does
+not accept a title. Name lookup is a separate, explicit resolution step that
+must return exactly one match or fail.
 
 The MCP surface accepts UUIDs uniformly and resolves internally to whatever
 each route requires. Callers should never need to know that properties are
@@ -188,43 +214,58 @@ keyed differently from blocks.
 
 ### Validation at the boundary
 
-Datascript queries are built by string interpolation, and the query travels
-as a string inside the JSON envelope — `json.dumps` escapes the envelope but
-cannot stop a value from breaking out of a query literal. Every value that
-reaches query text is validated:
+Datascript queries are built by string interpolation, and the query travels as
+a string inside the JSON envelope — `json.dumps` escapes the envelope but
+cannot stop a value from breaking out of a query literal inside it. So each
+kind of value is handled according to whether escaping is even available:
 
-- UUIDs must match the canonical 8-4-4-4-12 form
-- idents must match keyword shape
-- string literals containing quotes or backslashes are **rejected**, not
-  escaped — a quoted title is far more likely to be a bad paste than a real
-  title, and guessing wrong means operating on the wrong entity
+- **UUIDs** must match the canonical 8-4-4-4-12 form. Cosmetic variations
+  (braces, uppercase, a `urn:uuid:` prefix, missing separators) are normalised
+  rather than rejected; a value of the wrong KIND is rejected with a diagnosis
+  naming what it looks like instead.
+- **Idents** must match keyword shape, and this is the strict one. An ident
+  goes into an ATTRIBUTE position — `[?holder :plugin.property.x/Effort
+  ?value]` — which takes no `:in` binding and is not a string literal, so
+  there is nothing to escape it with. Whitespace, quotes, brackets and
+  backslashes are refused outright, including on idents that came back from
+  Logseq itself.
+- **String literals** — titles, mostly — are emitted with `json.dumps`, whose
+  output is a valid EDN string literal, so a title containing a quote or a
+  backslash is escaped correctly rather than refused. An earlier version of
+  this document claimed such titles were rejected; they were not, and refusing
+  them would have been wrong anyway. A page can legitimately be called `The
+  "Good" Place`.
 
 This is not a security boundary — the caller already holds the token. It
 converts silent nulls into loud errors, which given §1 is the point.
 
 ---
 
-## 5. `page-id` is a parent pointer
+## 5. The parent argument takes either kind
 
-The single most useful discovery, and it is invisible from the field name.
+The single most useful discovery, and it is invisible from the argument name.
 
 ```json
-{"operation": "add", "entityType": "block",
- "data": {"page-id": "<page uuid>",  "title": "..."}}   → top-level block
-{"operation": "add", "entityType": "block",
- "data": {"page-id": "<block uuid>", "title": "..."}}   → nested child
+{"method": "logseq.DB.insertBlock",
+ "args": ["<page uuid>",  "...", {"sibling": false}]}   → top-level block
+{"method": "logseq.DB.insertBlock",
+ "args": ["<block uuid>", "...", {"sibling": false}]}   → nested child
 ```
 
-One field, both behaviours. Nested block creation is available over HTTP and
-does not need the CLI.
+One argument, both behaviours, so nested block creation needs no separate
+route and no CLI. It was first found on `upsertNodes`, whose `page-id` field
+behaved the same way — and that field is also where the discovery turned into
+a bug, because `upsertNodes` wrote its single `page-id` into both
+`:block/parent` and `:block/page`. `insertBlock` sets the two independently,
+which is the other reason block creation moved to it.
 
-`data` is a **closed allowlist**: only `page-id` and `title`. `parent-id` is
-rejected as a disallowed key. There is no way to set tags, order, or position
-at creation — each is a follow-up call.
+Only the title can be set at creation. There is no way to set tags, order or
+position on the way in — each is a follow-up call.
 
-The general lesson: where a method or field names one entity type, try the
+The general lesson: where a method or argument names one entity type, try the
 other before believing the restriction. `removeBlockTag` works on pages for
-the same reason.
+the same reason, and so does `deletePage` on a tag — though that one is still
+unverified.
 
 ---
 
@@ -269,12 +310,15 @@ read but not written. Tools must surface this as a constraint, not fail
 mysteriously.
 
 Plugin idents are deterministic (`:plugin.property._test_plugin/<Title>`, no
-suffix) and can be constructed client-side. Tag and user-property idents get
-random suffixes and must be read back.
+suffix) and so are predictable, but read the one returned in `verified_state`
+rather than assembling it — Logseq normalizes titles. Tag and user-property
+idents get random suffixes and must be read back.
 
-**Closed values.** `Status` and `Priority` are enums —
-`:property/closed-values` lists the permitted value entities. Setting them
-means passing an entity id, not a string.
+**Closed values.** `Status` and `Priority` are enums. `getAllProperties`
+reports the permitted values as `:property/closed-values`, but no such datom
+exists — it is synthesised from the reverse of `:block/closed-value-property`,
+which lives on each value pointing back at its property. Query the real
+attribute; setting one means passing an entity id, not a string.
 
 **Recycling preserves entities.** A recycled page keeps its UUID, tags and
 refs, gaining `:logseq.property/deleted-at`,
@@ -283,10 +327,14 @@ refs, gaining `:logseq.property/deleted-at`,
 `:block/tags 4`, so **every page listing must exclude them** or they appear
 as live pages. Backlinks to a recycled page are not rewritten.
 
-**Batching works.** `upsertNodes` takes an array of operations. Building an
-outline is 2d−1 calls for depth d, independent of width: create a level, read
-back the server-assigned UUIDs, create the next. The read-back is
-unavoidable — creation does not return UUIDs and names do not resolve.
+**Batching works, and it no longer needs a read-back cycle.**
+`insertBatchBlock` takes a whole level of siblings in one call and **returns
+the entities it created**, so a parent's UUID is known before its own children
+are inserted. Building an outline is therefore one call per parent that has
+children — not the 2d−1 an earlier version of this section described, which
+assumed creation returned nothing and names did not resolve. The second half of
+that assumption still holds: names do not resolve, which is why the returned
+entities matter.
 
 ---
 
@@ -362,28 +410,47 @@ types — definitions are keyed by ident, targets by UUID.
 
 ```
 getBlockUUID(pageUuid)             -> every block on the page, any depth
-createBlock(parentUuid, title)     parent may be a page or a block (nests)
 getBlock(blockUuid)
+getBlockTree(blockUuid)            -> one subtree, with a truncation flag
+createBlock(parentUuid, title)     parent may be a page or a block (nests)
+createPageofBlocks(pageUuid, md)   one insertBatchBlock per parent
 updateBlock(blockUuid, title)
-removeBlock(blockUuid)
-createManyBlocks(op, op, ...)      one batched upsertNodes
-createPageofBlocks(indented_md)    create / read-back / create, per level
+moveBlock(blockUuid, targetUuid, placement)   child | before | after
+removeBlock(blockUuid)             takes the whole subtree
 ```
 
-`createPageofBlocks` is a tool rather than a caller-side loop because the
-create/read-back/create cycle is the most silent-failure-prone sequence in
-this API (§2). UUIDs are not returned by creation and names do not resolve, so
-the read-back between levels is structural, not defensive.
+`createPageofBlocks` is a tool rather than a caller-side loop because
+structure has to be right on the way in: `insertBatchBlock` returns the
+entities it created, and threading those UUIDs into the next level is exactly
+the sequence a caller gets wrong silently (§2).
+
+`moveBlock` no-ops when the position would not change, which the tool reports
+as `verified: false` rather than as a false success. `placement=child`
+prepends. A move carries the subtree, and the tool checks all three of the new
+parent, the owning page, and whether descendants followed.
 
 ### Pages
 
 ```
-getPageUUID(title)                 -> uuid
-getPage(pageUuid, detail)          detail: page | block | tags | properties | all
+getPageUUID(title)                 -> uuid, or candidates when ambiguous
+inspectPage(pageUuid, detail)      page | blocks | tags | properties | declared | all
+pageStats(pageUuid)                -> counts only
+findBacklinks(uuid)                -> refs, tag holders, property values
+findOrphans(pageUuid)              -> informational, not a repair signal
+createPage(title)
+renamePage(pageUuid, newTitle)
+deletePage(pageUuid)               recycles; references are not rewritten
+clearPage(pageUuid)                empties a page, keeps the page
+importPage(target, markdown)       a whole page in one call
+repairLinks(...)                   converts the placeholders importPage left
 ```
 
 The detail selector matters because a page's own tags and its blocks' tags are
 different queries, and declared-but-unset properties appear in neither (§6).
+
+It is `inspectPage` rather than `getPage` because it returns far more than a
+page entity, and because `logseq.DB.getPage` is a different and much narrower
+thing.
 
 ### Lists
 
@@ -422,24 +489,33 @@ routes that would serve them.
 > are validated at the boundary, because this API's characteristic failure is
 > success that did nothing.
 
-§2 states the standard; §3 records how far the current surface meets it. Four
-write tools — `creatTag`, `deleteTag`, `deleteProperty`, `removeProperty` —
-are shipping on untested routes. Until those are run against a live graph they
-are assumptions, and `deleteTag` is a destructive one.
+§2 states the standard; §3 records how far the current surface meets it. Two
+write tools — `deleteTag` and `deleteProperty` — are still shipping on
+unverified routes, and both are destructive: `deleteTag` strips the tag from
+everything carrying it, and `deleteProperty` takes every value of the property
+with it. Until they are run against a live graph they are assumptions, which is
+why both gate on an explicit acknowledgement and why their read-backs are the
+only thing standing between a silent no-op and a reported success.
 
 ---
 
 ## Open questions
 
-- Moving a block — no route identified and no tool exposed;
-  `insertBatchBlock` and `prependBlockInPage` untested
 - Whether built-in properties (`:logseq.property/status`, `priority`,
   `deadline`, `scheduled`) are writable, or blocked like `user.property/*`
-- Whether `deletePage` keys on UUID or name
 - Whether `removeProperty` (the route behind `deleteProperty`) works at all,
   by any identifier — the UUID form was confirmed to do nothing
-- Whether batch order determines `:block/order`
-- Whether recycling is reversible by clearing `:logseq.property/deleted-at`
-- How assets are modelled
-- `createTag` argument shape — never run
 - Whether `deleteTag` routing to `deletePage` is correct at all
+- Whether recycling is reversible by clearing `:logseq.property/deleted-at`
+- Whether any property namespace is shared between callers — if none is, two
+  integrations cannot see each other's properties, and a property the user can
+  edit in the UI can never be written through the API
+- What ident shape `createTag` actually assigns — the tool reads it back, so
+  nothing depends on the answer, but two documents used to guess differently
+- How assets are modelled
+
+Answered since this list was written: `deletePage` accepts the page UUID (the
+name is still tried as a fallback, since a silent no-op is indistinguishable
+from success); moving a block goes through `moveBlock` and is verified on every
+placement; batch order does determine `:block/order`, which is why
+`insertBatchBlock` preserves the order its items were written in.

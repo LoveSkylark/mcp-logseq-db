@@ -58,31 +58,40 @@ underneath it) does anything when handed a tag. Until a live run says
 otherwise, treat tag deletion as likely to come back `verified: false`, and do
 not design something that depends on cleaning up tags.
 
-**No block movement — yet.** Structure has to be right at creation. The pieces
-look present: `:block/parent` is a plain reference and `:block/order` is a
-fractional index string, so a move is in principle a change to two attributes.
-What is missing is a way to write them. `upsertNodes` `edit`+`block` accepts
-only `title`, and `data` is a closed allowlist. `scripts/live_reliability.py
---explore` probes the plausible routes; until one is found, plan structure
-up front.
+**Blocks can be moved.** `moveBlock(block_uuid, target_uuid, placement)`
+relocates a block and its subtree — `child`, `before` or `after` — including
+across pages, and is confirmed on all placements. An earlier version of this
+file said there was no route for it and told you to get structure right at
+creation; that is no longer true, so a model that needs to reorganise later is
+viable. Three behaviours still shape how you use it: it no-ops when the
+position would not change, `child` prepends, and the subtree's `:block/page`
+follows the move.
 
-That last point shapes import order more than anything else.
+That last point is the one that shapes import order least now that blocks can
+be moved — but building outward from identity is still cheaper than fixing
+structure afterwards.
 
 ## Import order
 
-Because nothing can be moved afterwards, build outward from identity:
+Definitions have to exist before values can point at them, so build outward
+from identity:
 
 1. **Properties and tags first.** Definitions must exist before values can be
    assigned. Retain every returned ident.
 2. **Pages next.** `createPage` returns the entity; keep the UUID. Titles must
    be unique, so plan for collisions with existing pages *and* with tags,
    which are pages too.
-3. **Structure before content.** Use `createPageofBlocks` for anything nested;
-   it handles the create/read-back/create cycle that block creation requires.
+3. **Structure before content.** Use `createPageofBlocks` for anything nested,
+   or `importPage` when you have the whole page as markdown — both thread the
+   UUIDs each level returns into the next, which is the part a caller-side loop
+   gets wrong silently.
 4. **Tags and properties last**, once targets have UUIDs.
 
-Batch within a level rather than across levels. `createManyBlocks` is one call
-for a whole level; going block by block multiplies round trips for no benefit.
+Batch within a level rather than across levels. `insertBatchBlock` — the route
+under `createPageofBlocks` and `importPage` — takes a whole level of siblings
+in one call; going block by block multiplies round trips for no benefit.
+(`createManyBlocks`, which this file used to name here, was removed: it batched
+across arbitrary parents, so a failure could commit part of the tree.)
 
 ## Property schema
 
@@ -101,8 +110,10 @@ real relationship between entities; a `default` property holding a name is not,
 because nothing links.
 
 **Closed values** turn a property into an enum. `Status` and `Priority` work
-this way. A write must pass one of the entities in `:property/closed-values`,
-so call `listClosedValues` first.
+this way. A write must pass one of the permitted value entities, so call
+`listClosedValues` first — and use that tool rather than querying
+`:property/closed-values`, which `getAllProperties` reports but which exists as
+no datom on any graph.
 
 Cardinality is worth deciding deliberately. `one` overwrites silently on the
 next write; `many` accumulates and needs explicit removal.
@@ -137,12 +148,13 @@ non-unique. Resolve to a UUID or ident and keep it.
 **`:db/id` in stored data.** Those integers are renumbered when a graph is
 rebuilt. Fine inside one query, never persisted.
 
-**Deep nesting for its own sake.** Each level of an outline costs a create plus
-a read-back. Depth is 2d−1 calls; width is free.
+**Deep nesting for its own sake.** Each level of an outline costs one call per
+parent that has children. Depth costs calls; width is free.
 
-**Duplicate sibling titles.** Two blocks with the same title under the same
-parent cannot be told apart by read-back, so a write cannot be verified. Under
-*different* parents they are fine.
+**Duplicate sibling titles.** Fine — `insertBatchBlock` returns the entities it
+created, so nothing has to identify a new block by its title. Two sections can
+each hold a child called `Notes`. (This was an anti-pattern when creation
+returned nothing and verification had to search siblings by title.)
 
 ## Before you build
 

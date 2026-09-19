@@ -45,6 +45,10 @@ There is one `addTag`, not an `addPageTag` and an `addBlockTag` — a page **is*
 a block in the DB, so the target is uniform and there is nothing to choose
 between. The same applies to `addProperty`.
 
+`getBlockTree` reads one block's subtree and reports `truncated` when a bound
+stopped it; like `getBlockUUID` it walks `:block/parent`, so a block whose
+`:block/page` disagrees still appears.
+
 `inspectPage` takes a `detail` selector: `page`, `blocks`, `tags`,
 `properties`, `declared`, or `all`. These are not interchangeable. A page's own
 tags and its blocks' tags live in different places, and properties that a page
@@ -55,7 +59,11 @@ much narrower thing.
 
 `pageStats` is the one read whose response size does not depend on the page.
 Every other read returns payload proportional to content, which makes auditing
-many pages expensive; this returns seven integers regardless.
+many pages expensive; this returns a fixed set of counts regardless. Three of
+them are worth distinguishing: `own_blocks` includes the empty block
+`createPage` seeds, `empty_blocks` counts those, and `content_blocks` is the
+difference — the figure to pair with a reference count when judging whether a
+page carries anything.
 
 ## Cost lives at the tool boundary
 
@@ -236,10 +244,10 @@ same conversation. The tools target DB graphs and exact DB identifiers.
 
 ## Claude Skill
 
-`dist/logseq-db-native.zip` gives Claude operational guidance for using this
-server: identifier rules, the sandbox, what verification means. Import it under
-Settings → Skills and enable it where this connector is available. Source is in
-`skills/logseq-db-native/`.
+`scripts/build-skill.ps1` packages `skills/logseq-db-native/` into
+`dist/logseq-db-native.zip`, which gives Claude operational guidance for using
+this server: identifier rules, the sandbox, what verification means. Import it
+under Settings → Skills and enable it where this connector is available.
 
 It contains no token. The token belongs only in the MCP server configuration —
 never in skill text, model instructions, or committed files.
@@ -265,7 +273,7 @@ encode the same beliefs the code does. Run it after a Logseq upgrade.
 | --- | --- |
 | [`doc/architecture.md`](doc/architecture.md) | why the server is built this way |
 | [`doc/api-reference.md`](doc/api-reference.md) | each tool and the HTTP call behind it |
-| [`doc/data-model.md`](doc/data-model.md) | how a DB graph is shaped |
 | [`doc/logseq-api-surface.md`](doc/logseq-api-surface.md) | what the plugin API offers and why most is unexposed |
+| [`skills/logseq-db-native/reference/data-modeling.md`](skills/logseq-db-native/reference/data-modeling.md) | how a DB graph is shaped |
 | [`tests/README.md`](tests/README.md) | running and extending the suite |
 | [`scripts/README.md`](scripts/README.md) | the live checks |

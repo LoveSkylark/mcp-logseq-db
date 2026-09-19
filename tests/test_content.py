@@ -296,18 +296,6 @@ class FakeClient:
         return []
 
 
-def test_upsert_nodes_sends_the_options_map() -> None:
-    """Pinned because omitting it is not a harmless simplification: the API
-    rejects the whole call and every write tool fails at once. This was
-    removed once on the strength of a single call that appeared to work."""
-    import inspect
-    from mcp_logseq_db import content as content_module
-
-    source = inspect.getsource(content_module.VerifiedContent.upsert_nodes)
-    assert '[normalized, {"dry-run": True}]' in source
-    assert '[normalized, {"dry-run": False}]' in source
-
-
 @pytest.fixture
 def graph() -> FakeGraph:
     return FakeGraph()
@@ -510,7 +498,9 @@ async def test_get_page_uuid_reports_a_missing_page(graph, content):
 
 
 async def test_get_block_uuid_returns_nested_blocks_too(graph, content):
-    """`:block/page` reaches any depth; `:block/parent` would stop at one."""
+    """The read walks `:block/parent` RECURSIVELY rather than scoping to
+    `:block/page`, so depth is covered and a block whose owning page
+    disagrees is still seen."""
     parent = (await content.create_block(
         graph.page["uuid"], "Parent")).verified_entities[0]
     await content.create_block(parent["uuid"], "Deep child")
@@ -555,7 +545,7 @@ async def test_create_page_refuses_a_duplicate_before_writing(graph, content):
     with pytest.raises(ValueError, match="already exists"):
         await verified.create_page("TEST-PAGE")
 
-    assert not any(m == "logseq.DB.upsertNodes" for m, _ in client.calls)
+    assert not any(m == "logseq.DB.createPage" for m, _ in client.calls)
 
 
 async def test_dry_run_does_not_report_verified_true(graph, content):
@@ -911,11 +901,15 @@ async def test_a_real_orphan_is_still_reported(graph, content):
     report = await content.find_orphans(graph.page["uuid"])
 
     assert len(report["orphans"]) == 1
-    assert "invisible to any page-scoped query" in report["diagnostic"]
+    # The diagnostic must say what the condition IS without calling it damage:
+    # a repair tool built on the opposite reading reordered ~1,500 blocks.
+    assert "NOT damage" in report["diagnostic"]
+    assert ":block/page misses them" in report["diagnostic"]
 
 
 async def test_page_stats_returns_counts_not_payload(graph, content):
-    """The point of the tool: six integers regardless of page size."""
+    """The point of the tool: integers regardless of page size, so a
+    full-graph audit costs a fixed payload per page."""
     parent = (await content.create_block(
         graph.page["uuid"], "Parent")).verified_entities[0]
     await content.create_block(parent["uuid"], "Child")

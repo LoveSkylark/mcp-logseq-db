@@ -43,7 +43,7 @@ from .client import (
     WriteCircuitOpenError,
 )
 from .content import VerifiedContent
-from .identifiers import require_uuid
+from .identifiers import IdentifierError, require_ident, require_uuid
 from .importer import VerifiedImport
 from .mutations import MutationVerificationError, VerifiedMutations
 from .settings import Settings
@@ -321,7 +321,7 @@ def create_server(
     async def creat_tag(
         title: str, options: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        """Create a tag. The ident is deterministic -- :plugin.class.<caller>/<Title> with spaces stripped -- and is returned. Tags and pages share one title space, so a title an existing page holds is refused."""
+        """Create a tag. The ident is assigned by Logseq, not derived from the title, and is returned in verified_state -- read it rather than constructing it. Tags and pages share one title space, so a title an existing page holds is refused."""
         return (await mutations().create_tag(title, options)).to_dict()
 
     @server.tool(name="deleteTag", structured_output=True)
@@ -479,7 +479,13 @@ def create_server(
         orphans = []
         for entry in properties or []:
             ident = entry.get("ident") if isinstance(entry, dict) else None
-            if not isinstance(ident, str) or not ident.startswith(":"):
+            # The ident goes into query TEXT -- an attribute position takes no
+            # `:in` binding -- so it is shape-checked even though it came from
+            # Logseq rather than from the caller. A built-in with a bare ident
+            # and no namespace is skipped rather than queried.
+            try:
+                ident = require_ident(ident)
+            except IdentifierError:
                 continue
             holders = await query(
                 f"[:find [?holder ...] :where [?holder {ident} _]]")
@@ -534,17 +540,17 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
     contracts = {
         "get_page_uuid": (
             "Pass the page's display title. If several pages share it, use "
-            "getPage with a UUID instead."
+            "inspectPage with a UUID instead."
         ),
-        "get_page": (
+        "inspect_page": (
             "Pass an exact page UUID and one of: page, blocks, tags, "
             "properties, declared, all."
         ),
         "create_page": (
             "Use a title no existing page, tag or block holds -- they share "
-            "one title space. If the failure is an EDN validation error from "
-            "upsertNodes instead, the title is not the problem: the graph is "
-            "refusing the transaction, and no retry or rename will help."
+            "one title space. If the failure is an EDN validation error "
+            "instead, the title is not the problem: the graph is refusing the "
+            "transaction, and no retry or rename will help."
         ),
         "rename_page": (
             "Pass an exact page UUID and a title nothing else already uses."

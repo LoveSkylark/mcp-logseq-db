@@ -110,6 +110,7 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "repairLinks":          ("logseq.DB.updateBlock",
                              "logseq.DB.datascriptQuery"),
     "getBlock":             ("logseq.DB.getBlock",),
+    "getBlockTree":         ("logseq.DB.datascriptQuery",),
     "createBlock":          ("logseq.DB.insertBlock",),
     "updateBlock":          ("logseq.DB.updateBlock",),
     "removeBlock":          ("logseq.DB.removeBlock",),
@@ -252,13 +253,21 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
     ),
     "pageStats": (
         "Counts only. Every other read returns payload proportional to page "
-        "size, which makes a full-graph audit expensive; this returns six "
-        "integers regardless of how large the page is.",
+        "size, which makes a full-graph audit expensive; this returns a fixed "
+        "set of integers regardless of how large the page is.",
+        "own_blocks counts the empty block createPage seeds, so it is never 0 "
+        "on a page created through this API. content_blocks is the figure to "
+        "pair with a reference count.",
     ),
-    "getPage": (
+    "inspectPage": (
         "The detail selector matters: a page's own tags and its blocks' tags "
         "are different queries, and properties that are declared but unset "
         "appear in neither.",
+    ),
+    "getBlockTree": (
+        "Walks :block/parent, so a block whose :block/page disagrees still "
+        "appears. Reports truncated=true when max_depth or max_nodes stopped "
+        "traversal.",
     ),
     "createPage": (
         "A title that already exists is rejected rather than duplicated; "

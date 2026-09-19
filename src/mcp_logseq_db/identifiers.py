@@ -30,6 +30,11 @@ _HEX_RE = re.compile(r"\A[0-9a-fA-F]{32}\Z")
 _IDENT_RE = re.compile(r"\A:?[a-z][\w.]*/[\w.?!-]+\Z", re.IGNORECASE)
 _PLACEHOLDER_RE = re.compile(r"\A[\$<{\[]|[>}\]]\Z")
 
+# An ident that will be interpolated into query text must be a bare keyword.
+# The leading colon is required here, unlike _IDENT_RE, because that form is
+# what the API returns and what every property route expects.
+_QUERY_IDENT_RE = re.compile(r"\A:[a-z][\w.-]*/[\w.?!+-]+\Z", re.IGNORECASE)
+
 
 class IdentifierError(ValueError):
     """A value that cannot be an entity UUID, with what it looks like instead."""
@@ -63,6 +68,31 @@ def require_uuid(value: object, *, role: str, hint: str | None = None) -> str:
     raise IdentifierError(
         f"{role} is not a UUID: {value!r}. {_diagnose(text)}" + _hint(hint)
     )
+
+
+def require_ident(value: object, *, role: str = "property ident") -> str:
+    """
+    Return `value` as a `:db/ident`, or raise.
+
+    Stricter than it looks necessary, because property idents are the one
+    value in this server that reaches DATASCRIPT QUERY TEXT by interpolation
+    -- `[?holder :plugin.property.x/Effort ?value]` cannot be parameterised,
+    since an attribute position takes no `:in` binding. `json.dumps` escapes
+    the JSON envelope but cannot stop a value from breaking out of the query
+    literal inside it, so the shape is checked here rather than trusted.
+
+    Whitespace, quotes, brackets and backslashes are therefore rejected rather
+    than escaped: an ident containing any of them is a bad paste, not a real
+    ident, and guessing wrong means querying something other than what was
+    asked for.
+    """
+    if not isinstance(value, str) or not _QUERY_IDENT_RE.match(value.strip()):
+        raise IdentifierError(
+            f"Expected an exact namespaced property ident such as "
+            f":plugin.property.my_plugin/Effort for {role}, not a title or a "
+            f"UUID: {value!r}"
+        )
+    return value.strip()
 
 
 def _diagnose(text: str) -> str:
