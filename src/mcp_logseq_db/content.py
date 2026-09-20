@@ -738,7 +738,7 @@ class VerifiedContent(VerifiedWriteHelpers):
         alias_note = ""
         if alias_of or declared_aliases:
             alias_note = (
-                ". ALIAS RELATION: this page "
+                "ALIAS RELATION: this page "
                 + " and ".join(filter(None, [
                     (f"is an alias of {len(alias_of)} page(s)"
                      if alias_of else ""),
@@ -754,6 +754,21 @@ class VerifiedContent(VerifiedWriteHelpers):
                 " More than one page claims this one as an alias, which is "
                 "itself irregular -- read both before touching either.")
 
+        counts_note = (
+            f"{by_page - empty} block(s) with content, {by_page} own "
+            f"block(s) including {empty} empty, {len(nested)} nested "
+            f"page(s), "
+            f"{refs + tag_holders + property_values} inbound reference(s)"
+            + (f", {len(orphans)} ORPHANED block(s)" if orphans else "")
+            + (". content_blocks is the figure to pair with the "
+               "reference count when judging whether a page is empty; "
+               "own_blocks counts the empty block createPage seeds and "
+               "so is never 0 on a page that was created through this "
+               "API" if empty else "")
+        )
+        # Joined with exactly one terminator between them: the counts note
+        # ends with a period only on some branches, so appending ". " blindly
+        # produced "...this API.. ALIAS RELATION".
         return {
             "page_uuid": page_uuid,
             "title": page.get("title"),
@@ -771,18 +786,9 @@ class VerifiedContent(VerifiedWriteHelpers):
             # it is a condition to investigate rather than a shape to model.
             "is_alias_of": alias_of[0] if alias_of else None,
             "aliases": declared_aliases,
-            "diagnostic": (
-                f"{by_page - empty} block(s) with content, {by_page} own "
-                f"block(s) including {empty} empty, {len(nested)} nested "
-                f"page(s), "
-                f"{refs + tag_holders + property_values} inbound reference(s)"
-                + (f", {len(orphans)} ORPHANED block(s)" if orphans else "")
-                + (". content_blocks is the figure to pair with the "
-                   "reference count when judging whether a page is empty; "
-                   "own_blocks counts the empty block createPage seeds and "
-                   "so is never 0 on a page that was created through this "
-                   "API." if empty else "")
-                + alias_note),
+            "diagnostic": ". ".join(
+                part.rstrip(". ") for part in (counts_note, alias_note)
+                if part.strip()) + ".",
         }
 
     # ------------------------------------------------------ page listings
