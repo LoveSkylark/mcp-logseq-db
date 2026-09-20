@@ -147,6 +147,27 @@ async def probe(settings: Settings, method: str, args: list[Any]) -> str:
     return "responded"
 
 
+async def probe_detail(settings: Settings, method: str,
+                       args: list[Any]) -> tuple[str, str]:
+    """
+    `probe`, plus the body, because the verdict alone is not enough to claim
+    a method exists.
+
+    Only `exists` is positive evidence -- a validation error proves the method
+    parsed the call. `null` and `responded` prove nothing either way: a method
+    that is absent may return an error string carrying none of the markers,
+    and a method that exists may silently no-op. Reporting those as existence
+    is how a capability list came to record three working methods as rejected,
+    and this function was written after doing exactly that again.
+    """
+    try:
+        response = await raw_call(settings, method, args, 10)
+    except httpx.TimeoutException:
+        return "timeout", ""
+    body = response.text.strip()[:160]
+    return await probe(settings, method, args), body
+
+
 async def contract(client: LogseqDBClient, settings: Settings) -> None:
     print("\n=== contract ===")
 
@@ -511,20 +532,187 @@ async def explore(client: LogseqDBClient, settings: Settings,
 
     # Can a property in someone else's namespace be written? If not, there is
     # no shared space and integrations are mutually invisible.
-    for target, why in (
-        (":user.property/__mcp_probe__", "UI-created namespace"),
-        (":plugin.property.__other__/__mcp_probe__", "another plugin"),
-    ):
-        response = await raw_call(settings, "logseq.DB.upsertBlockProperty",
-                                  [NIL_UUID, target, "x"], 10)
-        body = response.text.strip()[:120]
-        if "own properties" in body or "denied" in body.lower():
-            info(f"{why}: refused ({body})")
-        else:
-            ok(f"{why}: NOT refused -- investigate", body)
+    #
+    # The TARGET MUST EXIST for this to mean anything. Probing against
+    # NIL_UUID returned null -- the write did nothing because there was
+    # nothing to write to -- and an earlier version read that silence as
+    # "not refused", announcing a sandbox breach that had not happened.
+    holder = await client.call("logseq.DB.createPage",
+                               [f"MCP sandbox probe {marker}"])
+    holder_uuid = holder.get("uuid") if isinstance(holder, dict) else None
+    if not isinstance(holder_uuid, str):
+        info("could not create a probe page; skipping the namespace check")
+    else:
+        for target, why in (
+            (":user.property/__mcp_probe__", "UI-created namespace"),
+            (":plugin.property.__other__/__mcp_probe__", "another plugin"),
+        ):
+            response = await raw_call(
+                settings, "logseq.DB.upsertBlockProperty",
+                [holder_uuid, target, "x"], 10)
+            body = response.text.strip()[:120]
+            stored = await client.call("logseq.DB.datascriptQuery", [
+                "[:find (pull ?e [*]) . :where "
+                f"[?e :block/uuid #uuid \"{holder_uuid}\"]]"])
+            landed = (isinstance(stored, dict)
+                      and stored.get(target.lstrip(":")) is not None
+                      or isinstance(stored, dict)
+                      and stored.get(target) is not None)
+            if landed:
+                fail(f"{why} is still refused",
+                     "THE VALUE LANDED -- the sandbox no longer holds, and "
+                     "every tool constraint that cites it is now wrong")
+            else:
+                ok(f"{why} is still refused",
+                   f"nothing stored; response: {body or 'null'}")
+        await client.call("logseq.DB.deletePage", [holder_uuid])
 
     info(f"probe property {ident} was created and left in place; "
          "remove it manually if unwanted")
+
+    await explore_recycling(client, settings)
+
+
+async def explore_recycling(client: LogseqDBClient,
+                            settings: Settings) -> None:
+    """
+    Is recycling reversible, and can a recycled page be purged?
+
+    Both are open. Recycling is one-way from this API: there is no restore and
+    no purge, which dead-ended a live repair -- a page recycled mid-job could
+    neither be brought back nor cleared, and the work had to move to the UI.
+
+    NO ROUTE IS KNOWN FOR EITHER. Nothing in the API surface names one, so
+    this probes the two mechanisms that could plausibly work rather than
+    assuming a method exists:
+
+      - RESTORE by clearing `:logseq.property/deleted-at` through
+        `removeBlockProperty`. That method IS in the allowlist, and the tool
+        layer refuses built-in namespaces -- but the route itself may not.
+        Note that a full restore needs more than the flag: recycling also
+        reparents the page under Recycle and sets
+        `:logseq.property.recycle/original-page`, so clearing one attribute
+        may leave the page live but misparented. This reports what actually
+        changed rather than declaring success.
+      - PURGE by calling `deletePage` on an ALREADY recycled page, which is
+        what the UI's "delete permanently" appears to do.
+
+    A scratch page is created and recycled here specifically so the
+    destructive half has nothing of value to destroy. Purge is the only
+    irreversible operation in the whole toolset, which is why it is probed on
+    a page created seconds earlier and never on anything else.
+    """
+    print("\n=== explore: restore and purge ===")
+
+    marker = uuid.uuid4().hex[:8]
+    title = f"MCP recycle probe {marker}"
+
+    async def entity(entity_uuid: str) -> dict[str, Any] | None:
+        found = await client.call("logseq.DB.datascriptQuery", [
+            "[:find (pull ?e [*]) . :where "
+            f"[?e :block/uuid #uuid \"{entity_uuid}\"]]"])
+        return found if isinstance(found, dict) else None
+
+    created = await client.call("logseq.DB.createPage", [title])
+    page_uuid = created.get("uuid") if isinstance(created, dict) else None
+    if not isinstance(page_uuid, str):
+        info("could not create a scratch page; skipping")
+        return
+
+    await client.call("logseq.DB.deletePage", [page_uuid])
+    before = await entity(page_uuid)
+    if before is None:
+        info("the scratch page vanished on delete rather than recycling, so "
+             "there is nothing to restore or purge on this build")
+        return
+    if before.get(":logseq.property/deleted-at") is None:
+        info("the scratch page was not recycled; skipping")
+        return
+    info(f"scratch page recycled: {page_uuid}")
+
+    # Is there simply a method for either? A named route would make all of
+    # the below unnecessary. ONLY `exists` counts -- see `probe_detail`. An
+    # earlier version of this loop reported every non-`unsupported` verdict as
+    # EXISTS and so announced four routes that may well not be there.
+    for method, args in (
+        ("logseq.DB.restorePage", [NIL_UUID]),
+        ("logseq.DB.recoverPage", [NIL_UUID]),
+        ("logseq.DB.purgePage", [NIL_UUID]),
+        ("logseq.DB.emptyRecycleBin", []),
+    ):
+        verdict, body = await probe_detail(settings, method, args)
+        if verdict == "exists":
+            ok(f"{method} EXISTS", body)
+        elif verdict == "unsupported":
+            info(f"{method}: not available")
+        else:
+            info(f"{method}: inconclusive ({verdict}) -- {body or 'no body'}")
+
+    # RESTORE: clear the deletion flag directly.
+    response = await raw_call(
+        settings, "logseq.DB.removeBlockProperty",
+        [page_uuid, ":logseq.property/deleted-at"], 10)
+    after = await entity(page_uuid)
+    if after is None:
+        fail("restore probe", "the page disappeared entirely")
+    elif after.get(":logseq.property/deleted-at") is None:
+        ok("RESTORE IS POSSIBLE: removeBlockProperty cleared "
+           ":logseq.property/deleted-at",
+           "check whether it is back in listPages and correctly parented -- "
+           "recycling also reparents under Recycle")
+        recycle_parent = (after.get("parent") or {}).get("id")
+        info(f"restored page parent is now {recycle_parent}; "
+             f"original-page ref: "
+             f"{after.get(':logseq.property.recycle/original-page')}")
+
+        # THE GATING QUESTION for a restorePage tool. Clearing the flag puts
+        # the page back in listPages, which filters on deleted-at alone --
+        # but it is still parented under Recycle. If that parent cannot be
+        # cleared, the page is live to one query and in the bin by structure,
+        # and a restore tool would be reporting success while creating a
+        # subtler problem than the one it solved.
+        #
+        # There is no route to clear a ref attribute: moveBlock moves a block
+        # TO a target and cannot move one to no-parent. So the only candidate
+        # is removeBlockProperty on :block/parent itself, which is an
+        # attribute rather than a property entity -- hence a probe rather than
+        # an assumption.
+        if recycle_parent is not None:
+            response = await raw_call(
+                settings, "logseq.DB.removeBlockProperty",
+                [page_uuid, ":block/parent"], 10)
+            reparented = await entity(page_uuid)
+            still = ((reparented or {}).get("parent") or {}).get("id")
+            if still is None:
+                ok("RESTORE IS COMPLETE: :block/parent cleared too",
+                   "a restorePage tool is buildable -- clear the flag, then "
+                   "the parent, then verify the page is in listPages and has "
+                   "no parent")
+            else:
+                info(f"the Recycle parent survived ({still}). Response: "
+                     f"{response.text.strip()[:120]}")
+                info("so a restore leaves the page live to listPages AND "
+                     "parented in the bin. LOOK AT IT IN THE LOGSEQ UI "
+                     "before building anything: if it renders normally and "
+                     "is absent from the bin, the parent is cosmetic and a "
+                     "restore tool is fine. If it appears in both, it is "
+                     "not.")
+    else:
+        info("restore not possible this way: the flag survived. Response: "
+             f"{response.text.strip()[:120]}")
+
+    # PURGE: delete an already-recycled page.
+    await client.call("logseq.DB.deletePage", [page_uuid])
+    purged = await entity(page_uuid)
+    if purged is None:
+        ok("PURGE IS POSSIBLE: a second deletePage destroyed the entity",
+           "irreversible -- any tool for this needs the strongest "
+           "acknowledgement in the surface plus a findBacklinks report")
+    else:
+        info("purge not possible this way: the entity survived a second "
+             "deletePage, so recycling really is terminal from the API")
+        info(f"scratch page {title} is left recycled; it still holds its "
+             "title, so remove it in the UI if that matters")
 
 
 # ------------------------------------------------------------------ main
@@ -535,7 +723,9 @@ async def main() -> int:
                         help="also exercise write paths on a scratch page")
     parser.add_argument("--explore", action="store_true",
                         help="probe open questions: unexposed routes, property "
-                             "namespaces. Read-only unless --write is also set.")
+                             "namespaces, and whether recycling can be "
+                             "reversed or purged. Read-only unless --write "
+                             "is also set.")
     parser.add_argument("--skip-reliability", action="store_true")
     args = parser.parse_args()
 

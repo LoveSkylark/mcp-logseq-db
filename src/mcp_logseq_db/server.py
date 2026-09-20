@@ -151,6 +151,15 @@ def create_server(
         """Can this title be written? Uses the exact check createPage and renamePage make, so its answer cannot disagree with theirs. Returns available, and when taken, held_by with each holder's uuid, kind (page, tag, block or property -- all four share one title space) and whether it is RECYCLED. Recycling does not release a title: the entity survives, so the writers still refuse it while getPageUUID reports the same title as not found. That is deliberate on both sides -- a recycled page must not resolve or a link would point at a deleted page -- and this tool is how you see it. Call it before any rename or page creation, and when a duplicate-title repair needs to know what actually holds a name."""
         return await content().is_title_available(title)
 
+    @server.tool(name="findDuplicateTitles", structured_output=True)
+    async def find_duplicate_titles(
+        normalize: Literal["exact", "loose", "fuzzy"] = "loose",
+        include_recycled: bool = True,
+    ) -> dict[str, Any]:
+        """Group pages and tags whose titles may name the same thing, with the evidence to classify each group: both content counts, both reference counts, and ALIAS status. The front end to duplicate triage -- it replaces reading every title by eye, and costs six queries whatever the graph size. IT REPORTS AND RANKS; IT NEVER ACTS, and no classification is an instruction. Groups come back as dead_stub (safest), split_identity, near_title, genuine_split, or alias. An alias group is NOT a duplicate: an alias is empty, lightly referenced and titled one character off its neighbour, so it is indistinguishable from an abandoned stub by counts alone -- and deleting either side cannot be repaired, since alias is outside the writable namespace. Those groups are ranked last and excluded from anything actionable. normalize=exact groups identical titles only; loose folds case, whitespace, punctuation and simple plurals; fuzzy adds edit-distance matching for typo pairs and is opt-in because it also matches legitimately distinct short titles like Thread and Threads. Recycled pages are included by default, because a recycled page still holds its title. Confirm a symptom in the Logseq UI before any write."""
+        return await content().find_duplicate_titles(
+            normalize=normalize, include_recycled=include_recycled)
+
     @server.tool(name="inspectPage", structured_output=True)
     async def inspect_page(
         page_uuid: str,
@@ -238,7 +247,7 @@ def create_server(
         include_tags: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Convert {{link:X}} and {{tag:X}} placeholders left by importPage back to live references. Omit page_uuid to scan every page, which is the usual case since links resolve only once their targets have been imported. NOTHING IS CREATED WITHOUT EXPLICIT APPROVAL: a name matching no page or tag is skipped, its placeholder left in place, and reported — links under missing, tags under tags_missing. Names matching several candidates are skipped rather than guessed. Creating missing pages needs BOTH create_missing and acknowledge_page_creation; creating missing TAGS needs create_missing and acknowledge_tag_creation, which is a separate flag because tags are a separate entity kind. Both are capped. Run with dry_run first to see exactly which pages and tags would be created. Tags are opt-in via include_tags. Safe to re-run."""
+        """Convert {{link:X}} and {{tag:X}} placeholders left by importPage back to live references. Omit page_uuid to scan every page, which is the usual case since links resolve only once their targets have been imported. ONLY THOSE TWO PREFIXED FORMS ARE RECOGNISED: a bare {{X}} was never written by an import and is left alone, which matters because Logseq reads it as an unknown macro call rather than a link -- run searchBlocks for '{{' to see what a page actually carries. NOTHING IS CREATED WITHOUT EXPLICIT APPROVAL: a name matching no page or tag is skipped, its placeholder left in place, and reported — links under missing, tags under tags_missing. Names matching several candidates are skipped rather than guessed. Creating missing pages needs BOTH create_missing and acknowledge_page_creation; creating missing TAGS needs create_missing and acknowledge_tag_creation, which is a separate flag because tags are a separate entity kind. Both are capped. Run with dry_run first to see exactly which pages and tags would be created. Tags are opt-in via include_tags. Safe to re-run."""
         if page_uuid is not None:
             page_uuid = require_uuid(
                 page_uuid, role="page_uuid", hint="getPageUUID")
@@ -646,13 +655,19 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "may still be taken for writing -- recycled pages do not resolve "
             "here; check isTitleAvailable."
         ),
+        "find_duplicate_titles": (
+            "Takes no identifiers. normalize is exact, loose or fuzzy; "
+            "fuzzy is capped at 2000 titles because it compares every pair."
+        ),
         "is_title_available": (
             "Pass a title, not a UUID or an ident."
         ),
         "delete_page": (
-            "Pass an exact page UUID. Set acknowledge_reference_rewrite when "
-            "entities link to it, and acknowledge_alias_loss when it is in "
-            "an alias relation -- pageStats reports both."
+            "Pass an exact page UUID. If entities reference the page, pass "
+            "acknowledge_reference_rewrite=true -- those references are not "
+            "rewritten. If it is in an alias relation, pass "
+            "acknowledge_alias_loss=true -- that one cannot be repaired "
+            "afterwards, and pageStats reports both."
         ),
         "retitle_over_duplicate": (
             "Pass the UUID of the page that should END UP with the title, "
@@ -670,11 +685,6 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         ),
         "rename_page": (
             "Pass an exact page UUID and a title nothing else already uses."
-        ),
-        "delete_page": (
-            "Pass an exact page UUID. If entities reference the page, pass "
-            "acknowledge_reference_rewrite=true -- those references are not "
-            "rewritten."
         ),
         "clear_page": "Pass an exact page UUID, not a block UUID.",
         "import_page": (

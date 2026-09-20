@@ -64,6 +64,26 @@ Check `pageStats` before recycling any page that looks like an abandoned
 duplicate. `Abilties` was a live alias of `Attribute` and was one call away
 from being recycled; `Mechanics` carries two aliases of its own.
 
+## Triage before repair
+
+`findDuplicateTitles()` is the front end to everything in this file. It groups
+pages and tags whose titles may name the same thing and attaches the evidence
+to classify each group — both content counts, both reference counts, and alias
+status — in six queries whatever the graph size. Start here rather than
+reading titles or running a `pageStats` per page.
+
+It returns a `classification` per group mapping onto the classes below:
+`dead_stub` (A), `split_identity` (B), `genuine_split` (C), `near_title` (E),
+and `alias`. **`alias` is not a duplicate** — see the alias section — and both
+it and `genuine_split` rank last because neither is actionable.
+
+`normalize=loose` is the default and folds case, whitespace, punctuation and
+simple plurals. `normalize=fuzzy` adds edit-distance matching, which is how
+typo pairs surface, and is opt-in because it also matches legitimately
+distinct short titles: `Thread`/`Threads` and `Maneuver`/`Maneuvers` may both
+be intentional. **The classification is a reading of counts, not an
+instruction.** Confirm a symptom in the UI before any write.
+
 ## Counting cheaply
 
 Start with a counted LISTING, not a per-page read.

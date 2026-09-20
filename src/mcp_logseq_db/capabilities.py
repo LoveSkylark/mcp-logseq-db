@@ -124,6 +124,7 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "getPageUUID":          ("logseq.DB.getPage",
                              "logseq.DB.datascriptQuery"),
     "isTitleAvailable":     ("logseq.DB.datascriptQuery",),
+    "findDuplicateTitles":  ("logseq.DB.datascriptQuery",),
     "inspectPage":          ("logseq.DB.datascriptQuery",),
     "createPage":           ("logseq.DB.createPage",),
     "renamePage":           ("logseq.DB.renamePage",
@@ -332,6 +333,22 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "verification could not otherwise tell the new page from the old.",
         "The check counts recycled pages, and blocks and tags as well as "
         "pages. isTitleAvailable reports the same answer with the holder.",
+    ),
+    "findDuplicateTitles": (
+        "Reports and ranks. It never acts, and no classification is an "
+        "instruction -- two pages both holding content is a human decision.",
+        "Six queries whatever the graph size: the title inventory, three "
+        "count aggregates and one alias sweep. It is the front end to "
+        "duplicate triage, replacing a per-page pageStats or reading every "
+        "title by eye.",
+        "ALIAS groups are not duplicates and are ranked last. An alias is "
+        "empty, lightly referenced and titled one character off its "
+        "neighbour, so counts alone cannot tell it from an abandoned stub — "
+        "and deleting either side is unrepairable.",
+        "normalize=fuzzy matches legitimately distinct short titles "
+        "(Thread/Threads). It is opt-in and capped at 2000 titles.",
+        "Recycled pages are included by default, because a recycled page "
+        "still holds its title.",
     ),
     "isTitleAvailable": (
         "Uses the write path's own check, so it cannot disagree with what "

@@ -65,6 +65,15 @@ reading that design needs to find out why it is gone.
 **Untested, so unexposed.** `prependBlockInPage`, `addPropertyValueChoices`,
 `newBlockUUID`.
 
+**Restore and purge have no route.** Probed 2026-09-20: a second `deletePage`
+on an already-recycled page leaves the entity present, so recycling is
+terminal from the API. `restorePage`, `recoverPage`, `purgePage` and
+`emptyRecycleBin` returned no validation marker, which is not evidence they
+exist. `removeBlockProperty` does clear `:logseq.property/deleted-at`, but the
+page stays parented under Recycle — live to `listPages`, still in the bin by
+structure. See `architecture.md`'s open questions before building on any of
+this.
+
 `insertBlock`, `insertBatchBlock` and `moveBlock` were once in this section —
 all three now back the tool surface. `insertBlock` in particular was removed
 from the allowlist on the strength of the wrong capability list, which is how

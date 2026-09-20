@@ -5,21 +5,6 @@ Ordered so each instruction is independently shippable. Phase 1 is cheap and saf
 Every item traces to something that actually cost us in this session, noted under *Evidence*.
 
 
----
-
-## Phase 3 — Valuable, but verify upstream first
-
-### Instruction 10 — `purgeRecycled(uuid)` and `restorePage(uuid)` **[pair]**
-
-**Why:** recycling is currently one-way from the API. There's no purge and no restore.
-
-**Addresses:** it dead-ended a live repair today. Once I'd recycled `Creativity` I could neither bring it back nor clear it, and had to hand off to the UI mid-job.
-
-**Works with:** all duplicate repair; cleanup after any mistaken delete.
-
-**Concerns:** **check the Logseq API actually exposes these before scheduling the work** — `deleteTag` is already documented as an unverified route, and this may be the same situation. `purgeRecycled` is the only genuinely irreversible operation in the whole toolset, so it needs the strongest acknowledgement and a mandatory `findBacklinks` report first. Note that Instruction 5 makes this *less* urgent: renaming the recycled page out of the way now solves the title problem without purging.
-
-**Done when:** a recycled page can be restored to `listPages`, and purge refuses without acknowledgement.
 
 ---
 

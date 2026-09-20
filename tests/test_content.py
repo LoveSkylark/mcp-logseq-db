@@ -16,7 +16,12 @@ from typing import Any
 import pytest
 
 from mcp_logseq_db.access import WriteAccessPolicy
-from mcp_logseq_db.content import VerifiedContent, _parse_outline
+from mcp_logseq_db.content import (
+    VerifiedContent,
+    _parse_outline,
+    grouping_key,
+    within_edit_distance,
+)
 
 PAGE_CLASS_ID = 4
 PROPERTY_CLASS_ID = 3
@@ -395,6 +400,26 @@ class FakeClient:
             wanted = set(params[0])
             return [e for e in self.graph.entities.values()
                     if (e.get("parent") or {}).get("id") in wanted]
+        if ":in $ [?class ...]" in query and "(pull ?e" in query:
+            # The title inventory: every page and tag in one query, which is
+            # what keeps the duplicate sweep at six calls whatever the graph
+            # size.
+            wanted = set(params[0])
+            return [e for e in self.graph.entities.values()
+                    if any(t.get("id") in wanted
+                           for t in (e.get("tags") or []))]
+        if ":find ?holder ?target" in query and ":block/alias" in query:
+            # The graph-wide alias sweep, as PAIRS rather than entities. Both
+            # spellings are matched because the live graph carried every
+            # relation on :block/alias and none on :logseq.property/alias.
+            pairs = []
+            for entity in self.graph.entities.values():
+                declared = (entity.get("alias")
+                            or entity.get(":logseq.property/alias") or [])
+                for ref in declared:
+                    if isinstance(ref, dict) and ref.get("id") is not None:
+                        pairs.append([entity["id"], ref["id"]])
+            return pairs
         if "(pull ?holder" in query and ":block/alias ?target" in query:
             # Inbound: something declares this page as ITS alias. Both
             # attribute spellings are matched, because the code queries both
@@ -1355,6 +1380,184 @@ async def test_counted_page_listing_excludes_recycled_pages(graph, content):
     rows = {r["title"]: r for r in result["pages"]}
     assert "Gone" not in rows
     assert rows["TEST-PAGE"]["content_blocks"] == 1
+
+
+# ------------------------------------------------ duplicate title triage
+#
+# 330 titles were once read by eye for near-matches. These tests care about
+# two things the eye also got wrong: that an ALIAS is not reported as a
+# duplicate, and that a plural is not assumed to be a mistake.
+
+def add_page(graph, title, *, recycled=False):
+    extra = {":logseq.property/deleted-at": 1} if recycled else None
+    return graph.add(title, None, None, name=title.lower(),
+                     tags=[PAGE_CLASS_ID], extra=extra)
+
+
+async def test_an_exact_duplicate_is_grouped_as_a_dead_stub(graph, content):
+    real = add_page(graph, "Creativity")
+    await content.create_block(real["uuid"], "actual content")
+    stub = add_page(graph, "Creativity")
+
+    result = await content.find_duplicate_titles()
+
+    group = next(g for g in result["groups"] if "Creativity" in g["titles"])
+    assert group["classification"] == "dead_stub"
+    assert group["rank"] == 0
+    members = {m["uuid"]: m for m in group["members"]}
+    assert members[real["uuid"]]["content_blocks"] == 1
+    assert members[stub["uuid"]]["content_blocks"] == 0
+    assert members[stub["uuid"]]["refs"] == 0
+
+
+async def test_an_alias_is_flagged_as_an_alias_not_a_duplicate(
+        graph, content):
+    """The acceptance case, and the trap. `Abilties` is empty, referenced
+    once and one character off `Abilities` -- indistinguishable from a dead
+    stub by counts alone. Recommending its deletion is unrepairable."""
+    real = add_page(graph, "Abilities")
+    await content.create_block(real["uuid"], "content")
+    alias = add_page(graph, "Abilties")
+    owner = add_page(graph, "Attribute")
+    owner["alias"] = [{"id": alias["id"]}]
+
+    result = await content.find_duplicate_titles(normalize="fuzzy")
+
+    group = next(g for g in result["groups"] if "Abilties" in g["titles"])
+    assert group["classification"] == "alias"
+    assert group["rank"] == 5          # ranked below everything actionable
+    assert "NOT a duplicate" in group["reading"]
+    assert next(m for m in group["members"]
+                if m["uuid"] == alias["uuid"])["alias"] is True
+
+
+async def test_a_typo_pair_is_found_only_with_fuzzy(graph, content):
+    add_page(graph, "Persuade")
+    add_page(graph, "Presuade")
+
+    loose = await content.find_duplicate_titles()
+    fuzzy = await content.find_duplicate_titles(normalize="fuzzy")
+
+    assert loose["groups"] == []
+    assert any("Presuade" in g["titles"] for g in fuzzy["groups"])
+
+
+async def test_punctuation_and_case_fold_without_fuzzy(graph, content):
+    add_page(graph, "Loom-Weaver")
+    add_page(graph, "loom weaver")
+
+    result = await content.find_duplicate_titles()
+
+    assert len(result["groups"]) == 1
+
+
+async def test_exact_mode_does_not_fold_punctuation(graph, content):
+    add_page(graph, "Loom-Weaver")
+    add_page(graph, "Loom Weaver")
+
+    result = await content.find_duplicate_titles(normalize="exact")
+
+    assert result["groups"] == []
+
+
+async def test_two_pages_with_content_are_a_human_decision(graph, content):
+    left = add_page(graph, "Mechanics")
+    right = add_page(graph, "mechanics")
+    await content.create_block(left["uuid"], "one")
+    await content.create_block(right["uuid"], "two")
+
+    result = await content.find_duplicate_titles()
+
+    group = result["groups"][0]
+    assert group["classification"] == "genuine_split"
+    assert group["rank"] == 4
+    assert "human decision" in group["reading"]
+
+
+async def test_a_referenced_empty_page_is_a_split_identity(graph, content):
+    real = add_page(graph, "Dawnspire")
+    await content.create_block(real["uuid"], "content")
+    empty = add_page(graph, "dawnspire")
+    referrer = graph.add("points at it", graph.page["id"], graph.page["id"])
+    referrer["refs"] = [{"id": empty["id"]}]
+
+    result = await content.find_duplicate_titles()
+
+    group = next(g for g in result["groups"] if "Dawnspire" in g["titles"])
+    assert group["classification"] == "split_identity"
+    assert "retitleOverDuplicate" in group["reading"]
+
+
+async def test_a_tag_clashing_with_a_page_is_reported(graph, content):
+    """Tags and pages share one title space, so this is a real clash."""
+    add_page(graph, "Industrial")
+    graph.add("Industrial", None, None, ident=":user.class/industrial-x",
+              tags=[TAG_CLASS_ID])
+
+    result = await content.find_duplicate_titles()
+
+    group = result["groups"][0]
+    assert {m["kind"] for m in group["members"]} == {"page", "tag"}
+
+
+async def test_a_recycled_page_holding_a_title_is_reported(graph, content):
+    """It still holds the title, which is what surprises people."""
+    add_page(graph, "Creativity")
+    add_page(graph, "Creativity", recycled=True)
+
+    included = await content.find_duplicate_titles()
+    excluded = await content.find_duplicate_titles(include_recycled=False)
+
+    assert any(m["recycled"] for m in included["groups"][0]["members"])
+    assert excluded["groups"] == []
+
+
+async def test_nothing_is_written(graph):
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    add_page(graph, "Twin")
+    add_page(graph, "Twin")
+
+    await verified.find_duplicate_titles(normalize="fuzzy")
+
+    assert not any(m for m, _ in client.calls
+                   if m != "logseq.DB.datascriptQuery")
+
+
+async def test_a_bad_normalize_value_is_refused(content):
+    with pytest.raises(ValueError, match="exact, loose, or fuzzy"):
+        await content.find_duplicate_titles(normalize="aggressive")
+
+
+def test_the_plural_fold_is_conservative():
+    """A wrong fold silently merges two real pages; a missed one only reports
+    them separately. So the rule errs toward missing."""
+    assert grouping_key("Threads") == "thread"
+    assert grouping_key("Thread") == "thread"
+    # Double-s words keep their ending, but their plural still folds to it.
+    assert grouping_key("Class") == "class"
+    assert grouping_key("Classes") == "class"
+    # Short words are left alone rather than mangled.
+    assert grouping_key("Its") == "its"
+
+
+def test_exact_mode_interprets_nothing():
+    """`exact` promises identical titles only. It once folded case and
+    punctuation anyway, because the mode was passed as a boolean that only
+    switched off the plural rule."""
+    assert grouping_key("Loom-Weaver", mode="exact") == "Loom-Weaver"
+    assert (grouping_key("Loom-Weaver", mode="exact")
+            != grouping_key("Loom Weaver", mode="exact"))
+    assert (grouping_key("Creativity", mode="exact")
+            != grouping_key("creativity", mode="exact"))
+    # And loose still folds all three.
+    assert grouping_key("Loom-Weaver") == grouping_key("loom weaver")
+
+
+def test_edit_distance_exits_early_on_hopeless_pairs():
+    assert within_edit_distance("creativity", "creatvity", 1)
+    assert not within_edit_distance("creativity", "mechanics", 2)
+    assert not within_edit_distance("cat", "category", 1)
 
 
 # ------------------------------------------------ title availability

@@ -85,6 +85,11 @@ MAX_SEARCH_ROWS = 500
 # the worst case for a predicate query and useless as an answer.
 MIN_SEARCH_TEXT = 2
 
+# Entities compared pairwise when edit-distance matching is on. The grouping
+# itself is a dict lookup and scales fine; fuzzy matching is O(n^2), so it is
+# bounded rather than allowed to crawl a large graph.
+MAX_FUZZY_TITLES = 2000
+
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
@@ -95,6 +100,92 @@ TAG_CLASS = ":logseq.class/Tag"
 # interchangeable. A page's own tags and its blocks' tags live in different
 # places, and properties that are declared but unset appear in neither.
 PAGE_DETAILS = ("page", "blocks", "tags", "properties", "declared", "all")
+
+
+_PUNCTUATION = re.compile(r"[^\w\s]+")
+_WHITESPACE = re.compile(r"\s+")
+
+
+def normalize_title(title: str) -> str:
+    """
+    Fold a title to the form duplicates are grouped by.
+
+    Case, whitespace and punctuation only, plus a crude plural strip. What is
+    deliberately NOT done here is anything clever: this key decides which
+    titles are considered the same thing, and a normaliser that collapses too
+    much produces confident nonsense. `Loom-Weaver` and `Loom Weaver` fold
+    together because a hyphen is not a distinction anyone meant; `Thread` and
+    `Threads` fold together because the plural usually is not either -- but
+    that second one is a guess, which is why the caller can turn it off.
+    """
+    folded = _PUNCTUATION.sub(" ", title.lower())
+    folded = _WHITESPACE.sub(" ", folded).strip()
+    return folded
+
+
+def singularize(word: str) -> str:
+    """
+    Strip a trailing plural, conservatively.
+
+    `Class` keeps its double s because the s is part of the word; `Classes`
+    folds to `class` because the `es` is not. `Abilities` becomes
+    `abilitie` rather than `ability` -- inexact, but CONSISTENT, which is all
+    a grouping key needs, since both spellings fold the same way.
+
+    Irregular plurals are missed and that is deliberate: a missed pair is
+    reported as two separate entries, while a wrong fold silently merges two
+    real pages into one group and invites someone to delete one of them.
+    """
+    if len(word) > 4 and word.endswith("es"):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        return word[:-1]
+    return word
+
+
+def grouping_key(title: str, *, mode: str = "loose") -> str:
+    """
+    The key titles are bucketed by, for one of the three modes.
+
+    Takes the MODE rather than a `plural` flag, which was a bug: the flag only
+    switched the plural fold off, so `exact` still folded case and
+    punctuation and grouped `Loom-Weaver` with `Loom Weaver` -- contradicting
+    the one thing `exact` promises. Three modes do not fit in a boolean.
+
+    `exact` is the raw title, because its whole purpose is to find genuine
+    duplicates with no interpretation applied. `loose` and `fuzzy` share this
+    key; fuzzy differs only in merging near-miss keys afterwards.
+    """
+    if mode == "exact":
+        return title
+    folded = normalize_title(title)
+    return " ".join(singularize(word) for word in folded.split(" "))
+
+
+def within_edit_distance(left: str, right: str, allowed: int) -> bool:
+    """
+    Levenshtein distance, with an early exit at `allowed`.
+
+    Bounded rather than computed in full because the answer is only ever used
+    as a yes/no, and the bound is what keeps a pairwise sweep cheap.
+    """
+    if abs(len(left) - len(right)) > allowed:
+        return False
+    if left == right:
+        return True
+    previous = list(range(len(right) + 1))
+    for i, a in enumerate(left, start=1):
+        current = [i]
+        for j, b in enumerate(right, start=1):
+            current.append(min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + (a != b),
+            ))
+        if min(current) > allowed:
+            return False
+        previous = current
+    return previous[-1] <= allowed
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1123,6 +1214,278 @@ class VerifiedContent(VerifiedWriteHelpers):
             ":where [?holder :block/refs ?target]]",
             "Inbound reference counts", page_ids))
         return own, empty, refs
+
+    async def find_duplicate_titles(
+        self,
+        *,
+        normalize: str = "loose",
+        include_recycled: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Group titles that may name the same thing, with the evidence needed to
+        classify each group.
+
+        The front end to duplicate triage, which was previously done by
+        reading 330 titles by eye -- which does not scale and misses things.
+
+        IT REPORTS AND RANKS. IT NEVER ACTS. Every group carries a
+        classification drawn from the repair triage table, and the
+        classification is a reading of the counts rather than an instruction:
+        two pages with content are a human decision, and edit-distance matches
+        include legitimately distinct short titles -- `Thread` and `Threads`,
+        `Maneuver` and `Maneuvers` may both be intentional. Ranking exists so
+        the cheap certainties come first, not so the tail can be skipped.
+
+        ALIAS STATUS IS LOAD-BEARING, not a nicety. An alias reads exactly
+        like an abandoned duplicate: empty, one inbound reference, a title one
+        character off its neighbour. A tool that ranked duplicates without it
+        would recommend recycling working aliases, and `alias` is a built-in
+        property outside the writable namespace, so that cannot be undone.
+        Any group with an alias relation is classified `alias` and excluded
+        from the actionable ranks entirely.
+
+        Tags are included because tags and pages share one title space, so a
+        page and a tag with the same title is a real clash. Recycled pages are
+        included by default because a recycled page still HOLDS its title,
+        which is the thing that surprises people.
+
+        `normalize`: `exact` groups identical titles only; `loose` (the
+        default) folds case, whitespace, punctuation and simple plurals;
+        `fuzzy` adds an edit-distance sweep for typo pairs and is opt-in
+        because that is where the false positives live.
+
+        Costs six queries regardless of graph size.
+        """
+        if normalize not in {"exact", "loose", "fuzzy"}:
+            raise ValueError("normalize must be exact, loose, or fuzzy")
+
+        page_class = await self._class_id(PAGE_CLASS)
+        tag_class = await self._class_id(TAG_CLASS)
+
+        entities = await self._query_list(
+            "[:find [(pull ?e [:db/id :block/uuid :block/title :block/name "
+            ":logseq.property/deleted-at {:block/tags [:db/id]}]) ...] "
+            ":in $ [?class ...] :where [?e :block/tags ?class]]",
+            "Title inventory", [page_class, tag_class])
+
+        candidates = []
+        for entity in entities:
+            if not isinstance(entity, dict) or not entity.get("title"):
+                continue
+            recycled = entity.get(":logseq.property/deleted-at") is not None
+            if recycled and not include_recycled:
+                continue
+            classes = {self._reference_id(t)
+                       for t in (entity.get("tags") or [])}
+            candidates.append({
+                "id": entity["id"],
+                "uuid": entity.get("uuid"),
+                "title": entity["title"],
+                "kind": "tag" if tag_class in classes else "page",
+                "recycled": recycled,
+            })
+
+        groups = self._group_titles(candidates, normalize)
+        if not groups:
+            return {
+                "normalize": normalize,
+                "titles_examined": len(candidates),
+                "groups": [],
+                "diagnostic": (
+                    f"No title collisions among {len(candidates)} pages and "
+                    "tags at this normalisation. Try normalize=fuzzy for typo "
+                    "pairs, which is off by default because it also matches "
+                    "legitimately distinct short titles."),
+            }
+
+        # Counts and alias relations for everything in a group -- two bulk
+        # reads rather than a pageStats per candidate, which is the whole
+        # reason this is usable on a real graph.
+        involved = [m["id"] for group in groups for m in group]
+        own, empty, refs = await self._count_indexes(involved)
+        aliased = await self._alias_participants()
+
+        reports = [
+            self._classify_group(group, own, empty, refs, aliased)
+            for group in groups
+        ]
+        reports.sort(key=lambda r: (r["rank"], -len(r["members"])))
+
+        return {
+            "normalize": normalize,
+            "titles_examined": len(candidates),
+            "groups": reports,
+            "diagnostic": (
+                f"{len(reports)} group(s) among {len(candidates)} pages and "
+                "tags. Ranked cheapest-certainty first; `alias` and "
+                "`genuine_split` groups are NOT actionable and are ranked "
+                "last. Nothing here has been changed, and no classification "
+                "is an instruction -- confirm a symptom in the Logseq UI "
+                "before any write."),
+        }
+
+    def _group_titles(
+        self, candidates: list[dict[str, Any]], normalize: str
+    ) -> list[list[dict[str, Any]]]:
+        """Bucket candidates that may name the same thing."""
+        buckets: dict[str, list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            key = grouping_key(candidate["title"], mode=normalize)
+            buckets.setdefault(key, []).append(candidate)
+
+        groups = [members for members in buckets.values() if len(members) > 1]
+        if normalize != "fuzzy":
+            return groups
+
+        if len(candidates) > MAX_FUZZY_TITLES:
+            raise ValueError(
+                f"{len(candidates)} titles exceeds the {MAX_FUZZY_TITLES} "
+                "limit for edit-distance matching, which compares every pair. "
+                "Use normalize=loose.")
+
+        # Merge near-miss keys. Distance scales with length so that a
+        # one-character difference in a short word is not treated as the same
+        # evidence as one in a long phrase.
+        keys = [k for k, members in buckets.items()]
+        merged: dict[str, set[str]] = {k: {k} for k in keys}
+        for i, left in enumerate(keys):
+            for right in keys[i + 1:]:
+                allowed = 1 if min(len(left), len(right)) < 8 else 2
+                if within_edit_distance(left, right, allowed):
+                    merged[left].add(right)
+                    merged[right].add(left)
+
+        seen: set[str] = set()
+        fuzzy: list[list[dict[str, Any]]] = []
+        for key in keys:
+            if key in seen:
+                continue
+            cluster = merged[key]
+            seen |= cluster
+            members = [m for k in cluster for m in buckets[k]]
+            if len(members) > 1:
+                fuzzy.append(members)
+        return fuzzy
+
+    async def _alias_participants(self) -> set[int]:
+        """
+        Every entity id on either side of an alias relation, in one query.
+
+        One query for the whole graph rather than two per candidate. Both
+        attribute spellings are matched: on 2.0.1-alpha+nightly.20260826 every
+        relation sat on `:block/alias` and `:logseq.property/alias` had none,
+        so a sweep against the documented name alone would have found nothing
+        and quietly reported every alias as a duplicate.
+        """
+        pairs = await self._query_list(
+            "[:find ?holder ?target :where "
+            "(or-join [?holder ?target] "
+            "[?holder :logseq.property/alias ?target] "
+            "[?holder :block/alias ?target])]",
+            "Alias sweep")
+        participants: set[int] = set()
+        for pair in pairs:
+            if isinstance(pair, list):
+                participants.update(v for v in pair if isinstance(v, int))
+        return participants
+
+    @staticmethod
+    def _classify_group(
+        members: list[dict[str, Any]],
+        own: dict[int, int],
+        empty: dict[int, int],
+        refs: dict[int, int],
+        aliased: set[int],
+    ) -> dict[str, Any]:
+        """
+        Read the counts into one of the triage classes.
+
+        The class is a description of the evidence, not a decision. `rank`
+        orders groups by how little judgement they need -- 0 is a stub with
+        nothing pointing at it, 4 is something to read rather than repair.
+        """
+        detailed = []
+        for member in members:
+            content = own.get(member["id"], 0) - empty.get(member["id"], 0)
+            detailed.append({
+                **{k: v for k, v in member.items() if k != "id"},
+                "own_blocks": own.get(member["id"], 0),
+                "content_blocks": content,
+                "refs": refs.get(member["id"], 0),
+                "alias": member["id"] in aliased,
+            })
+
+        titles = {m["title"] for m in detailed}
+        with_content = [m for m in detailed if m["content_blocks"] > 0]
+        empty_members = [m for m in detailed if m["content_blocks"] == 0]
+
+        if any(m["alias"] for m in detailed):
+            return {
+                "titles": sorted(titles),
+                "members": detailed,
+                "classification": "alias",
+                "rank": 5,
+                "reading": (
+                    "NOT a duplicate. At least one of these is in an alias "
+                    "relation, which is live resolution wiring and looks "
+                    "identical to an abandoned stub in every count. Deleting "
+                    "either side breaks resolution and cannot be repaired "
+                    "through this API. Leave it alone."),
+            }
+
+        if len(with_content) > 1:
+            return {
+                "titles": sorted(titles),
+                "members": detailed,
+                "classification": "genuine_split",
+                "rank": 4,
+                "reading": (
+                    "Both sides hold content. Merging is a human decision -- "
+                    "read both pages. No tool should choose for you."),
+            }
+
+        stubs = [m for m in empty_members if m["refs"] == 0]
+        referenced = [m for m in empty_members if m["refs"] > 0]
+        same_title = len(titles) == 1
+
+        if with_content and stubs and not referenced:
+            return {
+                "titles": sorted(titles),
+                "members": detailed,
+                "classification": "dead_stub",
+                "rank": 0 if same_title else 1,
+                "reading": (
+                    f"{len(stubs)} empty, unreferenced entity(s) beside one "
+                    "holding content. The safest class -- but confirm the "
+                    "counts for that specific page before recycling it, and "
+                    "remember a recycled page keeps its title."),
+            }
+
+        if with_content and referenced:
+            return {
+                "titles": sorted(titles),
+                "members": detailed,
+                "classification": "split_identity",
+                "rank": 2,
+                "reading": (
+                    "One side is empty but REFERENCED, the other holds the "
+                    "content. Recycling the empty one strands its inbound "
+                    "references. If it is the empty side holding the title "
+                    "you want, retitleOverDuplicate moves the title in two "
+                    "renames without touching a block."),
+            }
+
+        return {
+            "titles": sorted(titles),
+            "members": detailed,
+            "classification": "near_title" if not same_title else "both_empty",
+            "rank": 3,
+            "reading": (
+                "Similar titles, and nothing here distinguishes them by "
+                "content or references. They may be two intentional pages: "
+                "a plural and a singular, or two short words one character "
+                "apart. Read them before assuming otherwise."),
+        }
 
     async def find_block_tree(
         self,

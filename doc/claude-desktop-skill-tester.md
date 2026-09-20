@@ -19,8 +19,17 @@ the second question.
    is missing** — test it anyway and record what happened.
 2. Before any write, state the target UUID or ident, the operation, and how it
    is reversed.
-3. Create one fixture page per run: `MCP T <date> <run>`. Never test against
-   real content.
+3. **Reuse the fixture pages; do not create one per run.** The convention is
+   two long-lived pages, `MCP Test Fixture A` and `MCP Test Fixture B`,
+   emptied with `clearPage` at the START of a run. Never test against real
+   content.
+
+   Why not a fresh `MCP T <date> <run>` page each time, which is what earlier
+   runs did: `deletePage` RECYCLES, a recycled page keeps its title, and there
+   is no purge from this API (see `architecture.md`). So every per-run fixture
+   name is permanently taken, the recycle bin grows monotonically — ten pages
+   after two sessions — and cleanup is UI-only. `clearPage` leaves nothing
+   behind and burns no title.
 4. Verify every write with an independent read. **An envelope reporting
    `verified: true` is necessary but not sufficient** — the server's read-back
    and your verification can share a wrong assumption.
@@ -52,7 +61,16 @@ the second question.
 11. **Before recycling anything, check `is_alias_of` and `aliases` in
     `pageStats`.** An alias relation appears in no count, and it is the one
     relation these tools cannot rebuild.
-12. Tear down fixtures at the end of the run.
+12. **Teardown means `clearPage`, not `deletePage`.** Empty the fixture pages
+    and leave them in place. Deleting them recycles rather than destroys:
+    the entity survives with its UUID, blocks and title, stays out of
+    `listPages`, and cannot be purged through any tool. If a run does create
+    a throwaway page, say so in the log — it is permanent state, and the next
+    person needs to know the name is gone.
+
+    Placeholders are also state. `{{link:X}}` and `{{tag:X}}` left by an
+    import survive teardown if the page does; a sweep with
+    `searchBlocks("{{")` shows what previous runs left lying around.
 
 ### Standard verification query
 
@@ -272,9 +290,13 @@ atomic** and it **stops** at the first block that does not verify, so what
 these tests ask is whether a partial result is legible — not just whether the
 happy path works.
 
-Build a fixture page with ten numbered sibling blocks (`Para 01` … `Para 10`)
-and a second empty destination page. Verify every outcome by reading
-`:block/order` at the destination, never from the envelopes.
+Empty `MCP Test Fixture A` with `clearPage`, then build ten numbered sibling
+blocks (`Para 01` … `Para 10`) on it with `createBlock` in a loop — NOT with
+`importPage`, which prepends each batch on this build, so an imported fixture
+arrives in reverse and the source-order assertion would be meaningless. Empty
+`MCP Test Fixture B` as the destination. Read `:block/order` on all ten before
+moving anything: that recorded order is the baseline, not the order you think
+you created.
 
 | ID | Test | Expected |
 |---|---|---|

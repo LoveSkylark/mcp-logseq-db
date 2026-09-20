@@ -537,7 +537,8 @@ only thing standing between a silent no-op and a reported success.
 - Whether `removeProperty` (the route behind `deleteProperty`) works at all,
   by any identifier — the UUID form was confirmed to do nothing
 - Whether `deleteTag` routing to `deletePage` is correct at all
-- Whether recycling is reversible by clearing `:logseq.property/deleted-at`
+- Whether a PAGE can be moved with `moveBlock`. This is the missing half of a
+  restore: see below.
 - Whether any property namespace is shared between callers — if none is, two
   integrations cannot see each other's properties, and a property the user can
   edit in the UI can never be written through the API
@@ -550,3 +551,34 @@ name is still tried as a fallback, since a silent no-op is indistinguishable
 from success); moving a block goes through `moveBlock` and is verified on every
 placement; batch order does determine `:block/order`, which is why
 `insertBatchBlock` preserves the order its items were written in.
+
+### Recycling: reversible by half, and not purgeable
+
+Probed 2026-09-20 on `2.0.1-alpha+nightly.20260826`, on a scratch page created
+and recycled for the purpose.
+
+**Purge is not available.** A second `deletePage` on an already-recycled page
+leaves the entity present. Recycling is terminal from this API; the UI's
+"delete permanently" has no reachable equivalent. `restorePage`,
+`recoverPage`, `purgePage` and `emptyRecycleBin` are not confirmed to exist —
+they returned bodies carrying no validation marker, which proves nothing
+either way.
+
+**Restore is half available, and the missing half is the dangerous part.**
+`removeBlockProperty` DOES clear `:logseq.property/deleted-at` — confirmed by
+read-back, and notable because the tool layer refuses built-in namespaces
+while the route does not. But recycling also reparents the page under the
+Recycle page, and clearing the flag leaves it there. The result is a page that
+`listPages` shows as live, because that listing filters on `deleted-at`, while
+its parent is still the bin.
+
+That state is worse than either end of it: visible through one query and wrong
+through another, which is the failure shape this whole design exists to avoid.
+So a `restorePage` tool needs a second operation — reparenting the page out of
+Recycle — and nothing has established that `moveBlock` accepts a PAGE as the
+thing being moved. Until that is probed, a restore tool would report success
+while creating a subtler problem than the one it fixed.
+
+The pressure for either is off in any case: `retitleOverDuplicate` takes a
+title back from a recycled page by renaming it, which was the dead end that
+made purge look necessary.
