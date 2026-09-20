@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 BULLET = re.compile(r"^(?P<indent>[\t ]*)-\s(?P<content>.*)$")
 PAGE_PROPERTY = re.compile(r"^(?P<key>[A-Za-z][\w.-]*)::\s*(?P<value>.*)$")
@@ -130,6 +131,102 @@ class ParsedPage:
             return sum((1 if b.children else 0) + walk(b.children)
                        for b in blocks)
         return walk(self.blocks) + (1 if self.blocks else 0)
+
+
+def parse_blocks(
+    blocks: list[Any], *, escape: bool = True
+) -> ParsedPage:
+    """
+    Parse an EXPLICIT block list, where one element is one block.
+
+    WHY THIS EXISTS. The line format infers block boundaries from `- ` and
+    depth from indentation, and neither survives content that contains
+    newlines. A bulletless line is joined to the block above it, which covers
+    a wrapped paragraph and a numbered list -- but a blank line inside a block
+    is dropped, leading whitespace is stripped, and any line that happens to
+    begin with `- ` becomes a CHILD BLOCK. So an eight-step sequence with a
+    nested bullet, a markdown table, or a fenced code block cannot be
+    expressed at all, and an import of real manuscript content needed a
+    `createBlock` fallback mid-way.
+
+    Here nothing is inferred. Each element is one block, its text is used
+    verbatim, and DEPTH IS EXPLICIT -- required rather than read from leading
+    whitespace, because with multi-line values indentation no longer
+    distinguishes structure from content. That is the whole point: the two
+    formats answer the same question differently, and mixing them would put
+    the ambiguity straight back.
+
+    An element is either a string (depth 0) or a mapping with `text` and
+    `depth`. `content` is accepted in place of `text`, since that is what the
+    underlying API calls the field.
+
+    Page properties are not parsed: there is no "before the first bullet"
+    region to hold them. References are still escaped -- Logseq parses content
+    on write whatever route it arrived by.
+    """
+    if not isinstance(blocks, list) or not blocks:
+        raise ValueError("markdown must be a non-empty string or block list")
+
+    warnings: list[str] = []
+    all_links: list[str] = []
+    all_tags: list[str] = []
+    roots: list[ParsedBlock] = []
+    stack: list[ParsedBlock] = []
+
+    for index, element in enumerate(blocks):
+        position = index + 1
+        if isinstance(element, str):
+            text, depth = element, 0
+        elif isinstance(element, dict):
+            raw = element.get("text", element.get("content"))
+            if not isinstance(raw, str):
+                raise ValueError(
+                    f"block {position}: needs a 'text' string")
+            depth = element.get("depth", 0)
+            if isinstance(depth, bool) or not isinstance(depth, int):
+                raise ValueError(
+                    f"block {position}: 'depth' must be an integer")
+            if depth < 0:
+                raise ValueError(
+                    f"block {position}: 'depth' cannot be negative")
+            text = raw
+        else:
+            raise ValueError(
+                f"block {position}: each element must be a string or an "
+                "object with 'text' and 'depth'")
+
+        if not text.strip():
+            raise ValueError(
+                f"block {position}: empty. An explicit list says what the "
+                "blocks are, so an empty one is a mistake rather than "
+                "something to skip silently.")
+
+        # A jump is an ERROR here, unlike the line format where it is a
+        # warning: indentation can be accidentally ragged, an integer cannot.
+        if depth > len(stack):
+            raise ValueError(
+                f"block {position}: depth {depth} skips a level -- the "
+                f"deepest available here is {len(stack)}. Depth is explicit "
+                "in this form, so a gap is a mistake rather than something "
+                "to flatten.")
+
+        if escape:
+            text, links, tags = escape_references(text)
+            all_links.extend(links)
+            all_tags.extend(tags)
+
+        block = ParsedBlock(content=text, line=position)
+        del stack[depth:]
+        (stack[-1].children if stack else roots).append(block)
+        stack.append(block)
+
+    total = sum(1 for _ in _walk(roots))
+    if total > MAX_IMPORT_BLOCKS:
+        raise ValueError(
+            f"{total} blocks exceeds the {MAX_IMPORT_BLOCKS}-block import "
+            "limit. Split the page.")
+
+    return ParsedPage({}, roots, all_links, all_tags, warnings)
 
 
 def parse_markdown(text: str, *, escape: bool = True) -> ParsedPage:

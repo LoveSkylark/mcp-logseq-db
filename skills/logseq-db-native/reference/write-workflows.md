@@ -243,6 +243,43 @@ work if consistent. Skipping a level raises.
 There is no transaction. A failure at level three leaves levels one and two in
 place; the error names which level stopped.
 
+### Importing a whole page
+
+```
+importPage(target, markdown, replace=false, dry_run=false)
+```
+
+`markdown` takes either of two forms, chosen by type rather than a flag.
+
+**A string** is Logseq markdown: every block line starts with `- `,
+indentation gives depth, and a line WITHOUT a bullet continues the block above
+it. Page properties are read from the region before the first bullet.
+
+**A list** is one block per element with depth stated explicitly — either a
+plain string (depth 0) or `{"text": "...", "depth": 1}`. The text is used
+verbatim.
+
+**Use the list form for any block containing newlines.** The string form
+cannot express them. A blank line inside a block is dropped, leading
+whitespace is stripped, and a line beginning with `- ` becomes a CHILD of the
+block rather than part of it — so an eight-step sequence with a nested bullet,
+a markdown table, or a fenced code block fragments. That is what forces a
+`createBlock` fallback part-way through an import, and it is the one thing the
+list form exists to prevent.
+
+Depth is required rather than inferred there, and a skipped level is an ERROR
+rather than a warning: indentation stops distinguishing structure from content
+once values span lines, and an explicit integer cannot be accidentally ragged
+the way whitespace can.
+
+Same in both forms: references are escaped to `{{link:X}}` and `{{tag:X}}`,
+and markdown headings convert to native Logseq headings. Different: page
+properties are only parsed from a string, so `key:: value` as a list element
+is simply block content.
+
+Existing content is appended to. `replace=true` clears the page first, which
+destroys its block UUIDs and every reference to them.
+
 ### Editing and deleting
 
 ```

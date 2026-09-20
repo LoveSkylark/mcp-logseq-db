@@ -84,6 +84,17 @@ from a dead stub. `deletePage` refuses on one without
 overriding: `alias` is a built-in property outside the writable namespace, so
 a relation broken this way cannot be rebuilt through these tools.
 
+**`importPage` takes two input forms.** A STRING is Logseq markdown — `- `
+starts a block, indentation gives depth, a bulletless line continues the
+block above. A LIST is one block per element with explicit depth, either a
+plain string or `{"text": "...", "depth": 1}`, and its text is used verbatim.
+
+Use the list form whenever a block contains newlines. The string form cannot
+carry them: a blank line inside a block is dropped, leading whitespace is
+stripped, and a line starting with `- ` becomes a child of the block instead
+of part of it. An eight-step numbered sequence, a markdown table or a fenced
+code block therefore needs the list form, or it fragments.
+
 ## A page is a block
 
 Pages, blocks, tags, and properties share one entity store. A page carries

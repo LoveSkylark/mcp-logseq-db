@@ -263,13 +263,18 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "Nested pages are reported separately as ordinary structure.",
     ),
     "importPage": (
+        "markdown takes either a STRING of Logseq markdown or a LIST of one "
+        "block per element with explicit depth. Only the list form can carry "
+        "a block containing newlines: in the string form a line beginning "
+        "with '- ' inside a multi-line block becomes a child of it.",
         "References are escaped, not written live: Logseq mints a page or tag "
         "for any [[link]] or #tag it parses, so an unescaped import creates a "
         "stub for every target that does not yet exist.",
         "Markdown headings are passed through and converted by Logseq into "
         "native heading properties.",
         "Page properties (key:: value) are parsed and reported but NOT "
-        "applied — they are outside the writable namespace.",
+        "applied — they are outside the writable namespace. The list form has "
+        "no region for them, so it does not parse them at all.",
         "Appends by default. replace=true clears the page first, which "
         "destroys block UUIDs and any references to them.",
     ),

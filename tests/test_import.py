@@ -17,6 +17,7 @@ from mcp_logseq_db.importer import VerifiedImport
 from mcp_logseq_db.markdown import (
     escape_references,
     find_placeholders,
+    parse_blocks,
     parse_markdown,
     restore_reference,
 )
@@ -398,6 +399,152 @@ async def test_import_rejects_a_block_uuid_as_target(graph, importer):
 
     with pytest.raises(ValueError, match="block, not a page"):
         await importer.import_page(block["uuid"], SAMPLE)
+
+
+# --------------------------------------- the explicit block list format
+#
+# The line format infers block boundaries from `- ` and depth from
+# indentation, and neither survives content containing newlines. A bulletless
+# line is joined to the block above -- which covers a wrapped paragraph -- but
+# a blank line is dropped, leading whitespace is stripped, and a line starting
+# with `- ` becomes a CHILD. So an eight-step sequence, a markdown table or a
+# fenced code block could not be imported as one block, and a real import
+# needed a createBlock fallback part-way through.
+
+EIGHT_STEPS = """1. Declare intent
+2. Name the stake
+3. Roll
+- 3a. On a tie, the defender chooses
+4. Compare
+
+5. Narrate
+6. Apply cost
+7. Update the clock
+8. Ask what changes"""
+
+
+async def test_an_eight_line_list_imports_as_one_block(graph, importer):
+    """The acceptance case. Note what the text contains: a numbered list, a
+    nested `- ` bullet, and a blank line -- each of which the string form
+    would turn into a separate block or drop."""
+    result = await importer.import_page(
+        graph.page["uuid"], ["Resolution Sequence", EIGHT_STEPS])
+
+    assert result.verified is True
+    assert result.blocks == 2
+    stored = [b["title"] for b in graph.children(graph.page["id"])]
+    assert EIGHT_STEPS in stored
+    # Byte-exact: the newlines, the blank line and the nested bullet all
+    # survived as content rather than becoming structure.
+    kept = next(t for t in stored if t.startswith("1. Declare"))
+    assert kept.count("\n") == 9
+    assert "\n\n" in kept
+    assert "- 3a." in kept
+
+
+async def test_the_same_text_in_the_string_form_fragments(graph, importer):
+    """Pinned to show what the list form is FOR. This is not a bug in the
+    string form -- it is what indentation-as-structure necessarily does."""
+    result = await importer.import_page(
+        graph.page["uuid"], f"- Resolution Sequence\n  {EIGHT_STEPS}")
+
+    # The `- 3a.` line became its own block, so the sequence is split.
+    assert result.blocks > 1
+
+
+async def test_depth_is_explicit_in_the_list_form(graph, importer):
+    await importer.import_page(graph.page["uuid"], [
+        "Parent",
+        {"text": "Child", "depth": 1},
+        {"text": "Grandchild", "depth": 2},
+        {"text": "Second parent", "depth": 0},
+    ])
+
+    roots = graph.children(graph.page["id"])
+    assert {b["title"] for b in roots} == {"Parent", "Second parent"}
+    parent = next(b for b in roots if b["title"] == "Parent")
+    child = graph.children(parent["id"])[0]
+    assert child["title"] == "Child"
+    assert graph.children(child["id"])[0]["title"] == "Grandchild"
+
+
+async def test_a_skipped_depth_is_an_error_not_a_warning(graph, importer):
+    """The line format flattens a ragged indent and warns, because whitespace
+    can be accidentally ragged. An explicit integer cannot, so a gap here is a
+    mistake and is refused."""
+    with pytest.raises(ValueError, match="skips a level"):
+        await importer.import_page(graph.page["uuid"], [
+            "Parent", {"text": "Too deep", "depth": 2}])
+
+
+async def test_references_are_escaped_in_the_list_form_too(graph, importer):
+    """Logseq parses content on write whatever route it arrived by, so the
+    escaping is not a property of the string parser."""
+    result = await importer.import_page(
+        graph.page["uuid"], ["see [[Dawnspire]] and #mist"])
+
+    assert result.escaped_links == ("Dawnspire",)
+    assert result.escaped_tags == ("mist",)
+    stored = graph.children(graph.page["id"])[0]["title"]
+    assert "{{link:Dawnspire}}" in stored
+    assert "[[Dawnspire]]" not in stored
+
+
+async def test_a_code_block_survives_the_list_form(graph, importer):
+    fenced = "```python\ndef f():\n    return 1\n```"
+
+    await importer.import_page(graph.page["uuid"], [fenced])
+
+    assert graph.children(graph.page["id"])[0]["title"] == fenced
+
+
+async def test_an_empty_element_is_refused(graph, importer):
+    with pytest.raises(ValueError, match="empty"):
+        await importer.import_page(graph.page["uuid"], ["Real", "   "])
+
+
+async def test_a_malformed_element_is_refused(graph, importer):
+    with pytest.raises(ValueError, match="must be a string or an"):
+        await importer.import_page(graph.page["uuid"], ["Real", 42])
+
+
+async def test_an_empty_list_is_refused(graph, importer):
+    with pytest.raises(ValueError, match="non-empty"):
+        await importer.import_page(graph.page["uuid"], [])
+
+
+async def test_a_dry_run_works_on_the_list_form(graph):
+    client = FakeClient(graph)
+    verified = VerifiedImport(client)  # type: ignore[arg-type]
+
+    result = await verified.import_page(
+        graph.page["uuid"],
+        ["Parent", {"text": "Child", "depth": 1}],
+        dry_run=True)
+
+    assert result.verified is False
+    assert result.blocks == 2
+    assert not any(m == "logseq.DB.insertBatchBlock"
+                   for m, _ in client.calls)
+
+
+def test_the_list_form_does_not_parse_page_properties():
+    """There is no "before the first bullet" region, so `key:: value` is just
+    block content. Silently treating it as a property would be worse."""
+    parsed = parse_blocks(["alias:: City/Dawnspire"])
+
+    assert parsed.page_properties == {}
+    assert parsed.blocks[0].content == "alias:: City/Dawnspire"
+
+
+async def test_the_string_form_still_works(graph, importer):
+    """The existing format is unchanged -- adding a second one must not
+    migrate anybody."""
+    result = await importer.import_page(
+        graph.page["uuid"], "- Parent\n  - Child\n")
+
+    assert result.verified is True
+    assert result.blocks == 2
 
 
 # ------------------------------------------------------------------ repair

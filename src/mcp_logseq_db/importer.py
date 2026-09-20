@@ -34,6 +34,7 @@ from .content import VerifiedContent
 from .markdown import (
     ParsedBlock,
     find_placeholders,
+    parse_blocks,
     parse_markdown,
     restore_reference,
 )
@@ -76,7 +77,7 @@ class VerifiedImport(VerifiedWriteHelpers):
     async def import_page(
         self,
         target: str,
-        markdown: str,
+        markdown: str | list[Any],
         *,
         replace: bool = False,
         dry_run: bool = False,
@@ -87,8 +88,25 @@ class VerifiedImport(VerifiedWriteHelpers):
         `target` is either a page UUID (write into that page) or a title
         (create it). References are escaped rather than written live -- see
         the module docstring.
+
+        TWO INPUT FORMATS, chosen by type rather than by a flag, because the
+        shape of the argument already says which one it is:
+
+          - a STRING is Logseq markdown: `- ` starts a block, indentation
+            gives depth, a bulletless line continues the block above.
+          - a LIST is one block per element, with depth stated explicitly.
+            Text is used verbatim, so a block may contain newlines, blank
+            lines, leading whitespace, a markdown table or a fenced code
+            block -- none of which the line format can express, since a line
+            beginning with `- ` inside a multi-line block would become a
+            child of it.
+
+        The list form exists for real manuscript content. It is the difference
+        between importing an eight-step sequence as one block and having to
+        fall back to `createBlock` part-way through an import.
         """
-        parsed = parse_markdown(markdown)
+        parsed = (parse_blocks(markdown) if isinstance(markdown, list)
+                  else parse_markdown(markdown))
 
         if dry_run:
             return ImportResult(

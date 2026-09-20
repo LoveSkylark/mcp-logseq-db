@@ -219,11 +219,11 @@ def create_server(
     @server.tool(name="importPage", structured_output=True)
     async def import_page(
         target: str,
-        markdown: str,
+        markdown: str | list[Any],
         replace: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Build a whole page from Logseq markdown in one call. target is either a page UUID (write into it) or a title (create it). Indentation gives structure and every block line must start with '- '. Markdown headings convert to native Logseq headings automatically. [[links]] and #tags are ESCAPED to {{link:X}} and {{tag:X}} rather than written live, because Logseq mints a page or tag for any reference it parses — run repairLinks afterwards to convert them once their targets exist. Existing content is appended to unless replace=true, which clears the page first and destroys its block UUIDs."""
+        """Build a whole page in one call. target is either a page UUID (write into it) or a title (create it). markdown takes either of two forms. As a STRING it is Logseq markdown: indentation gives structure, every block line must start with '- ', and a line without a bullet continues the block above it. As a LIST it is one block per element with depth stated explicitly -- either a plain string (depth 0) or {"text": "...", "depth": 1} -- and the text is used VERBATIM, which is the only way to import a block that contains newlines, blank lines, leading whitespace, a markdown table or a fenced code block. Use the list form for real manuscript content: in the string form a line beginning with '- ' inside a multi-line block becomes a child of it. Depth is required rather than inferred there, because indentation stops telling structure from content once values span lines. Markdown headings convert to native Logseq headings in both forms. [[links]] and #tags are ESCAPED to {{link:X}} and {{tag:X}} rather than written live, because Logseq mints a page or tag for any reference it parses -- run repairLinks afterwards to convert them once their targets exist. Existing content is appended to unless replace=true, which clears the page first and destroys its block UUIDs. Page properties are only parsed in the string form."""
         return (await importer().import_page(
             target, markdown, replace=replace, dry_run=dry_run)).to_dict()
 
@@ -678,8 +678,10 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         ),
         "clear_page": "Pass an exact page UUID, not a block UUID.",
         "import_page": (
-            "Pass a page UUID or a page title, then the markdown. Every block "
-            "line must begin with '- '; indentation alone creates nothing."
+            "Pass a page UUID or a page title, then the content. As a string, "
+            "every block line must begin with '- ' and indentation alone "
+            "creates nothing. As a list, one element per block with explicit "
+            "depth -- use that form for blocks containing newlines."
         ),
         "repair_links": (
             "Omit page_uuid to scan the whole graph. Unresolvable names are "
