@@ -256,7 +256,7 @@ def create_server(
 
     @server.tool(name="getBlockUUID", structured_output=True)
     async def get_block_uuid(page_uuid: str) -> list[dict[str, Any]]:
-        """List every block on a page, at any depth, ordered by position. Returns a list, not a single UUID."""
+        """List every block on a page, at any depth, sorted by :block/order across ALL depths -- which is not document order: a nested child can be returned before its own parent. Use getBlockTree when structure or reading order matters. Returns a list, not a single UUID."""
         return await content().get_block_uuid(page_uuid)
 
     @server.tool(name="getBlock", structured_output=True)

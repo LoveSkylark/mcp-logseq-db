@@ -1556,11 +1556,16 @@ class VerifiedContent(VerifiedWriteHelpers):
         and neither is visible in a block or reference count: an empty page
         that is a working alias looks exactly like a dead stub.
 
-        BOTH ATTRIBUTES are queried. DB graphs carry the built-in as
-        `:logseq.property/alias`; `:block/alias` is the older form, and a
-        guard written against only one of them silently never fires -- which
-        is the worst possible outcome for a guard whose whole job is to stop a
-        deletion. An or-join costs nothing here and removes the guess.
+        BOTH ATTRIBUTES are queried, and which one is live is NOT settled.
+        Observed 2026-09-20 on 2.0.1-alpha+nightly.20260826: `:block/alias`
+        held every relation in the graph and `:logseq.property/alias` had
+        zero holders -- the opposite of what this docstring asserted for a
+        year. Neither form is safe to assume, and a guard written against
+        only one of them silently never fires, which is the worst possible
+        outcome for a guard whose whole job is to stop a deletion. The
+        or-join costs nothing and is the only reason the guard fired at all
+        on that build. DO NOT narrow it to whichever attribute today's graph
+        happens to use.
 
         Note that `alias` is a built-in property, outside the plugin sandbox
         this server can write. So an alias relation destroyed by a delete
@@ -2245,6 +2250,14 @@ class VerifiedContent(VerifiedWriteHelpers):
             "[?child :block/parent ?parent]]"
         )
         children = await self._query_list(query, "Child lookup")
+        # Fractional-index keys are designed for lexicographic comparison, so
+        # sorting them as strings is correct for ordinary siblings. Two edges
+        # are not: a child with no :block/order sorts under "" and one with an
+        # explicit null under "None", which lands after digits. Since
+        # `last-child` is verified by asking whether this list's final element
+        # is the moved block, an order-less sibling can produce a spurious
+        # verified:false -- or mask a real one. Read :block/order directly when
+        # a position matters rather than trusting this ordering.
         children.sort(key=lambda c: str(c.get("order", "")))
         return children
 

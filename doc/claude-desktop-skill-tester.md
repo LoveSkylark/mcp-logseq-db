@@ -38,10 +38,21 @@ the second question.
 8. Destructive steps require explicit confirmation: `deleteTag`,
    `deleteProperty`, `deletePage`, `clearPage`, and `removeBlock` on anything
    with children.
-9. Use `pageStats` for triage rather than `getPage` or `findOrphans`. Its
+9. Use `pageStats` for triage rather than `inspectPage` or `findOrphans`. Its
    response is a fixed size; theirs scale with page content, and a container
-   page can exhaust the context in one call.
-10. Tear down fixtures at the end of the run.
+   page can exhaust the context in one call. Across MANY pages, use
+   `listPages(with_counts=true)` or `listJournals(with_counts=true)` instead
+   of a `pageStats` per page — four queries either way.
+10. **Pass `verbose: false` on any write whose payload you do not need.** The
+    default is `true` for compatibility, and the envelope carries the target
+    entity twice. Keep `verbose: true` on `clearPage`, `removeBlock`,
+    `deletePage` and `updateBlock`, where the payload is the only record of
+    what was destroyed or of what Logseq did to what you sent. Record which
+    mode each test used — shaping must not change `verified`.
+11. **Before recycling anything, check `is_alias_of` and `aliases` in
+    `pageStats`.** An alias relation appears in no count, and it is the one
+    relation these tools cannot rebuild.
+12. Tear down fixtures at the end of the run.
 
 ### Standard verification query
 
@@ -81,14 +92,20 @@ or the build changed underneath it.
 |---|---|---|
 | T-001 | `createBlock` on a page | Succeeds. Block creation now routes through `insertBlock`, not `upsertNodes` — the latter wrote its single `page-id` into both `:block/parent` and `:block/page`. |
 | T-002 | `createBlock` with a **block** parent | `:block/parent` is the block, `:block/page` is the **page**. These are separate facts and the old route conflated them. |
-| T-003 | `getPage` with `detail=properties` | Returns rows. Previously 500'd: `(pull ?value ...)` received scalars such as `:block/order` strings. |
-| T-004 | `getPage` with `detail=all` | Returns; recovers with T-003. |
+| T-003 | `inspectPage` with `detail=properties` | Returns rows. Previously 500'd: `(pull ?value ...)` received scalars such as `:block/order` strings. |
+| T-004 | `inspectPage` with `detail=all` | Returns; recovers with T-003. |
 | T-005 | `getPageUUID` with the lowercase form of a mixed-case title | Resolves via the normalized name fallback. |
 | T-006 | `getPageUUID` for a title also used by a tag | Resolves to the page. Tags carry `:block/name` too; the Page-class filter separates them. |
 | T-007 | `getBlockUUID` on a page with nested blocks | Every block at any depth, and none duplicated. Reads walk `:block/parent`, and the raw `_parent` key is stripped once the tree is built. |
 | T-008 | `findOrphans` on a page containing a **nested page** | `orphans: []`, `nested_pages` populated, diagnostic says "No damage". A nested page is a page boundary — flagging its blocks invites repair of correct structure. |
 | T-009 | `deleteProperty` on a property with a `checkbox` or `datetime` value | Succeeds. The usage query pulled the value, which 500'd on inline literals and left such properties undeletable. |
 | T-010 | `clearPage` on a page holding property values | Content blocks gone, property-value blocks preserved and counted in the diagnostic. |
+| T-011 | `capabilities` tool list | Includes `getBlockTree`, `isTitleAvailable` and `retitleOverDuplicate`. `getBlockTree` was missing from the route map entirely, so it never appeared. |
+| T-012 | `capabilities` constraints for `inspectPage` | Present. They were keyed under the old name `getPage` and so were never surfaced. |
+| T-013 | Any property tool with an ident containing a space or a quote | Rejected at the boundary. An ident reaches Datascript query TEXT, which an attribute position cannot parameterise, so the shape is checked rather than escaped. |
+| T-014 | `listOrphanProperties` | Returns. Built-ins with no namespace are skipped rather than interpolated into a query. |
+| T-015 | `moveBlock` with `placement=last-child` | Available and appends — see the Moving section. |
+| T-016 | Any write with `verbose: false` | `verified` is identical to the same write with `verbose: true`; only the payload differs. Shaping must never change the verdict. |
 
 ---
 
@@ -100,15 +117,68 @@ or the build changed underneath it.
 | T-102 | `createPage` with an existing title | Rejected **before** writing, not duplicated |
 | T-103 | `renamePage` | Title changes, **UUID stable**, `:block/name` updated, still a page |
 | T-104 | `renamePage` onto an existing title | Rejected |
-| T-105 | `deletePage` with no inbound refs | Recycled: `:logseq.property/deleted-at` set, UUID and tags retained |
+| T-105 | `deletePage` with no inbound refs and no alias relation | Recycled: `:logseq.property/deleted-at` set, UUID and tags retained |
 | T-106 | `deletePage` **with** inbound refs, no acknowledgement | Refused, referring entities listed |
 | T-107 | Same with `acknowledge_reference_rewrite: true` | Proceeds; **confirm the inbound refs still point at it** |
 | T-108 | `listPages` after T-105 | Recycled page absent |
 | T-109 | `listRecycled` after T-105 | Recycled page present |
 | T-110 | `clearPage` on a page with nested blocks | All content blocks gone; page, tags and property values intact |
-| T-111 | `getPage` at each `detail` value | `page`, `blocks`, `tags`, `properties`, `declared`, `all` each return their own shape |
+| T-111 | `inspectPage` at each `detail` value | `page`, `blocks`, `tags`, `properties`, `declared`, `all` each return their own shape |
 | T-112 | `pageStats` on a leaf page | Counts only, no block payload. Compare `own_blocks` against `getBlockUUID` length. |
 | T-113 | `pageStats` on a container page with sub-pages | `nested_pages > 0`, `true_orphans: 0`, `own_blocks` counts only the container's own. Response stays small. |
+
+### Titles, availability and the recycle asymmetry
+
+`getPageUUID` is recycle-BLIND and the write path is recycle-AWARE, both
+deliberately. This is the sequence that cost a repair: a page recycled on the
+belief its title would be released, found mid-repair to be still holding it.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-114 | `isTitleAvailable` on an unused title | `available: true`, `held_by: []` |
+| T-115 | `isTitleAvailable` on a live page's title | `available: false`; one holder, `kind: page`, `recycled: false` |
+| T-116 | Recycle a fixture page, then `isTitleAvailable` on its title | `available: false`, `recycled: true`. **Then `getPageUUID` on the same title: `found: false`.** Both are correct. Record both in the log — this pair is the whole point of the tool. |
+| T-117 | `createPage` with that recycled title | Refused, agreeing with T-116 rather than with `getPageUUID` |
+| T-118 | `isTitleAvailable` on a title held by a plain BLOCK | `available: false`, `kind: block`. Surprising and correct: `createPage` refuses it. |
+| T-119 | `isTitleAvailable` on a title held by a tag | `kind: tag` |
+
+### Taking a title back
+
+| ID | Test | Expected |
+|---|---|---|
+| T-120 | `retitleOverDuplicate` onto a title held by an EMPTY page | Two renames, `verified: true`, `parked` names the holder's new title. **Confirm with an independent read that no block was edited and that inbound refs on both pages are unchanged.** |
+| T-121 | Same, where the holder is RECYCLED | Succeeds. Renaming a recycled page is what releases its title — the fact the whole tool rests on. Record it explicitly. |
+| T-122 | `retitleOverDuplicate` onto a title held by a page WITH content | Refused, both reference counts reported, nothing renamed |
+| T-123 | `retitleOverDuplicate` onto a title held by an ALIAS page | Refused with the alias diagnostic. Construct this deliberately: it is the near-miss that nearly recycled a working alias. |
+| T-124 | `retitleOverDuplicate` onto a free title | Plain rename, `parked: null` |
+| T-125 | `retitleOverDuplicate` where the parking title is itself taken | Refused **before** any write; confirm the holder still has its original title |
+
+### Alias visibility
+
+An alias relation shows up in no count. `alias` is a built-in property outside
+the writable namespace, so anything broken here cannot be repaired with these
+tools — which makes this the most consequential suite in the spec.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-126 | `pageStats` on a page that is an alias of another | `is_alias_of` carries the owner's UUID; diagnostic says "NOT a dead stub" |
+| T-127 | `pageStats` on the page that declares it | `aliases` lists the alias page's UUID |
+| T-128 | Record which attribute this graph uses | Dump every attribute of the declaring page and note whether the alias is under `:logseq.property/alias` or `:block/alias`. Both are queried through an or-join. **Record which one holds data — it has differed between builds, and the or-join is what makes the guard version-independent.** Finding either form does NOT mean narrowing the query to it: a single-attribute guard silently never fires on a graph using the other. `getProperyUsers` answers this in two calls, one per ident, without touching a page. |
+| T-129 | `deletePage` on an alias page, no acknowledgement | Refused, alias-related entities listed |
+| T-130 | `deletePage` on the page that DECLARES aliases, no acknowledgement | Also refused — the guard runs in both directions |
+| T-131 | Same with `acknowledge_alias_loss: true` | Proceeds; diagnostic states how many relations were broken. **Then check in the Logseq UI whether the alias still resolves.** Needs a human. |
+| T-132 | `deletePage` on a page with no alias relation | Proceeds without the flag — the guard must not tax every delete |
+
+### Counted listings
+
+| ID | Test | Expected |
+|---|---|---|
+| T-133 | `listJournals` with no arguments | A bare list, unchanged shape, no counts |
+| T-134 | `listJournals(with_counts=true)` | Envelope with `total`, `counted`, `truncated`; each entry carries `own_blocks`, `content_blocks`, `refs`. Newest first. |
+| T-135 | Compare T-134 against `pageStats` on three of those journals | The counts agree exactly. They query the same attributes; a disagreement means one of them is wrong. |
+| T-136 | A journal with NO blocks in T-134 | `own_blocks: 0` rather than a missing key. A page absent from the join must read as zero. |
+| T-137 | `listPages(with_counts=true)` on a graph over 500 pages | `truncated: true`, `counted: 500`, diagnostic names the way to get the rest |
+| T-138 | `listPages(with_counts=true, limit=10)` | Ten rows, `truncated: true`, `total` is the real total |
 
 ---
 
@@ -134,18 +204,43 @@ or the build changed underneath it.
 
 ### Moving
 
-`moveBlock`'s underlying route has never been observed changing anything. The
-tool verifies by reading back, so a no-op returns `verified: false` with a
-diagnostic saying so. **Treat that as the tool working correctly.**
+`moveBlock` is **confirmed working on every placement**, including across
+pages. An earlier version of this spec said its route had never been observed
+changing anything; that is no longer true, and a `verified: false` here is now
+a finding rather than the expected result.
+
+It still returns null whether it moved the block or did nothing, so the tool
+establishes the outcome by reading back. A genuine no-op — moving a block to
+the position it already occupies — comes back `verified: false` with a
+silent-no-op diagnostic. **That is the tool working correctly**; record it as
+CAUGHT, not FAIL.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-216 | `moveBlock` to another block on the same page, `placement=child` | Parent changes, page unchanged. Or `verified: false` with "silent no-op". |
+| T-216 | `moveBlock` to another block on the same page, `placement=child` | Parent changes, page unchanged |
 | T-217 | `moveBlock` to a block on a **different page** | Parent changes **and** `:block/page` follows. A page that does not follow leaves an invisible child. |
 | T-218 | `moveBlock` on a block with descendants | Descendants' `:block/page` follows too |
 | T-219 | `moveBlock` with a page target, `placement=child` | Moves to the page's top level |
 | T-220 | `moveBlock` with a page target, `placement=after` | Refused — a page has no siblings |
 | T-221 | `moveBlock` into the block's own subtree | Refused before the call |
+| T-222 | `moveBlock` to the parent it already has | `verified: false`, silent-no-op diagnostic. CAUGHT. |
+
+#### Append vs prepend
+
+`placement=child` PREPENDS. That is Logseq's own behaviour and is left alone,
+which means moving a sequence with it reverses the sequence — silently, and
+only visible by reading the destination back. Three pages of content were
+reversed this way before anyone looked.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-223 | Two blocks under a parent, move a third with `placement=child` | The arrival is FIRST. Confirm `child` still prepends: if it ever starts appending, `last-child` is redundant and the docs are wrong. |
+| T-224 | Same with `placement=last-child` | The arrival is LAST |
+| T-225 | **Acceptance.** Move three blocks in source order to an empty page with `last-child` | They arrive in source order. Verify by reading `:block/order` on all three, not by trusting the envelopes. |
+| T-226 | The same three with `placement=child` | They arrive REVERSED. Record it — this is the footgun the placement exists to remove, and it should still be reproducible. |
+| T-227 | `last-child` into a parent with no children | Succeeds; falls through to a plain child call, where prepend and append coincide |
+| T-228 | `last-child` on a block that is already the last child | `verified: true` with "no move was needed", and **no `moveBlock` call is issued** — the state was read, not written. Distinguish this from T-222. |
+| T-229 | `last-child` where the block lands under the right parent but not last | `verified: false`, diagnostic gives its position. Hard to provoke deliberately; if it happens, it is a real finding about the route. |
 
 ---
 
@@ -153,7 +248,7 @@ diagnostic saying so. **Treat that as the tool working correctly.**
 
 | ID | Test | Expected |
 |---|---|---|
-| T-301 | `creatTag` | Created. The ident is **deterministic**: `:plugin.class.<caller>/<Title>`, spaces stripped. Record it and confirm no random suffix. |
+| T-301 | `creatTag` | Created. **Record the assigned ident verbatim.** It comes from Logseq rather than being derived from the title, so it is read back rather than constructed — note whether it carries a random suffix and under which namespace it landed. Two documents used to guess differently. |
 | T-302 | `creatTag` with a title an existing page holds | Refused — tags and pages share one title space |
 | T-303 | `addTag` to a block | `:block/tags` updated |
 | T-304 | `addTag` to a page | Same tool, same result — the target is uniform |
@@ -161,7 +256,7 @@ diagnostic saying so. **Treat that as the tool working correctly.**
 | T-306 | `removeTag` with two tags present | Only the named relation removed; the other survives |
 | T-307 | `removeTag` from a page | Page keeps `:logseq.class/Page` and is still a page |
 | T-308 | `getTagUsers` on a tag applied to a page and a block | Both returned; pages distinguishable by `:block/name` |
-| T-309 | `deleteTag` on an unused tag | Succeeds. Record which identifier the route accepted. |
+| T-309 | `deleteTag` on an unused tag | **Unverified route** — it goes through `deletePage`, never confirmed against a tag. Record which identifier the route accepted, or that it silently did nothing. A `verified: false` here is the expected outcome until proven otherwise. |
 | T-310 | `deleteTag` on a tag in use, no acknowledgement | Refused, holders listed |
 | T-311 | Same with `acknowledge_detach: true` | Proceeds; every `:block/tags` and `:block/refs` entry cleared |
 | T-312 | `listOrphanTags` after T-306 | The now-unused tag appears |
@@ -198,10 +293,10 @@ refusal are testing the guard, not looking for a workaround.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-501 | `getPage detail=declared` on a page tagged `Task` | Status, Priority, Deadline, Scheduled listed as declared |
+| T-501 | `inspectPage detail=declared` on a page tagged `Task` | Status, Priority, Deadline, Scheduled listed as declared |
 | T-502 | Same page, `detail=properties` | Only properties **with values**; declared-but-unset ones absent |
-| T-503 | A page's own tags vs its blocks' tags | `getPage detail=tags` covers both; confirm each holder is identified |
-| T-504 | `listClosedValues` | **Expected empty on current builds.** No closed-value relationship exists: `Status` reports type `default` with a `:logseq.property/default-value` and no permitted set. Record if that changes. |
+| T-503 | A page's own tags vs its blocks' tags | `inspectPage detail=tags` covers both; confirm each holder is identified |
+| T-504 | `listClosedValues` | **Expected empty on current builds.** The permitted set is reported by `getAllProperties` as `:property/closed-values`, but no such datom exists — the tool queries the real attribute, `:block/closed-value-property`, which lives on each VALUE pointing back at its property. `Status` reports type `default` with a `:logseq.property/default-value` and no permitted set. Record if that changes. |
 
 ---
 
@@ -209,12 +304,13 @@ refusal are testing the guard, not looking for a workaround.
 
 | ID | Test | Expected |
 |---|---|---|
-| T-601 | Write `[[Target]]` into a block title via `createBlock` | **No `:block/refs` entry.** Links written through the API stay inert text. |
-| T-602 | Edit that block in the Logseq UI | Record whether a user edit materializes the ref. Needs a human. |
-| T-603 | Point a `node` property at a page, then `findBacklinks` on the page | Appears under `property_values`, **not** under `refs` |
-| T-604 | `findBacklinks` on a page with refs, tag holders and property values | All three reported separately. The total exceeds Logseq's backlink panel, which counts only `refs`. |
-| T-605 | `deletePage` on a referenced page, then `findBacklinks` | **References are not rewritten** — they still point at the recycled page |
-| T-606 | `pageStats` reference counts vs `findBacklinks` lengths | The integers agree with the lists |
+| T-601 | Write `[[Target]]` into a block title via `createBlock`, where `Target` EXISTS | **This spec and the code disagree, and the answer matters.** This table has said links written through the API stay inert text with no `:block/refs` entry. `importPage` escapes every reference on the opposite premise — that Logseq mints a page or tag for anything it parses — and `updateBlock` verifies the title CHANGED rather than matching, because `[[X]]` is expected to come back as `[[uuid]]`. Record exactly what happens: whether `:block/refs` gained the target, and whether the stored title still reads `[[Target]]`. |
+| T-602 | Same with a target that does NOT exist | Record whether a stub page is minted. If it is, the escaping in `importPage` is load-bearing and T-601's old expectation was wrong. If nothing is created and no ref appears, the escaping is unnecessary and `repairLinks` exists for nothing — either finding is worth the run. |
+| T-603 | Edit a block containing `[[Target]]` in the Logseq UI | Record whether a user edit materializes the ref where an API write did not. Needs a human. |
+| T-604 | Point a `node` property at a page, then `findBacklinks` on the page | Appears under `property_values`, **not** under `refs` |
+| T-605 | `findBacklinks` on a page with refs, tag holders and property values | All three reported separately. The total exceeds Logseq's backlink panel, which counts only `refs`. |
+| T-606 | `deletePage` on a referenced page, then `findBacklinks` | **References are not rewritten** — they still point at the recycled page |
+| T-607 | `pageStats` reference counts vs `findBacklinks` lengths | The integers agree with the lists |
 
 ---
 
@@ -249,6 +345,27 @@ Fill in from envelopes captured during earlier suites.
 | T-807 | Any `verified: false` result | `previous_state` and `observed_state` both present, and distinguishable |
 | T-808 | Any `dry_run: true` call | `verified: false`, empty `verified_entities`. A dry run is not a write. |
 | T-809 | A partial batch failure (T-214) | The committed blocks appear in `verified_entities` and the diagnostic says batches are not atomic |
+| T-810 | `deletePage` refused for an alias relation | `observed_entities` carries the alias-related pages, so the refusal is actionable without a second read |
+| T-811 | `retitleOverDuplicate` after a second-rename failure | `PARTIALLY APPLIED`, the parked UUID, its original title, and an undo instruction. Rare; if it happens, capture the whole envelope. |
+
+---
+
+## Suite 9 — Response shaping and cost
+
+The point of this suite is that `verbose` changes the PAYLOAD and nothing
+else. If a verdict ever differs between the two modes, that is a serious
+finding — shaping would be altering behaviour.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-901 | `moveBlock` on a block holding ~400 words, `verbose: true` | The block's text appears **twice** — once in `previous_entities`, once in `verified_entities`. Record the response size. |
+| T-902 | The same move back, `verbose: false` | `verified`, `uuid`, `parent`, `page`, `order`, `diagnostic` and nothing proportional to content. Compare sizes with T-901. |
+| T-903 | A failing write with `verbose: false` | Still `verified: false`, still the same diagnostic, and `observed` carries entity DIGESTS — a failure must stay actionable, since a write cannot safely be re-run to get detail. |
+| T-904 | `creatTag` and `createProperty` with `verbose: false` | The assigned `ident` is still present. It is the only way to address the entity afterwards, so terse keeps it. |
+| T-905 | `clearPage` with `verbose: true` on a page of real prose | `previous_entities` carries the full text. **This is the only surviving record of what was destroyed** — confirm it is complete enough to diff an import against. |
+| T-906 | `clearPage` with `verbose: false` | Reduced to `previous_count`. Verify the count matches T-905's list length. |
+| T-907 | `createPageofBlocks` with `verbose: false` | `created_count` plus one digest per block; the titles you sent are not echoed back |
+| T-908 | `importPage` | No `verbose` flag, and none needed — its result is already counts and names. Confirm nothing proportional to the page appears. |
 
 ---
 
@@ -262,6 +379,10 @@ created through the tools. `getPageUUID`, `getTagUUID` and `getPropertyIndent`
 all have ambiguity guards that can only be exercised against pre-existing
 damage.
 
+The **recycled-title** case is the exception and IS constructable — see T-116.
+Recycle a fixture page and the title is held by an entity that `getPageUUID`
+will not resolve, which is exactly the state that misled a repair. Run it.
+
 **Setting a declared built-in.** Every `Task`-declared property is a
 `:logseq.property/*` built-in, outside the sandbox. There is no way to set one
 and watch it move from `declared` to `properties`.
@@ -274,13 +395,22 @@ enforce against.
 
 ## No tool exists
 
-Tag inheritance (`extends`), tag-level property declaration, block icons, and
-page aliases. All have working API methods and no tool. If any becomes one,
-this spec needs a suite.
+Tag inheritance (`extends`), tag-level property declaration, and block icons.
+All have working API methods and no tool. If any becomes one, this spec needs
+a suite.
+
+**Page aliases are readable but not writable.** `pageStats` reports
+`is_alias_of` and `aliases`, and `deletePage` and `retitleOverDuplicate` both
+refuse on an alias relation — but nothing here can create, move or restore
+one, because `alias` is a built-in property outside the writable namespace.
+That asymmetry is why the guards exist: breaking a relation is possible and
+repairing it is not.
 
 Assigning or freeing a UUID. `:block/uuid` cannot be written, and recycling
 does not release an identity. This is what makes split-identity damage
-unrepairable by reassignment.
+unrepairable by reassignment — though a TITLE can now be taken back from an
+empty duplicate without touching a UUID, which is what
+`retitleOverDuplicate` does.
 
 ---
 
@@ -288,10 +418,17 @@ unrepairable by reassignment.
 
 Suite 0 first — a regression there makes everything after it uninterpretable.
 Then Suite 1, since fixtures depend on page creation, and Suite 2, since most
-later suites need blocks to target. Then 3, 4, 5, 6. Suite 8 is assembled from
-envelopes already captured. Suite 7 last, and T-706 last of all.
+later suites need blocks to target. Then 3, 4, 5, 6. Suites 8 and 9 are
+assembled from envelopes already captured. Suite 7 last, and T-706 last of
+all.
+
+Within Suite 1, run the alias tests (T-126 to T-132) before anything that
+deletes a page, and construct the alias fixture by hand in the Logseq UI —
+there is no tool that can create one.
 
 After the run, update `scripts/live_reliability.py` with any assumption that
-turned out to be wrong. A finding recorded only in a run log gets rediscovered
-the expensive way — several in this spec were rediscovered twice before being
-written down.
+turned out to be wrong. It now checks the ones these tools depend on,
+including that `children: true` still prepends; if T-223 contradicts it, the
+script is the thing to fix first. A finding recorded only in a run log gets
+rediscovered the expensive way — several in this spec were rediscovered twice
+before being written down.
