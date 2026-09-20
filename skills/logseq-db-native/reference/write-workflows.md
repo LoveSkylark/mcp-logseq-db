@@ -253,11 +253,15 @@ importPage(target, markdown, replace=false, dry_run=false)
 
 **A string** is Logseq markdown: every block line starts with `- `,
 indentation gives depth, and a line WITHOUT a bullet continues the block above
-it. Page properties are read from the region before the first bullet.
+it. Page properties are read from the region before the first bullet — any
+other text there is REFUSED rather than dropped, because content the parser
+cannot place is an error, not a warning.
 
 **A list** is one block per element with depth stated explicitly — either a
 plain string (depth 0) or `{"text": "...", "depth": 1}`. The text is used
-verbatim.
+verbatim. A JSON-encoded array is accepted too, since some clients cannot
+send a real one — and getting that wrong once cost six of eight lines,
+because the string arrived at the markdown parser instead.
 
 **Use the list form for any block containing newlines.** The string form
 cannot express them. A blank line inside a block is dropped, leading
@@ -277,8 +281,17 @@ and markdown headings convert to native Logseq headings. Different: page
 properties are only parsed from a string, so `key:: value` as a list element
 is simply block content.
 
-Existing content is appended to. `replace=true` clears the page first, which
-destroys its block UUIDs and every reference to them.
+Existing content is NOT appended to — `insertBatchBlock` **prepends**,
+confirmed 2026-09-20. New blocks land ABOVE what the page already held, and a
+second import lands above the first, so importing a document chapter by
+chapter into one page yields the chapters in reverse order, silently, with
+`blocks` counting correctly every time. Order within a single call is correct.
+Import a page in one call where you can; if you must build it up, read
+`:block/order` afterwards rather than assuming, or relocate with `moveBlocks`
+and `last-child`.
+
+`replace=true` clears the page first, which destroys its block UUIDs and
+every reference to them.
 
 ### Editing and deleting
 

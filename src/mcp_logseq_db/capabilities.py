@@ -275,7 +275,11 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "Page properties (key:: value) are parsed and reported but NOT "
         "applied — they are outside the writable namespace. The list form has "
         "no region for them, so it does not parse them at all.",
-        "Appends by default. replace=true clears the page first, which "
+        "New content lands ABOVE existing content: insertBatchBlock "
+        "PREPENDS, confirmed 2026-09-20 on 2.0.1-alpha+nightly.20260826. "
+        "Order within one call is correct, but importing a document chapter "
+        "by chapter into one page yields the chapters in reverse. replace="
+        "true clears the page first, which "
         "destroys block UUIDs and any references to them.",
     ),
     "repairLinks": (

@@ -22,6 +22,7 @@ The internal call count (34 for that page) is a smaller consideration.
 
 from __future__ import annotations
 
+import json
 from dataclasses import asdict, dataclass, field
 from difflib import get_close_matches
 from typing import Any
@@ -105,8 +106,7 @@ class VerifiedImport(VerifiedWriteHelpers):
         between importing an eight-step sequence as one block and having to
         fall back to `createBlock` part-way through an import.
         """
-        parsed = (parse_blocks(markdown) if isinstance(markdown, list)
-                  else parse_markdown(markdown))
+        parsed = self._parse_input(markdown)
 
         if dry_run:
             return ImportResult(
@@ -177,6 +177,45 @@ class VerifiedImport(VerifiedWriteHelpers):
                 "The import is partial; batches are not atomic, so earlier "
                 "levels are committed. Audit with findOrphans and pageStats "
                 "rather than retrying, which would duplicate what landed."))
+
+    @staticmethod
+    def _parse_input(markdown: str | list[Any]) -> Any:
+        """
+        Choose the parser, tolerating a list that arrived as a JSON STRING.
+
+        Dispatching on type alone was not enough in practice. A client asked
+        for the list form and the argument arrived as a JSON-encoded string,
+        so it went to `parse_markdown`, which read the JSON text as markdown
+        and dropped everything before the first `- ` as pre-block text. Six of
+        eight lines were discarded and the result still reported
+        `verified: true` -- exactly the silent content loss this server exists
+        to prevent, caused by the one branch that decides which contract
+        applies.
+
+        So a string that parses as a JSON array of blocks is treated as the
+        list it was meant to be. A real markdown page cannot be mistaken for
+        one: it would have to be valid JSON *and* an array, and `[[Link]] is a
+        page` is neither.
+        """
+        if isinstance(markdown, str):
+            stripped = markdown.strip()
+            if stripped.startswith("["):
+                try:
+                    decoded = json.loads(stripped)
+                except ValueError:
+                    decoded = None
+                if isinstance(decoded, list):
+                    parsed = parse_blocks(decoded)
+                    parsed.warnings.append(
+                        "markdown arrived as a JSON string and was read as a "
+                        "block list. Pass a real array where the client "
+                        "allows it; this coercion exists because the string "
+                        "form would otherwise have parsed the JSON as "
+                        "markdown and discarded most of it.")
+                    return parsed
+        if isinstance(markdown, list):
+            return parse_blocks(markdown)
+        return parse_markdown(markdown)
 
     async def _resolve_target(self, target: str) -> tuple[dict[str, Any], bool]:
         """

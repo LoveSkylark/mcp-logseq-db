@@ -251,6 +251,7 @@ def parse_markdown(text: str, *, escape: bool = True) -> ParsedPage:
     all_tags: list[str] = []
 
     start = len(lines)
+    ignored: list[str] = []
     for index, raw in enumerate(lines):
         if BULLET.match(raw):
             start = index
@@ -262,9 +263,24 @@ def parse_markdown(text: str, *, escape: bool = True) -> ParsedPage:
         if match:
             properties[match.group("key")] = match.group("value").strip()
         else:
-            warnings.append(
-                f"line {index + 1}: text before the first block was ignored: "
-                f"{stripped[:40]!r}")
+            ignored.append(f"line {index + 1}: {stripped[:60]!r}")
+
+    # REFUSED rather than warned. This used to append to `warnings` and carry
+    # on, so an import could drop most of its content and still return
+    # verified=true with a plausible block count -- the silent content loss
+    # this whole server exists to prevent, and it happened: six of eight
+    # lines discarded because the caller's text reached this parser instead
+    # of the block-list one. Content the caller sent and this cannot place is
+    # an error, not a footnote.
+    if ignored:
+        raise ValueError(
+            f"{len(ignored)} line(s) before the first '- ' are neither page "
+            "properties nor blocks, and would be DISCARDED: "
+            + "; ".join(ignored[:3])
+            + (" ..." if len(ignored) > 3 else "")
+            + ". Every block line must begin with '- '. If these lines belong "
+            "inside one block, pass a block LIST instead -- its text is used "
+            "verbatim.")
 
     # Indent unit comes from the first indented bullet, so tabs and spaces
     # both work provided the source is internally consistent.

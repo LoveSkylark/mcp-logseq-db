@@ -58,8 +58,34 @@ def test_spaces_and_tabs_both_work():
 
 
 def test_markdown_with_no_blocks_is_rejected():
-    with pytest.raises(ValueError, match="No blocks found"):
+    """And the error names the content that would have been lost, rather than
+    just saying nothing was found."""
+    with pytest.raises(ValueError, match="would be DISCARDED"):
         parse_markdown("Just a paragraph with no bullet.")
+
+
+def test_content_before_the_first_bullet_is_refused_not_dropped():
+    """This used to append to `warnings` and carry on, so an import could
+    discard most of its content and still report verified=true with a
+    plausible block count. That happened: six of eight lines lost, because
+    the caller's text reached this parser instead of the block-list one.
+    Content that cannot be placed is an error, not a footnote."""
+    with pytest.raises(ValueError, match="would be DISCARDED") as caught:
+        parse_markdown(
+            "1. Draw the sigil\n2. Place the lamp\n\n- A real block\n")
+
+    message = str(caught.value)
+    assert "line 1" in message
+    assert "Draw the sigil" in message
+    # And it points at the form that would have kept them.
+    assert "block LIST" in message
+
+
+def test_page_properties_are_still_allowed_before_the_first_bullet():
+    """The refusal must not catch the one thing that region is FOR."""
+    parsed = parse_markdown("alias:: City/Dawnspire\n\n- A block\n")
+
+    assert parsed.page_properties == {"alias": "City/Dawnspire"}
 
 
 def test_call_count_is_one_per_parent_with_children():
@@ -535,6 +561,40 @@ def test_the_list_form_does_not_parse_page_properties():
 
     assert parsed.page_properties == {}
     assert parsed.blocks[0].content == "alias:: City/Dawnspire"
+
+
+async def test_a_list_that_arrives_as_a_json_string_is_still_a_list(
+        graph, importer):
+    """THE DEFECT THIS PINS. A client asked for the list form and the
+    argument arrived JSON-encoded. Dispatching on type alone sent it to the
+    markdown parser, which read the JSON as markdown and discarded six of
+    eight lines -- reporting verified=true with a plausible block count.
+
+    The block list and the markdown string are different CONTRACTS, so the
+    one branch that decides which applies must not be decided by how a client
+    happened to serialise the argument.
+    """
+    import json as _json
+
+    result = await importer.import_page(
+        graph.page["uuid"],
+        _json.dumps(["Resolution Sequence", EIGHT_STEPS]))
+
+    assert result.verified is True
+    assert result.blocks == 2
+    stored = [b["title"] for b in graph.children(graph.page["id"])]
+    assert EIGHT_STEPS in stored          # byte-exact, nothing dropped
+    assert any("JSON string" in w for w in result.warnings)
+
+
+async def test_real_markdown_is_not_mistaken_for_a_json_list(graph, importer):
+    """The coercion keys on parsing as a JSON ARRAY, so markdown that merely
+    starts with a bracket stays markdown."""
+    result = await importer.import_page(
+        graph.page["uuid"], "- [[Dawnspire]] is a city\n")
+
+    assert result.blocks == 1
+    assert result.escaped_links == ("Dawnspire",)
 
 
 async def test_the_string_form_still_works(graph, importer):
