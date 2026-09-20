@@ -1382,6 +1382,165 @@ async def test_counted_page_listing_excludes_recycled_pages(graph, content):
     assert rows["TEST-PAGE"]["content_blocks"] == 1
 
 
+# ------------------------------------------------------ page migration
+#
+# The journal-to-page workflow. The tool is mechanical on purpose: which
+# blocks belong on which page was the irreducibly human part of the job, and
+# these tests pin that the tool does not attempt it.
+
+async def test_a_journal_migrates_in_order(graph, content):
+    journal = graph.add("Feb 10th, 2026", None, None, name="feb 10th, 2026",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Chapter One", None, None, name="chapter one",
+                            tags=[PAGE_CLASS_ID])
+    for n in range(4):
+        graph.add(f"Para {n}", journal["id"], journal["id"])
+
+    result = await content.migrate_page(
+        journal["uuid"], destination["uuid"])
+
+    assert result["verified"] is True
+    assert result["remaining"] == 0
+    assert result["order_preserved"] is True
+    arrived = [b["title"]
+               for b in await content._children_of(destination["uuid"])]
+    assert arrived == ["Para 0", "Para 1", "Para 2", "Para 3"]
+
+
+async def test_a_dry_run_writes_nothing_and_returns_the_plan(graph):
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    journal = graph.add("Feb 11th", None, None, name="feb 11th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Chapter", None, None, name="chapter",
+                            tags=[PAGE_CLASS_ID])
+    graph.add("A long paragraph " * 10, journal["id"], journal["id"])
+
+    result = await verified.migrate_page(
+        journal["uuid"], destination["uuid"], dry_run=True)
+
+    assert result["verified"] is False
+    assert "DRY RUN" in result["diagnostic"]
+    assert len(result["planned"]) == 1
+    # A preview, not the block: enough to recognise it.
+    assert len(result["planned"][0]["preview"]) <= 81
+    assert not any(m == "logseq.DB.moveBlock" for m, _ in client.calls)
+    assert await verified._children_of(destination["uuid"]) == []
+
+
+async def test_the_substring_selector_is_the_callers_rule(graph, content):
+    """The only selection this tool does. No clustering, no similarity --
+    placement judgement stays with the person."""
+    journal = graph.add("Feb 10th", None, None, name="feb 10th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Mechanics", None, None, name="mechanics",
+                            tags=[PAGE_CLASS_ID])
+    graph.add("[mechanics] dice pools", journal["id"], journal["id"])
+    graph.add("a diary entry", journal["id"], journal["id"])
+    graph.add("[mechanics] modifiers", journal["id"], journal["id"])
+
+    result = await content.migrate_page(
+        journal["uuid"], destination["uuid"], contains="[mechanics]")
+
+    assert result["verified"] is True
+    assert result["remaining"] == 1
+    arrived = [b["title"]
+               for b in await content._children_of(destination["uuid"])]
+    assert arrived == ["[mechanics] dice pools", "[mechanics] modifiers"]
+    left = [b["title"] for b in await content._children_of(journal["uuid"])]
+    assert left == ["a diary entry"]
+
+
+async def test_the_selector_is_case_sensitive(graph, content):
+    """Consistent with searchBlocks, and deliberate: a selector that guesses
+    at intent is the thing this tool refuses to be."""
+    journal = graph.add("Feb 10th", None, None, name="feb 10th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Dest", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+    graph.add("Mechanics note", journal["id"], journal["id"])
+
+    result = await content.migrate_page(
+        journal["uuid"], destination["uuid"], contains="mechanics")
+
+    assert result["planned"] == []
+    assert result["remaining"] == 1
+    assert "none containing" in result["diagnostic"]
+
+
+async def test_nested_blocks_travel_with_their_parent(graph, content):
+    """Only top-level blocks are selected, because a move carries the
+    subtree -- selecting a child directly would tear it out of context."""
+    journal = graph.add("Feb 10th", None, None, name="feb 10th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Dest", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+    parent = graph.add("Section", journal["id"], journal["id"])
+    graph.add("nested detail", parent["id"], journal["id"])
+
+    result = await content.migrate_page(
+        journal["uuid"], destination["uuid"])
+
+    assert len(result["planned"]) == 1        # the parent only
+    assert result["verified"] is True
+    moved = await content._children_of(destination["uuid"])
+    assert [b["title"] for b in moved] == ["Section"]
+    assert [b["title"] for b in await content._children_of(parent["uuid"])] \
+        == ["nested detail"]
+
+
+async def test_remaining_is_read_back_not_subtracted(graph):
+    """Arithmetic would agree with itself even if a move silently did
+    nothing, which is the failure this whole server is built around."""
+    client = FakeClient(graph)
+    client.write_effective = False
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    journal = graph.add("Feb 10th", None, None, name="feb 10th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Dest", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+    graph.add("Para", journal["id"], journal["id"])
+
+    result = await verified.migrate_page(
+        journal["uuid"], destination["uuid"])
+
+    assert result["verified"] is False
+    assert result["remaining"] == 1           # still on the source
+
+
+async def test_an_empty_source_is_not_an_error(graph, content):
+    journal = graph.add("Feb 12th", None, None, name="feb 12th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Dest", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+
+    result = await content.migrate_page(
+        journal["uuid"], destination["uuid"])
+
+    assert result["verified"] is True
+    assert result["planned"] == []
+    assert "the page is empty" in result["diagnostic"]
+
+
+async def test_migrating_a_page_onto_itself_is_refused(graph, content):
+    journal = graph.add("Feb 10th", None, None, name="feb 10th",
+                        tags=[PAGE_CLASS_ID])
+
+    with pytest.raises(ValueError, match="same page"):
+        await content.migrate_page(journal["uuid"], journal["uuid"])
+
+
+async def test_a_blank_selector_is_refused(graph, content):
+    journal = graph.add("Feb 10th", None, None, name="feb 10th",
+                        tags=[PAGE_CLASS_ID])
+    destination = graph.add("Dest", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+
+    with pytest.raises(ValueError, match="contains cannot be blank"):
+        await content.migrate_page(
+            journal["uuid"], destination["uuid"], contains="   ")
+
+
 # ------------------------------------------------------- splitting a block
 #
 # updateBlock sets a title and nothing else, so a heading fused onto the tail

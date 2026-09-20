@@ -106,16 +106,27 @@ def entity_digest(entity: Any) -> dict[str, Any]:
     return digest
 
 
-def entity_digests(entities: Any, *, limit: int = 20) -> list[dict[str, Any]]:
+def entity_digests(
+    entities: Any, *, limit: int | None = 20
+) -> list[dict[str, Any]]:
     """
-    Digests for a collection, bounded.
+    Digests for a collection, bounded by default.
 
-    Bounded because the collections that matter here are unbounded: a cleared
-    page or a deleted subtree can be hundreds of entities, and a terse mode
-    that grows with the damage is not terse.
+    Bounded because the collections this was written for are unbounded: a
+    cleared page or a deleted subtree can be hundreds of entities, and a terse
+    mode that grows with the damage is not terse.
+
+    `limit=None` for a collection of IDENTIFIERS THE CALLER MUST ACT ON. That
+    distinction was learned the hard way: `createPageofBlocks` returned
+    `created_count: 55` beside 20 UUIDs, so the blocks past the cap were
+    unaddressable and nothing said so. A count that disagrees with the list
+    beside it is worse than either a long list or an honest refusal. Anywhere
+    the bound still applies, report the true count next to it.
     """
     items = [e for e in (entities or []) if isinstance(e, dict)]
-    return [entity_digest(e) for e in items[:limit]]
+    if limit is not None:
+        items = items[:limit]
+    return [entity_digest(e) for e in items]
 
 
 class VerifiedWriteHelpers:

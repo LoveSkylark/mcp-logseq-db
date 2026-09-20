@@ -1664,6 +1664,141 @@ class VerifiedContent(VerifiedWriteHelpers):
             "diagnostic": diagnostic,
         }
 
+    @serialized_write
+    async def migrate_page(
+        self,
+        source_uuid: str,
+        target_uuid: str,
+        *,
+        contains: str | None = None,
+        placement: str = "last-child",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Move a page's top-level blocks to another page, in order.
+
+        The journal-to-page workflow, which had no primitive: enumerate the
+        top-level blocks, move them in order, verify, and report what is left
+        behind.
+
+        IT DOES NOT DECIDE WHAT TO MIGRATE. That judgement -- which cluster of
+        blocks belongs on which page -- is the irreducibly human part of a
+        migration, and the part a tool should not touch. So the only selector
+        is `contains`, a plain case-sensitive substring on the block's own
+        title: a rule the CALLER states, not one this infers. There is no
+        clustering, no similarity, no "looks like it belongs with". If the
+        blocks to move are not describable by one substring, pass their UUIDs
+        to `moveBlocks` instead -- that is the same operation with the
+        selection done by hand, and choosing it is not a failure.
+
+        Only TOP-LEVEL blocks are considered. A move carries the whole
+        subtree, so a nested block travels with its parent and selecting one
+        directly would tear it out of its context.
+
+        `dry_run` returns the plan -- every block that would move, in order,
+        with a preview of its text -- and writes nothing. Use it first: the
+        preview is how you check the selector caught what you meant before
+        anything moves.
+
+        Inherits everything from `moveBlocks`, including the 50-block cap and
+        the fact that it is NOT atomic and stops at the first block that does
+        not verify. On a long journal this means several calls; `remaining`
+        tells you what is still there each time.
+        """
+        source_uuid = self._require_entity(self._validated_uuid(source_uuid))
+        target_uuid = self._require_entity(self._validated_uuid(target_uuid))
+        if source_uuid == target_uuid:
+            raise ValueError("The source and target are the same page")
+        if contains is not None and not str(contains).strip():
+            raise ValueError(
+                "contains cannot be blank -- omit it to migrate every "
+                "top-level block")
+
+        source = await self._page_by_uuid(source_uuid)
+        await self._entity_by_uuid(target_uuid)
+
+        top_level = await self._children_of(source_uuid)
+        selected = [
+            block for block in top_level
+            if contains is None or contains in str(block.get("title") or "")
+        ]
+        skipped = len(top_level) - len(selected)
+
+        def preview(block: dict[str, Any]) -> dict[str, Any]:
+            text = str(block.get("title") or "")
+            return {
+                "uuid": block.get("uuid"),
+                "order": block.get("order"),
+                # Enough to recognise the block, not the block itself. A
+                # migration plan is read by a person deciding whether the
+                # selector caught the right things.
+                "preview": text[:80] + ("…" if len(text) > 80 else ""),
+            }
+
+        if not selected:
+            return {
+                "verified": True,
+                "source_uuid": source_uuid,
+                "target_uuid": target_uuid,
+                "planned": [],
+                "moved": [],
+                "remaining": len(top_level),
+                "diagnostic": (
+                    f"Nothing to migrate. {len(top_level)} top-level block(s) "
+                    "on the source"
+                    + (f", none containing {contains!r}." if contains
+                       else " -- the page is empty.")),
+            }
+
+        if dry_run:
+            return {
+                "verified": False,
+                "source_uuid": source_uuid,
+                "target_uuid": target_uuid,
+                "planned": [preview(b) for b in selected],
+                "moved": [],
+                "remaining": len(top_level),
+                "diagnostic": (
+                    f"DRY RUN -- nothing moved. {len(selected)} of "
+                    f"{len(top_level)} top-level block(s) would move to the "
+                    f"target, in the order listed"
+                    + (f"; {skipped} do not contain {contains!r}." if contains
+                       else ".")
+                    + " Each carries its own subtree. Check the previews "
+                      "before running this without dry_run."),
+            }
+
+        outcome = await self.move_blocks(
+            [block["uuid"] for block in selected], target_uuid,
+            placement=placement)
+
+        # What is actually left, read back rather than subtracted. The
+        # arithmetic would agree with itself even if a move silently did
+        # nothing.
+        left = await self._children_of(source_uuid)
+        landed = [m for m in outcome["moved"] if m["verified"]]
+
+        return {
+            "verified": outcome["verified"] and len(left) == skipped,
+            "source_uuid": source_uuid,
+            "source_title": source.get("title"),
+            "target_uuid": target_uuid,
+            "planned": [preview(b) for b in selected],
+            "moved": outcome["moved"],
+            "summary": outcome["summary"],
+            "order_preserved": outcome["order_preserved"],
+            "not_attempted": outcome["not_attempted"],
+            "remaining": len(left),
+            "diagnostic": (
+                f"{len(landed)} block(s) moved to the target in order; "
+                f"{len(left)} top-level block(s) remain on the source "
+                f"({skipped} were not selected). "
+                + outcome["diagnostic"]
+                + (" Call again with the same arguments to continue -- the "
+                   "cap is per call, and last-child appends after what has "
+                   "already arrived." if outcome["not_attempted"] else "")),
+        }
+
     async def find_block_tree(
         self,
         block_uuid: str,

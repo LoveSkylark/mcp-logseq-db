@@ -122,6 +122,8 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "moveBlock":            ("logseq.DB.moveBlock",),
     "moveBlocks":           ("logseq.DB.moveBlock",
                              "logseq.DB.datascriptQuery"),
+    "migratePage":          ("logseq.DB.moveBlock",
+                             "logseq.DB.datascriptQuery"),
     "createPageofBlocks":   ("logseq.DB.insertBatchBlock",
                              "logseq.DB.datascriptQuery"),
     # Pages
@@ -224,6 +226,22 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "once and preserves whitespace exactly. Capped at 20 parts.",
         "Refused before any write: an empty part, a delimiter that does not "
         "occur, and any part with a line starting with '- '.",
+    ),
+    "migratePage": (
+        "A wrapper over moveBlocks and inherits all of it: not atomic, stops "
+        "at the first block that does not verify, capped at 50 per call. A "
+        "long journal takes several calls.",
+        "It does NOT choose what to migrate. The only selector is a plain "
+        "substring the caller states; there is no clustering or similarity "
+        "matching, because which blocks belong on which page is a human "
+        "judgement.",
+        "Top-level blocks only — a move carries the subtree, so a nested "
+        "block travels with its parent.",
+        "dry_run returns the plan with a text preview per block and writes "
+        "nothing. It is the intended first call.",
+        "`remaining` is read back from the source rather than subtracted, so "
+        "it cannot agree with itself after a silent no-op. The source page "
+        "is never deleted.",
     ),
     "moveBlocks": (
         "Two API calls per block, not the eight a single moveBlock needs: "

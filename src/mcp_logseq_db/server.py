@@ -401,6 +401,26 @@ def create_server(
             block_uuids, target_uuid, placement=placement,
             all_or_nothing=all_or_nothing)
 
+    @server.tool(name="migratePage", structured_output=True)
+    async def migrate_page(
+        source_uuid: str,
+        target_uuid: str,
+        contains: str | None = None,
+        placement: Literal[
+            "child", "last-child", "before", "after"
+        ] = "last-child",
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Move a page's TOP-LEVEL blocks to another page, in order, and report what is left behind -- the journal-to-page workflow. IT DOES NOT DECIDE WHAT TO MIGRATE: which blocks belong on which page is a human judgement and this will not make it. The only selector is contains, a plain case-sensitive substring on a block's own title, which is a rule YOU state. There is no clustering or similarity matching. If the blocks you want are not describable by one substring, pass their UUIDs to moveBlocks instead -- the same operation with the selection done by hand. Only top-level blocks are considered, because a move carries the whole subtree and a nested block travels with its parent. RUN dry_run FIRST: it writes nothing and returns the plan with a text preview per block, which is how you check the selector caught what you meant. Inherits moveBlocks' behaviour -- not atomic, stops at the first block that does not verify, capped at 50 per call -- so a long journal takes several calls; remaining tells you what is still there. The source page itself is never deleted."""
+        source_uuid = require_uuid(
+            source_uuid, role="source_uuid", hint="getPageUUID")
+        target_uuid = require_uuid(
+            target_uuid, role="target_uuid",
+            hint="getPageUUID or getBlockUUID")
+        return await content().migrate_page(
+            source_uuid, target_uuid, contains=contains,
+            placement=placement, dry_run=dry_run)
+
     @server.tool(name="removeBlock", structured_output=True)
     async def remove_block(
         block_uuid: str, verbose: bool = True
@@ -745,6 +765,11 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "Pass an exact block UUID and exactly one of offset or "
             "delimiter. Read the block first -- the delimiter must occur in "
             "the text as Logseq stored it, which may not be as you sent it."
+        ),
+        "migrate_page": (
+            "Pass the source page UUID, then the target. contains is an "
+            "optional substring selector on block titles -- it does not "
+            "choose for you. Run dry_run first."
         ),
         "move_blocks": (
             "Pass the blocks in the order they should end up, then the "

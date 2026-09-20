@@ -7,21 +7,6 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
----
-
-### Instruction 12 — `splitBlock(uuid, offset | delimiter)`
-
-**Why:** `updateBlock` is title-only, so there's no inverse of a merge.
-
-**Addresses:** the Feb 28th mechanics summary has headings fused onto the tail of the preceding paragraph — `"…both dice succeed [1]\n\n**Modifiers:**"`. "Modifiers:", "Equipment:" and "Special Effects Die:" are all trapped mid-block and can't be promoted to their own headings.
-
-**Works with:** cleaning up any pasted or generated content, which is a large share of this graph.
-
-**Implementation:** `updateBlock` the original to the first part, `createBlock` the remainder, `moveBlock` it to `after`. Composition of existing primitives.
-
-**Concerns:** not atomic — a failure between steps leaves truncated text, which is data loss in the user's prose. Do the create before the truncate so the content exists twice at the worst moment, never zero times.
-
-**Done when:** a two-part block splits into two correctly ordered blocks with no text lost.
 
 ---
 
