@@ -121,6 +121,11 @@ class ParsedPage:
     links: list[str]
     tags: list[str]
     warnings: list[str]
+    # True when the content is used exactly as given, which only the block
+    # list guarantees. It lets the import verify stored text by EQUALITY on
+    # that path, rather than falling back to the weaker line-count invariant
+    # the markdown form needs.
+    verbatim: bool = False
 
     def block_count(self) -> int:
         def walk(blocks: list[ParsedBlock]) -> int:
@@ -239,7 +244,8 @@ def parse_blocks(
             f"{total} blocks exceeds the {MAX_IMPORT_BLOCKS}-block import "
             "limit. Split the page.")
 
-    return ParsedPage({}, roots, all_links, all_tags, warnings)
+    return ParsedPage({}, roots, all_links, all_tags, warnings,
+                      verbatim=True)
 
 
 def parse_markdown(text: str, *, escape: bool = True) -> ParsedPage:

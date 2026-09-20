@@ -633,6 +633,75 @@ async def test_real_markdown_is_not_mistaken_for_a_json_list(graph, importer):
     assert result.escaped_links == ("Dawnspire",)
 
 
+async def test_a_truncated_block_is_reported_not_verified(graph):
+    """THE FAILURE THIS CLOSES. Logseq truncates a block at a line beginning
+    with `- ` and the block still exists, so a count-only check agreed with
+    itself: eight lines sent, two stored, verified true. The guard refuses
+    that shape now, but a client that truncates for any other reason must
+    still be caught by the read-back."""
+    class TruncatingClient(FakeClient):
+        def _parse(self, entity, content):
+            # Keep only the first line, as Logseq did.
+            super()._parse(entity, content.splitlines()[0])
+
+    client = TruncatingClient(graph)
+    verified = VerifiedImport(client)  # type: ignore[arg-type]
+
+    result = await verified.import_page(
+        graph.page["uuid"], ["alpha\nbeta\ngamma"])
+
+    assert result.verified is False
+    assert "did not store what was sent" in result.diagnostic
+    assert "3 line(s) sent, 1 stored" in result.diagnostic
+
+
+async def test_an_intact_import_verifies_by_equality_on_the_list_form(
+        graph, importer):
+    """The list form is verbatim and its references are escaped to
+    placeholders Logseq does not rewrite, so exact comparison is available
+    there -- the strongest check the import can make."""
+    result = await importer.import_page(
+        graph.page["uuid"], ["alpha\n\nbeta", "   indented"])
+
+    assert result.verified is True
+    assert result.diagnostic is None
+
+
+async def test_a_rewritten_reference_does_not_read_as_damage(graph, importer):
+    """The string form cannot use equality: Logseq rewrites a resolved
+    reference to [[uuid]]. The line-count invariant survives that, which is
+    why the two paths check differently."""
+    graph.add("Dawnspire", name="dawnspire", tags=[PAGE_CLASS_ID])
+
+    result = await importer.import_page(
+        graph.page["uuid"], "- A line\n  continued\n")
+
+    assert result.verified is True
+
+
+async def test_extra_blocks_are_a_failure_too(graph):
+    """`gained >= expected` passed when MORE blocks appeared than were sent,
+    which means a block was split or something else wrote to the page --
+    neither of which is the import succeeding."""
+    class DuplicatingClient(FakeClient):
+        def _insert_batch(self, target_uuid, blocks, options=None):
+            out = super()._insert_batch(target_uuid, blocks, options)
+            # An extra block nobody asked for.
+            target = self.graph.entities[target_uuid]
+            page = (target["id"] if target.get("name")
+                    else target["page"]["id"])
+            self.graph.add("uninvited", target["id"], page)
+            return out
+
+    client = DuplicatingClient(graph)
+    verified = VerifiedImport(client)  # type: ignore[arg-type]
+
+    result = await verified.import_page(graph.page["uuid"], ["just one"])
+
+    assert result.verified is False
+    assert "More blocks appeared than were sent" in result.diagnostic
+
+
 async def test_the_string_form_still_works(graph, importer):
     """The existing format is unchanged -- adding a second one must not
     migrate anybody."""

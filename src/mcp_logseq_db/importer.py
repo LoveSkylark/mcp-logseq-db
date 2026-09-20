@@ -29,7 +29,7 @@ from typing import Any
 
 import httpx
 
-from ._shared import VerifiedWriteHelpers
+from ._shared import VerifiedWriteHelpers, content_loss
 from .client import LogseqDBClient, serialized_write
 from .content import VerifiedContent
 from .markdown import (
@@ -138,13 +138,42 @@ class VerifiedImport(VerifiedWriteHelpers):
         # import.
         before = len(await self._content.get_block_uuid(page_uuid))
 
-        calls = await self._insert_tree(page_uuid, parsed.blocks)
+        calls, written = await self._insert_tree(page_uuid, parsed.blocks)
 
         # Counted by a parent-walking read, so a block whose owning page came
         # out wrong is still counted and the mismatch shows.
         present = await self._content.get_block_uuid(page_uuid)
         gained = len(present) - before
         expected = parsed.block_count()
+
+        # CONTENT, not just count. The count was the only check, and that is
+        # how eight lines sent and two stored reported verified=true: Logseq
+        # truncates a block at a line beginning with `- ` and the block still
+        # exists, so the arithmetic agreed. Verified against the read above,
+        # so this costs no extra calls.
+        stored = {b.get("uuid"): str(b.get("title") or "") for b in present}
+        damaged: list[str] = []
+        for block_uuid, sent in written:
+            if block_uuid not in stored:
+                damaged.append(f"{block_uuid}: not present after the write")
+                continue
+            if parsed.verbatim:
+                # The block list is used verbatim and its references are
+                # escaped to placeholders Logseq does not rewrite, so
+                # equality is available on this path and is the strongest
+                # check there is.
+                if stored[block_uuid] != sent.rstrip():
+                    damaged.append(
+                        f"{block_uuid}: stored text differs from what was "
+                        f"sent ({len(sent.splitlines())} line(s) sent, "
+                        f"{len(stored[block_uuid].splitlines())} stored)")
+            else:
+                lost = content_loss(sent, stored[block_uuid])
+                if lost is not None:
+                    damaged.append(f"{block_uuid}: {lost}")
+
+        count_ok = gained == expected
+        verified = count_ok and not damaged
 
         notes = list(parsed.warnings)
         if parsed.page_properties:
@@ -160,7 +189,7 @@ class VerifiedImport(VerifiedWriteHelpers):
                 "run repairLinks once their targets exist")
 
         return ImportResult(
-            verified=gained >= expected,
+            verified=verified,
             page_uuid=page_uuid,
             page_title=page.get("title"),
             created_page=created,
@@ -171,12 +200,22 @@ class VerifiedImport(VerifiedWriteHelpers):
             page_properties=parsed.page_properties,
             warnings=tuple(notes),
             diagnostic=(
-                None if gained >= expected else
-                f"Expected this import to add {expected} block(s); the page "
-                f"went from {before} to {len(present)}, a gain of {gained}. "
-                "The import is partial; batches are not atomic, so earlier "
-                "levels are committed. Audit with findOrphans and pageStats "
-                "rather than retrying, which would duplicate what landed."))
+                None if verified else
+                ("" if count_ok else
+                 f"Expected this import to add {expected} block(s); the page "
+                 f"went from {before} to {len(present)}, a gain of {gained}. "
+                 + ("More blocks appeared than were sent, so something else "
+                    "wrote to this page or a block was split. "
+                    if gained > expected else
+                    "The import is partial; batches are not atomic, so "
+                    "earlier levels are committed. "))
+                + (f"{len(damaged)} block(s) did not store what was sent: "
+                   + "; ".join(damaged[:3])
+                   + (" ..." if len(damaged) > 3 else "")
+                   + ". The write reported success, so this is the read-back "
+                     "disagreeing with it." if damaged else "")
+                + " Audit with findOrphans and pageStats rather than "
+                  "retrying, which would duplicate what landed."))
 
     @staticmethod
     def _parse_input(markdown: str | list[Any]) -> Any:
@@ -244,7 +283,7 @@ class VerifiedImport(VerifiedWriteHelpers):
 
     async def _insert_tree(
         self, parent_uuid: str, blocks: list[ParsedBlock]
-    ) -> int:
+    ) -> tuple[int, list[tuple[str, str]]]:
         """
         Breadth-first, one batched insert per parent.
 
@@ -252,8 +291,14 @@ class VerifiedImport(VerifiedWriteHelpers):
         complete instead of one ragged branch -- easier to audit and easier to
         resume. The response carries the created entities, so a parent's UUID
         is known before its children are inserted.
+
+        Returns the call count and every (uuid, content sent) pair, so the
+        caller can check what was STORED against what was sent. Without that
+        pairing the only available check is arithmetic, and a truncated block
+        still counts as one block.
         """
         calls = 0
+        written: list[tuple[str, str]] = []
         queue: list[tuple[str, list[ParsedBlock]]] = [(parent_uuid, blocks)]
 
         while queue:
@@ -276,9 +321,10 @@ class VerifiedImport(VerifiedWriteHelpers):
                     "retrying would duplicate what already landed.")
 
             for block, block_uuid in zip(group, uuids):
+                written.append((block_uuid, block.content))
                 if block.children:
                     queue.append((block_uuid, block.children))
-        return calls
+        return calls, written
 
     # ------------------------------------------------------------- repair
 
