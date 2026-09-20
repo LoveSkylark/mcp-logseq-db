@@ -2,11 +2,67 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import httpx
 
 from .identifiers import require_uuid
+
+# A line beginning with `- ` inside block content is DESTRUCTIVE. Logseq
+# truncates the block there and discards everything after it -- measured
+# 2026-09-20 on 2.0.1-alpha+nightly.20260826, where "alpha\n- beta" stored
+# only "alpha" with a successful response and a correct block count. It does
+# not become a child block; it is dropped.
+#
+# Lives here rather than in the markdown parser because the parser only
+# guarded `importPage`. `createBlock` and `updateBlock` take multi-line
+# titles too and had no guard at all, which is the same silent loss on a path
+# nobody had looked at.
+DASH_LINE = re.compile(r"^[\t ]*-\s")
+
+
+def reject_truncating_content(title: str, *, role: str = "title") -> None:
+    """Refuse content Logseq would silently truncate."""
+    offender = next(
+        (line for line in title.splitlines()[1:] if DASH_LINE.match(line)),
+        None)
+    if offender is not None:
+        raise ValueError(
+            f"{role}: a line begins with '- ' ({offender.strip()[:40]!r}). "
+            "Logseq truncates the block there and discards the rest, so this "
+            "would lose content silently. Use '* ' instead, or split it into "
+            "separate blocks.")
+
+
+def content_loss(sent: str, stored: str) -> str | None:
+    """
+    Did a write lose content? Returns a diagnostic, or None.
+
+    Equality is NOT the test, and cannot be: Logseq parses content on write,
+    so `[[X]]` comes back as `[[uuid]]` and a heading loses its marker. The
+    invariant that survives those rewrites is the LINE COUNT -- neither
+    reference rewriting nor heading conversion adds or removes a newline,
+    while truncation always does.
+
+    The last-line check catches a same-line truncation the count would miss,
+    and is skipped when the final line holds a reference or a heading marker,
+    since those are exactly the cases Logseq legitimately rewrites.
+    """
+    sent, stored = sent.rstrip(), stored.rstrip()
+    if stored == sent:
+        return None
+    if sent.count("\n") != stored.count("\n"):
+        return (f"{sent.count(chr(10)) + 1} line(s) sent, "
+                f"{stored.count(chr(10)) + 1} stored -- content was dropped "
+                "on write. The call reported success; this is the read-back "
+                "disagreeing with it.")
+    last = sent.splitlines()[-1].strip() if sent else ""
+    if last and "[[" not in last and "#" not in last:
+        if not stored.endswith(last):
+            return ("The stored text does not end with the last line sent, "
+                    "so content was rewritten or dropped at the end.")
+    return None
 
 # Keys a terse digest keeps. Enough to act on the result -- identify the
 # entity, see where it landed, see where it sits among its siblings -- and

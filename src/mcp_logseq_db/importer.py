@@ -183,19 +183,18 @@ class VerifiedImport(VerifiedWriteHelpers):
         """
         Choose the parser, tolerating a list that arrived as a JSON STRING.
 
-        Dispatching on type alone was not enough in practice. A client asked
-        for the list form and the argument arrived as a JSON-encoded string,
-        so it went to `parse_markdown`, which read the JSON text as markdown
-        and dropped everything before the first `- ` as pre-block text. Six of
-        eight lines were discarded and the result still reported
-        `verified: true` -- exactly the silent content loss this server exists
-        to prevent, caused by the one branch that decides which contract
-        applies.
+        A latent bug rather than an observed one, and worth being exact about
+        which: when a client cannot send a real array, a JSON-encoded list
+        reaches `parse_markdown`, which reads the JSON as markdown. It was
+        briefly recorded here as the cause of an observed six-of-eight line
+        loss; it was not. That loss came from Logseq truncating a block at a
+        line beginning with `- ` (see `parse_blocks`), on a run where the
+        list parser had worked correctly -- three blocks in two calls, with
+        the multi-line element nested at depth 1, is a shape only
+        `parse_blocks` produces.
 
-        So a string that parses as a JSON array of blocks is treated as the
-        list it was meant to be. A real markdown page cannot be mistaken for
-        one: it would have to be valid JSON *and* an array, and `[[Link]] is a
-        page` is neither.
+        The coercion stays because the failure it prevents is real and silent
+        when it happens. It is not the explanation for anything already seen.
         """
         if isinstance(markdown, str):
             stripped = markdown.strip()

@@ -36,6 +36,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ._shared import reject_truncating_content
+
 BULLET = re.compile(r"^(?P<indent>[\t ]*)-\s(?P<content>.*)$")
 PAGE_PROPERTY = re.compile(r"^(?P<key>[A-Za-z][\w.-]*)::\s*(?P<value>.*)$")
 
@@ -156,6 +158,11 @@ def parse_blocks(
     formats answer the same question differently, and mixing them would put
     the ambiguity straight back.
 
+    ONE SHAPE IS STILL IMPOSSIBLE, and it is Logseq's limit rather than this
+    parser's: a line beginning with `- ` inside a block is truncated away on
+    write. It is refused below rather than sent. Newlines, blank lines and
+    leading whitespace all survive -- measured, not assumed.
+
     An element is either a string (depth 0) or a mapping with `text` and
     `depth`. `content` is accepted in place of `text`, since that is what the
     underlying API calls the field.
@@ -200,6 +207,12 @@ def parse_blocks(
                 f"block {position}: empty. An explicit list says what the "
                 "blocks are, so an empty one is a mistake rather than "
                 "something to skip silently.")
+
+        # A LINE BEGINNING WITH `- ` CANNOT BE BLOCK CONTENT. The rule lives
+        # in `_shared` because it is Logseq's, not this parser's, and
+        # `createBlock` and `updateBlock` need it too -- they take multi-line
+        # titles and had no guard at all. One copy, one measurement.
+        reject_truncating_content(text, role=f"block {position}")
 
         # A jump is an ERROR here, unlike the line format where it is a
         # warning: indentation can be accidentally ragged, an integer cannot.

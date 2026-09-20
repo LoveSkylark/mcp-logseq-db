@@ -440,7 +440,7 @@ async def test_import_rejects_a_block_uuid_as_target(graph, importer):
 EIGHT_STEPS = """1. Declare intent
 2. Name the stake
 3. Roll
-- 3a. On a tie, the defender chooses
+   3a. On a tie, the defender chooses
 4. Compare
 
 5. Narrate
@@ -448,11 +448,17 @@ EIGHT_STEPS = """1. Declare intent
 7. Update the clock
 8. Ask what changes"""
 
+# The one shape no form can carry. Logseq truncates a block at a line
+# beginning with `- ` and discards the rest -- measured 2026-09-20 on
+# 2.0.1-alpha+nightly.20260826, where "DASHLINE alpha\n- DASHLINE beta"
+# stored only "DASHLINE alpha" with a successful response.
+DASH_INSIDE_BLOCK = "Step three\n- 3a. On a tie, the defender chooses"
+
 
 async def test_an_eight_line_list_imports_as_one_block(graph, importer):
-    """The acceptance case. Note what the text contains: a numbered list, a
-    nested `- ` bullet, and a blank line -- each of which the string form
-    would turn into a separate block or drop."""
+    """The acceptance case. The text carries a numbered list, an indented
+    continuation line and a BLANK line -- all three survive verbatim, which
+    was confirmed against a live graph rather than assumed."""
     result = await importer.import_page(
         graph.page["uuid"], ["Resolution Sequence", EIGHT_STEPS])
 
@@ -460,22 +466,49 @@ async def test_an_eight_line_list_imports_as_one_block(graph, importer):
     assert result.blocks == 2
     stored = [b["title"] for b in graph.children(graph.page["id"])]
     assert EIGHT_STEPS in stored
-    # Byte-exact: the newlines, the blank line and the nested bullet all
-    # survived as content rather than becoming structure.
     kept = next(t for t in stored if t.startswith("1. Declare"))
     assert kept.count("\n") == 9
-    assert "\n\n" in kept
-    assert "- 3a." in kept
+    assert "\n\n" in kept                 # the blank line survived
+    assert "   3a." in kept              # so did the leading whitespace
 
 
-async def test_the_same_text_in_the_string_form_fragments(graph, importer):
-    """Pinned to show what the list form is FOR. This is not a bug in the
-    string form -- it is what indentation-as-structure necessarily does."""
+async def test_a_bullet_line_inside_a_block_is_refused(graph, importer):
+    """Refused rather than sent, because Logseq would truncate the block
+    there and report success. Eight lines sent, two stored, verified true --
+    that happened, and it is the failure this server exists to prevent."""
+    with pytest.raises(ValueError, match="truncates a block") as caught:
+        await importer.import_page(
+            graph.page["uuid"], [DASH_INSIDE_BLOCK])
+
+    # The message has to say what to do instead, since the content is valid
+    # and the caller has no other way to know.
+    assert "Split it into separate blocks" in str(caught.value)
+    assert graph.children(graph.page["id"]) == []
+
+
+async def test_a_leading_bullet_on_the_first_line_is_fine(graph, importer):
+    """Only a line AFTER the first matters -- the first line's bullet is
+    stripped by Logseq as decoration, not a truncation point."""
+    result = await importer.import_page(
+        graph.page["uuid"], ["- A single bulleted line"])
+
+    assert result.verified is True
+
+
+async def test_the_same_text_in_the_string_form_loses_the_blank_line(
+        graph, importer):
+    """Pinned to show what the list form is FOR, and corrected: the string
+    form does not fragment this text, it QUIETLY REWRITES it -- the blank
+    line is dropped and every continuation line is stripped of indentation.
+    """
     result = await importer.import_page(
         graph.page["uuid"], f"- Resolution Sequence\n  {EIGHT_STEPS}")
 
-    # The `- 3a.` line became its own block, so the sequence is split.
-    assert result.blocks > 1
+    assert result.blocks == 1
+    stored = graph.children(graph.page["id"])[0]["title"]
+    assert "\n\n" not in stored          # blank line gone
+    assert "   3a." not in stored        # indentation stripped
+    assert "3a." in stored               # the text itself survived
 
 
 async def test_depth_is_explicit_in_the_list_form(graph, importer):

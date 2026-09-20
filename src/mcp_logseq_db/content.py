@@ -47,7 +47,13 @@ from typing import Any
 
 import httpx
 
-from ._shared import VerifiedWriteHelpers, entity_digest, entity_digests
+from ._shared import (
+    VerifiedWriteHelpers,
+    content_loss,
+    entity_digest,
+    entity_digests,
+    reject_truncating_content,
+)
 from .client import LogseqDBClient, poll_readback, serialized_write
 
 MAX_SUBTREE_NODES = 1000
@@ -2323,6 +2329,7 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         parent_uuid = self._require_entity(self._validated_uuid(parent_uuid))
         self._validate_title(title)
+        reject_truncating_content(title)
         parent = await self._entity_by_uuid(parent_uuid)
 
         if dry_run:
@@ -2359,18 +2366,19 @@ class VerifiedContent(VerifiedWriteHelpers):
                 previous_entities=(parent,))
 
         return await self._verify_created(
-            created, parent, response, timed_out)
+            created, parent, response, timed_out, sent=title)
 
     async def _verify_created(
         self, block_uuid: str, parent: dict[str, Any],
-        response: Any, timed_out: bool,
+        response: Any, timed_out: bool, sent: str | None = None,
     ) -> ContentResult:
         """
-        Confirm the new block's parent AND owning page.
+        Confirm the new block's parent, owning page AND content.
 
         Checking the parent alone is what let the ownership bug go unnoticed:
         the block appeared under the right parent while belonging to the wrong
-        page.
+        page. Checking structure alone let the next one through: the block
+        landed correctly and Logseq had silently truncated its text.
         """
         block = await poll_readback(
             self._client,
@@ -2405,6 +2413,18 @@ class VerifiedContent(VerifiedWriteHelpers):
                     "belongs to the wrong page, so it is invisible to every "
                     "page-scoped query -- run findOrphans and remove it."),
                 previous_entities=(parent,), observed_entities=(block,))
+
+        if sent is not None:
+            lost = content_loss(sent, str(block.get("title") or ""))
+            if lost is not None:
+                return ContentResult(
+                    validation=None, response=response,
+                    verified_entities=(block,),
+                    recovered_after_timeout=timed_out, verified=False,
+                    diagnostic=(
+                        "The block was created in the right place but its "
+                        f"content is not what was sent. {lost}"),
+                    previous_entities=(parent,), observed_entities=(block,))
 
         return ContentResult(
             validation=None, response=response, verified_entities=(block,),
@@ -2455,6 +2475,7 @@ class VerifiedContent(VerifiedWriteHelpers):
         """
         block_uuid = self._require_entity(self._validated_uuid(block_uuid))
         self._validate_title(title)
+        reject_truncating_content(title)
 
         previous = await self._entity_by_uuid(block_uuid)
         if previous.get("name"):
@@ -2494,6 +2515,21 @@ class VerifiedContent(VerifiedWriteHelpers):
                     "The edit was not observed; the block still has its "
                     "original title. This API returns success for writes that "
                     "do nothing."),
+                previous_entities=(previous,), observed_entities=(current,))
+
+        # The title changed, which is all the poll above can establish -- and
+        # a TRUNCATED write changes the title too, so it would pass that
+        # check. The line-count invariant is what separates "Logseq rewrote
+        # my references" from "Logseq kept two of my eight lines".
+        lost = content_loss(title, str(current.get("title") or ""))
+        if lost is not None:
+            return ContentResult(
+                validation=None, response=response,
+                verified_entities=(current,),
+                recovered_after_timeout=timed_out, verified=False,
+                diagnostic=(
+                    "The block was edited but its content is not what was "
+                    f"sent. {lost}"),
                 previous_entities=(previous,), observed_entities=(current,))
 
         return ContentResult(

@@ -295,8 +295,10 @@ and a second empty destination page. Verify every outcome by reading
 | ID | Test | Expected |
 |---|---|---|
 | T-260 | `importPage` with a markdown STRING, nested | Tree correct, `blocks` matches, references escaped to `{{link:X}}` |
-| T-261 | **Acceptance.** `importPage` with a LIST whose second element is an eight-line numbered sequence containing a blank line and a nested `- 3a.` line | ONE block. Read it back and confirm it is byte-exact: the newlines, the blank line and the `- ` line are all content, not structure. |
-| T-262 | The same text as a markdown string | It FRAGMENTS — the `- ` line becomes a separate block. Record it; this is what the list form exists for, and it should stay reproducible. |
+| T-261 | **Acceptance.** `importPage` with a LIST whose second element is an eight-line numbered sequence containing a blank line and an INDENTED continuation line (`   3a. …`), and **no** line beginning with `- ` | ONE block. Read it back and confirm byte-exact: the newlines, the blank line and the leading whitespace are all content. This is the contract the docs claim, and the case the first run never actually tested — its fixture mixed the safe shape with the destructive one below. |
+| T-261b | The same list, but with a line beginning with `- ` inside the multi-line element | **REFUSED** before any write, with a diagnostic naming the offending line. Logseq truncates a block at such a line and discards the rest — measured 2026-09-20, where eight lines sent stored two with `verified: true`. Confirm nothing was written. |
+| T-261c | `createBlock` with a multi-line title containing a `- ` line | Also refused. The guard is shared, because this path had none and fails identically. |
+| T-262 | The T-261 text as a markdown STRING | ONE block, but **rewritten**: the blank line is dropped and the indentation stripped. It does not fragment — that earlier expectation was wrong, and depended on the `- ` line that T-261 no longer contains. |
 | T-263 | A list with explicit depths `0, 1, 2, 0` | Two roots, one child, one grandchild. Confirm by reading `:block/parent`, not from the count. |
 | T-264 | A list element with `depth: 2` following a `depth: 0` element | Refused. A skipped level is an error here, unlike the string form which flattens and warns. |
 | T-265 | A list containing a fenced code block with indented lines | Stored verbatim, indentation intact |
