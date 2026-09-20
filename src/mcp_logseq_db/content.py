@@ -69,6 +69,16 @@ MAX_MOVE_BATCH = 50
 # this bounds a pathological chain rather than the ordinary case.
 MAX_SUBTREE_DEPTH = 50
 
+# Rows searchBlocks will pull over the wire, whatever `limit` asks for. The
+# count comes first and is a single integer, so an enormous match set is
+# REPORTED rather than fetched: a response big enough to hit the byte cap is
+# indistinguishable, from the caller's side, from a search that found nothing.
+MAX_SEARCH_ROWS = 500
+
+# Shorter than this scans the whole graph to match almost everything, which is
+# the worst case for a predicate query and useless as an answer.
+MIN_SEARCH_TEXT = 2
+
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
@@ -340,6 +350,167 @@ class VerifiedContent(VerifiedWriteHelpers):
             else:
                 kinds.append("block")
         return kinds
+
+    async def search_blocks(
+        self,
+        text: str,
+        *,
+        page_uuid: str | None = None,
+        regex: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """
+        Find blocks whose title contains `text`.
+
+        The gap this fills: there was no way to locate a string in the graph,
+        so a typo noticed while reading could not be found again once the page
+        had left the caller's context. The tool that could fix it existed; the
+        tool to find it did not.
+
+        THE PREDICATE IS THE RISK. `clojure.string/includes?` runs inside
+        Logseq's DB worker, and predicate queries have wedged that worker
+        before. Three things follow, and they are the design rather than
+        decoration:
+
+          - NO RETRY. `datascriptQuery` is already in the client's
+            no-retry set, because a query that timed out once times out again
+            and a second scan doubles the load on a worker that may already be
+            struggling. Nothing here adds a retry on top.
+          - COUNT FIRST. The count is one integer, so it cannot be too large
+            to return. That is what separates "no matches" from "too many to
+            fetch" -- at scale a row query can come back empty, and an empty
+            result that might mean either is worse than no tool at all.
+          - SCOPE WHERE POSSIBLE. `page_uuid` binds the scan to one page's
+            blocks before the predicate runs.
+
+        MATCHING IS CASE-SENSITIVE and substring-only. Case folding would mean
+        a second predicate over every title, and the point of this tool is to
+        find an exact misspelling. `regex` refines what the substring already
+        matched, in Python -- it does not widen the search, and cannot be used
+        alone, because a regex has no cheap form in the query.
+
+        Anything carrying `:block/title` matches, which includes pages, tags
+        and property definitions as well as blocks. Each row says which it is
+        rather than filtering them out: a typo in a page title is exactly as
+        worth finding.
+        """
+        if not isinstance(text, str) or len(text.strip()) < MIN_SEARCH_TEXT:
+            raise ValueError(
+                f"Search text must be at least {MIN_SEARCH_TEXT} characters. "
+                "A shorter string scans the whole graph to match almost "
+                "everything.")
+        if not isinstance(limit, int) or not 1 <= limit <= MAX_SEARCH_ROWS:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_SEARCH_ROWS}")
+
+        pattern = None
+        if regex is not None:
+            try:
+                pattern = re.compile(regex)
+            except re.error as error:
+                raise ValueError(f"regex is not valid: {error}") from error
+
+        needle = text.strip()
+        scope, params = "", []
+        if page_uuid is not None:
+            page_uuid = self._require_entity(self._validated_uuid(page_uuid))
+            page = await self._page_by_uuid(page_uuid)
+            scope = "[?block :block/page ?page] "
+            params = [page["id"]]
+        where = (
+            (":in $ ?page :where " if params else ":where ")
+            + scope
+            + "[?block :block/title ?title] "
+            f"[(clojure.string/includes? ?title {json.dumps(needle)})]"
+        )
+
+        matches = await self._client.call(
+            "logseq.DB.datascriptQuery",
+            [f"[:find (count ?block) . {where}]", *params])
+        matches = matches if isinstance(matches, int) else 0
+
+        if matches == 0:
+            return {
+                "text": needle,
+                "matches": 0,
+                "returned": 0,
+                "truncated": False,
+                "results": [],
+                "diagnostic": (
+                    "No entity title contains this string. This is a "
+                    "definite zero: it comes from a count, not from an empty "
+                    "row set, so it does not mean the result was too large. "
+                    "Matching is case-sensitive and substring-only."),
+            }
+
+        if matches > MAX_SEARCH_ROWS:
+            return {
+                "text": needle,
+                "matches": matches,
+                "returned": 0,
+                "truncated": True,
+                "results": [],
+                "diagnostic": (
+                    f"{matches} entities match, more than the "
+                    f"{MAX_SEARCH_ROWS} this will fetch. Nothing was read "
+                    "back: a response that large risks the byte cap, and a "
+                    "truncated row set would not say which matches were "
+                    "dropped. Narrow the search with a longer string or scope "
+                    "it with page_uuid."),
+            }
+
+        rows = await self._query_list(
+            "[:find [(pull ?block [:db/id :block/uuid :block/title "
+            ":block/order :block/name :db/ident "
+            "{:block/page [:block/uuid :block/title]}]) ...] "
+            f"{where}]",
+            "Block search", *params)
+
+        results = [self._search_row(r) for r in rows if isinstance(r, dict)]
+        if pattern is not None:
+            results = [r for r in results
+                       if pattern.search(r["title"] or "")]
+        refined = len(results)
+        results = results[:limit]
+
+        diagnostic = (
+            f"{matches} match(es); {len(results)} returned."
+            " Matching is case-sensitive and substring-only.")
+        if pattern is not None:
+            diagnostic = (
+                f"{matches} substring match(es), {refined} of which also "
+                f"matched the regex; {len(results)} returned. The regex "
+                "refined the substring result in Python -- it did not widen "
+                "the search.")
+        if refined > len(results):
+            diagnostic += (
+                f" {refined - len(results)} further match(es) were not "
+                "returned; raise limit or narrow the search.")
+
+        return {
+            "text": needle,
+            "matches": matches,
+            "returned": len(results),
+            "truncated": refined > len(results),
+            "results": results,
+            "diagnostic": diagnostic,
+        }
+
+    @staticmethod
+    def _search_row(entity: dict[str, Any]) -> dict[str, Any]:
+        """One match, terse: enough to edit it or read its page, no more."""
+        page = entity.get("page") if isinstance(entity.get("page"), dict) else {}
+        kind = ("page" if entity.get("name")
+                else "definition" if entity.get("ident")
+                else "block")
+        return {
+            "uuid": entity.get("uuid"),
+            "kind": kind,
+            "title": entity.get("title"),
+            "order": entity.get("order"),
+            "page": {"uuid": page.get("uuid"), "title": page.get("title")}
+                    if page else None,
+        }
 
     async def get_page(
         self, page_uuid: str, detail: str = "page"

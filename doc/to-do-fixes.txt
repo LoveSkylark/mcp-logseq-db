@@ -5,25 +5,6 @@ Ordered so each instruction is independently shippable. Phase 1 is cheap and saf
 Every item traces to something that actually cost us in this session, noted under *Evidence*.
 
 
-
----
-
-### Instruction 8 — `searchBlocks(text, page_uuid?, limit?)`
-
-**Signature:** substring or regex match over block titles; return `{uuid, page, title, order}`.
-
-**Why:** there is no way to find a string in the graph.
-
-**Addresses:** I logged a dozen block-level typos — `Opions`, `Agressive`, `Advanatage`, `Benifit`, `Initive`, `fufill`, `Campaing`, `Sesion Zero`, `Eqipment`, a stray `麻木` mid-sentence — and then could not fix them, because locating them again meant re-reading whole pages whose content had aged out of my context. The tool that could edit them existed; the tool to find them didn't.
-
-**Works with:** typo sweeps, duplicate-content detection, provenance checks (finding the DC20 and *Righteous Blood* material), and verifying an import matched its source.
-
-**Implementation:** Datascript predicate over `:block/title`. Return terse rows, not full entities.
-
-**Concerns:** predicates run in Logseq's DB worker and can wedge it, per your own troubleshooting notes — so single-attempt, no retry, and a mandatory `limit`. A large result set can also silently return `[]` at scale; return a count alongside results so the caller can tell "no matches" from "too many".
-
-**Done when:** `searchBlocks("Opions")` returns the block and its page in one call.
-
 ---
 
 ### Instruction 9 — `importPage` multi-line blocks

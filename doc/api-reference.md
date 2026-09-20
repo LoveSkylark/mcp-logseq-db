@@ -205,6 +205,7 @@ which is what removed the read-back cycle from outline building.
 | Tool | Route | Status |
 | --- | --- | --- |
 | `getBlockUUID(page_uuid)` | `datascriptQuery` | verified |
+| `searchBlocks(text, ...)` | `datascriptQuery` | verified; predicate query |
 | `getBlock(uuid)` | `getBlock` | **verified** |
 | `getBlockTree(uuid)` | `datascriptQuery` | verified |
 | `createBlock(parent, title)` | `insertBlock` | **verified, nesting included** |
@@ -288,6 +289,49 @@ same reason: nothing has to identify a new block by its title.
 
 It is not atomic. A failure at the third level leaves the first two committed;
 the error names the level that stopped.
+
+---
+
+### Searching
+
+The only predicate query in the tool surface. Predicates run inside Logseq's
+DB worker and are the shape known to be able to wedge it, so this is
+single-attempt — `datascriptQuery` is already in the client's no-retry set,
+because a query that timed out once will time out again and a second scan
+doubles the load on a worker that may already be struggling.
+
+The count comes first, as its own query. One integer cannot be too large to
+return, which is what distinguishes "nothing matched" from "the row set was
+too big to send" — the latter can come back as an empty result, and an empty
+result meaning either would be worse than no tool at all.
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find (count ?block) . :where [?block :block/title ?title] [(clojure.string/includes? ?title \"$TEXT\")]]"]}
+```
+
+Only then the rows, and only when the count is within the ceiling:
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?block [:db/id :block/uuid :block/title :block/order :block/name :db/ident {:block/page [:block/uuid :block/title]}]) ...] :where [?block :block/title ?title] [(clojure.string/includes? ?title \"$TEXT\")]]"]}
+```
+
+Scoping binds the page before the predicate runs, which is the cheapest way to
+make this safe:
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find (count ?block) . :in $ ?page :where [?block :block/page ?page] [?block :block/title ?title] [(clojure.string/includes? ?title \"$TEXT\")]]", 846]}
+```
+
+The needle is emitted with `json.dumps`, so quotes, backslashes and non-Latin
+characters all survive as a valid EDN string literal. `clojure.string/includes?`
+is case-SENSITIVE and there is no folding: case-insensitive matching would
+mean a second predicate over every title in the graph.
+
+A pull rather than bound variables, because `:block/order` is missing on some
+entities and a datalog join would silently drop every row lacking it. The
+pattern includes `:block/name` and `:db/ident` so each row can say whether it
+is a block, a page, or a tag or property definition — all of them carry
+`:block/title` and all of them match.
 
 ---
 

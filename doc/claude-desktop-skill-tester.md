@@ -202,6 +202,28 @@ tools — which makes this the most consequential suite in the spec.
 | T-214 | `createPageofBlocks` where one level fails | **Batches are not atomic.** Earlier levels stay committed. Confirm the result names the failing level and does not imply a clean rollback. |
 | T-215 | `findOrphans` after T-214 | Reports what was left, so the partial write is auditable |
 
+### Searching
+
+The riskiest suite in this spec: `searchBlocks` is the only tool that runs a
+predicate in front of every title in the graph. **If a trivial read times out
+after any of these, stop, restart Logseq, and record which search provoked
+it** — that finding is worth more than the rest of the suite.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-230 | `searchBlocks` for a string you know exists in one block | One match, with its uuid and page. Confirm the page is right with `getBlock`. |
+| T-231 | `searchBlocks` for a string that exists nowhere | `matches: 0`, `truncated: false`, diagnostic calls it a definite zero |
+| T-232 | The same string with different capitalisation | `matches: 0`. Matching is case-sensitive by design. |
+| T-233 | A common word such as "the" | Either a count with rows, or a count with `results: []` and `truncated: true` above the ceiling. **Record the count and the elapsed time** — this is the worst case for the predicate. |
+| T-234 | The same search with `page_uuid` set | Far fewer matches, and noticeably faster: scoping binds the page before the predicate runs. |
+| T-235 | A string containing a quote, e.g. `"Session Zero"` | Matches, or a clean zero. **It must not fail with `FST_ERR_CTP_INVALID_JSON_BODY`** — the needle is escaped, and this is the test for that. |
+| T-236 | A non-Latin string | Matches. Records whether EDN `\uXXXX` escapes resolve on this build. |
+| T-237 | A string that appears in a PAGE title | Matched, with `kind: page` and `page: null`. Pages carry `:block/title` too. |
+| T-238 | `regex` alongside `text` | Refines the substring rows; `matches` still reports the substring count and `returned` the smaller number |
+| T-239 | `limit` below the match count | `truncated: true`, and the diagnostic says how many were withheld |
+| T-240 | A one-character search | Refused before any query |
+| T-241 | End-to-end: find a real typo, then `updateBlock` it from the returned uuid | Fixed in two calls, with no page re-read. This is the workflow the tool exists for. |
+
 ### Moving
 
 `moveBlock` is **confirmed working on every placement**, including across

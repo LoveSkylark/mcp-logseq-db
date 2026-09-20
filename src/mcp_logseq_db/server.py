@@ -286,6 +286,20 @@ def create_server(
             page_uuid, role="page_uuid", hint="getPageUUID")
         return await content().find_orphans(page_uuid)
 
+    @server.tool(name="searchBlocks", structured_output=True)
+    async def search_blocks(
+        text: str,
+        page_uuid: str | None = None,
+        regex: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Find every entity whose title contains a string -- the way to locate a typo, a phrase, or duplicated content without re-reading whole pages. Returns terse rows: uuid, kind, title, order, and the page each sits on, which is what updateBlock needs. MATCHING IS CASE-SENSITIVE and substring-only; regex refines those rows afterwards rather than widening the search. matches is counted separately from the rows returned, so zero means genuinely nothing found rather than a result set too large to send -- and when there are more matches than can safely be fetched, it reports the count and fetches nothing rather than returning a silently truncated list. Scope with page_uuid where you can: this runs a predicate inside Logseq's DB worker, which is the one query shape known to be able to wedge it, so it is single-attempt and never retried. Pages, tags and property definitions carry titles too and will match; each row says which kind it is."""
+        if page_uuid is not None:
+            page_uuid = require_uuid(
+                page_uuid, role="page_uuid", hint="getPageUUID")
+        return await content().search_blocks(
+            text, page_uuid=page_uuid, regex=regex, limit=limit)
+
     @server.tool(name="getBlockTree", structured_output=True)
     async def get_block_tree(
         block_uuid: str, max_depth: int = 20, max_nodes: int = 1000
@@ -685,6 +699,11 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
         ),
         "get_block_uuid": "Pass an exact page UUID, not a block UUID.",
         "get_block": "Pass an exact block UUID.",
+        "search_blocks": (
+            "Pass at least two characters. Scope with page_uuid when you "
+            "can, and use a longer string rather than a bigger limit when "
+            "there are too many matches."
+        ),
         "get_block_tree": (
             "Pass an exact block UUID, max_depth 0-100, max_nodes 1-1000."
         ),

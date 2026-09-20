@@ -24,6 +24,8 @@ being accepted.
 | A user says content is missing from a page | Check the page in the Logseq UI before believing any count. | A count disagreement is not evidence of missing content. Confirm the symptom first. |
 | A tool call returns "no result received after 4 minutes" | The client stopped waiting; the server usually kept working and committed. | Do not retry blindly. Re-read state to see what landed. Bulk operations need a batch limit so each call returns in time. |
 | A large query returns `[]` when a `(count …)` of the same clauses returns thousands | Almost always a MALFORMED query, not size. An inline `#uuid "…"` or a quoted string inside the query text breaks the JSON body, and the failure looks like an empty result. | Pass strings and UUIDs as `:in` parameters instead of inlining them. Confirm the query runs at all with a `(count …)` form first. |
+| `searchBlocks` returns `matches: 0` | A real zero. The count is its own query, run before any rows, so this is not the empty-result-means-too-large case above. | Check the case — matching is case-sensitive — and the exact spelling of the string. |
+| `searchBlocks` returns a count but `results: []` and `truncated: true` | More matches than it will fetch. Deliberate: a truncated row set would not say which matches were dropped. | Narrow the string or pass `page_uuid`. Raising `limit` will not help past the ceiling. |
 | Every write fails with "The Imported EDN has N validation error(s)" while the dry run succeeds | `upsertNodes` fails on SYNCED graphs. Nothing in this server routes through it any more; if you see this, something is calling it directly. | Not a graph fault and not repairable from here. `createPage`, `insertBlock`, `updateBlock` and `createTag` all work on the same graph. |
 | A write works in the Logseq UI but fails through a tool | The method that tool routes through is failing, not the graph. | Try a tool that uses a different route before concluding anything about the data. |
 
@@ -78,6 +80,13 @@ Datascript predicates run inside Logseq's DB worker, so an expensive query can
 wedge the worker while the MCP process stays healthy. Queries are
 single-attempt for that reason: a query that timed out once will time out
 again, and retrying doubles the load on something already struggling.
+
+**`searchBlocks` is the one tool that puts a predicate in front of every
+title in the graph**, so it is the most likely to provoke this. Scope it with
+`page_uuid` when you can, and if the graph stops responding after a search,
+the worker is the first thing to suspect — restart Logseq, not just the MCP.
+Do not loop it over a list of words without checking the graph is still
+answering in between.
 
 If a trivial read also times out afterwards, the worker is wedged. Restart
 Logseq.

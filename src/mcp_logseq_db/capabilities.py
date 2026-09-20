@@ -110,6 +110,7 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "repairLinks":          ("logseq.DB.updateBlock",
                              "logseq.DB.datascriptQuery"),
     "getBlock":             ("logseq.DB.getBlock",),
+    "searchBlocks":         ("logseq.DB.datascriptQuery",),
     "getBlockTree":         ("logseq.DB.datascriptQuery",),
     "createBlock":          ("logseq.DB.insertBlock",),
     "updateBlock":          ("logseq.DB.updateBlock",),
@@ -298,6 +299,19 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "The detail selector matters: a page's own tags and its blocks' tags "
         "are different queries, and properties that are declared but unset "
         "appear in neither.",
+    ),
+    "searchBlocks": (
+        "The only tool that runs a PREDICATE inside Logseq's DB worker, which "
+        "is the query shape known to be able to wedge it. Single-attempt, "
+        "never retried, and worth scoping with page_uuid.",
+        "The count is a separate query from the rows, so 0 means genuinely no "
+        "match rather than a result set too large to return. Above 500 "
+        "matches it reports the count and fetches nothing rather than "
+        "returning a silently truncated list.",
+        "Case-sensitive, substring only. regex refines the rows afterwards in "
+        "Python and cannot widen the search.",
+        "Anything with :block/title matches, so pages, tags and property "
+        "definitions appear alongside blocks; each row reports its kind.",
     ),
     "getBlockTree": (
         "Walks :block/parent, so a block whose :block/page disagrees still "

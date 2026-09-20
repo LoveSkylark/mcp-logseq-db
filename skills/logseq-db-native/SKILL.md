@@ -148,6 +148,23 @@ after and compares the gain against the markdown, which is immune to seed
 blocks and to whatever the page already held. An absolute comparison on an
 append cannot distinguish a successful import from a silent no-op.
 
+**To find a string, use `searchBlocks`.** Do not re-read pages looking for
+text. It returns uuid, kind, title, order and page per match — everything
+`updateBlock` needs to fix a typo in place. Three things to hold in mind:
+
+- **Case-sensitive, substring only.** `searchBlocks("Benifit")` will not find
+  `benifit`. Search the exact string you saw.
+- **`matches: 0` is a real zero**, counted separately from the rows, so it
+  does not mean "too many to return". Above 500 matches it reports the count
+  and fetches nothing; narrow the string or pass `page_uuid` rather than
+  raising `limit`.
+- **It is the one tool that runs a predicate in Logseq's DB worker**, which
+  can wedge it. Scope with `page_uuid` where you can, and do not loop it over
+  a word list without pausing to check the graph is still responding.
+
+`regex` refines what the substring already matched; it cannot widen the
+search, and there is no regex-only mode.
+
 ## Cost lives at the tool boundary
 
 What costs you is what crosses in and out — arguments and results — not the
@@ -548,9 +565,9 @@ at the first block that does not verify, and reports which UUIDs landed.
 ## Tools
 
 **Reads** — `capabilities`, `getPageUUID`, `isTitleAvailable`, `inspectPage`,
-`pageStats`, `getBlockUUID`, `getBlock`, `getBlockTree`, `findBacklinks`,
-`findOrphans`, `getTagUUID`, `getTag`, `getTagUsers`, `getPropertyIndent`,
-`getProperyUsers`
+`pageStats`, `getBlockUUID`, `getBlock`, `searchBlocks`, `getBlockTree`,
+`findBacklinks`, `findOrphans`, `getTagUUID`, `getTag`, `getTagUsers`,
+`getPropertyIndent`, `getProperyUsers`
 
 **Lists** — `listPages`, `listJournals`, `listTags`,
 `listProperties`, `listClosedValues`, `listOrphanTags`,

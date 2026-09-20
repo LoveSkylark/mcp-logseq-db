@@ -186,6 +186,18 @@ class FakeClient:
         self.graph.entities[block_uuid] = {**current, "title": title}
         return None
 
+    def _with_page_titles(self, entity):
+        """Resolve `{:block/page [...]}` to the pulled shape the row builder
+        reads, rather than the bare `{"id": n}` the graph stores."""
+        copy = dict(entity)
+        page_id = (entity.get("page") or {}).get("id")
+        page = self.graph.by_id(page_id) if page_id is not None else None
+        if page is not None:
+            copy["page"] = {"uuid": page["uuid"], "title": page.get("title")}
+        else:
+            copy.pop("page", None)
+        return copy
+
     def _with_parent_chain(self, entity):
         """Attach the ancestor chain, as a recursive parent pull returns it.
         The subtree guards in move_blocks are set tests over this rather than
@@ -352,6 +364,23 @@ class FakeClient:
                     if target in wanted:
                         rows[target] = rows.get(target, 0) + 1
             return [[target, n] for target, n in rows.items()]
+        if "clojure.string/includes? ?title" in query:
+            # The search predicate. Modelled faithfully in two respects that
+            # the tool's contract rests on: matching is case-SENSITIVE, and
+            # the scan covers every entity carrying :block/title, so pages
+            # and definitions match alongside blocks.
+            needle = json.loads(
+                query.split("includes? ?title ")[1].split(")]")[0])
+            scope = params[0] if ":in $ ?page" in query else None
+            hits = [
+                e for e in self.graph.entities.values()
+                if needle in str(e.get("title") or "")
+                and (scope is None
+                     or (e.get("page") or {}).get("id") == scope)
+            ]
+            if "(count ?block)" in query:
+                return len(hits)
+            return [self._with_page_titles(e) for e in hits]
         if "(or [?e :block/uuid" in query:
             # The bulk read: many UUIDs in one query, since a uuid cannot be
             # bound as a parameter. Each entity comes back with its whole
@@ -1791,6 +1820,163 @@ async def test_the_subtree_of_a_moved_block_follows_it(graph, content):
 
     assert result["verified"] is True
     assert result["stranded_descendants"] == []
+
+
+# ----------------------------------------------------------- searching
+#
+# There was no way to find a string in the graph, so a typo noticed while
+# reading could not be located again once the page left context. The tool to
+# fix it existed; the tool to find it did not.
+#
+# The predicate runs in Logseq's DB worker, which is the one query shape known
+# to be able to wedge it -- hence the count-first design and the refusal to
+# fetch an unbounded row set.
+
+async def test_a_typo_is_found_with_its_page_in_one_call(graph, content):
+    """The acceptance case."""
+    block = graph.add("He weighed his Opions carefully",
+                      graph.page["id"], graph.page["id"])
+
+    found = await content.search_blocks("Opions")
+
+    assert found["matches"] == 1
+    assert found["returned"] == 1
+    row = found["results"][0]
+    assert row["uuid"] == block["uuid"]
+    assert row["kind"] == "block"
+    assert row["page"]["title"] == "TEST-PAGE"
+    assert "Opions" in row["title"]
+
+
+async def test_no_match_is_a_definite_zero(graph, content):
+    """The distinction the count exists for: an empty row set could mean the
+    result was too large, but a count of 0 cannot."""
+    found = await content.search_blocks("Nothingcontainsthis")
+
+    assert found["matches"] == 0
+    assert found["results"] == []
+    assert found["truncated"] is False
+    assert "definite zero" in found["diagnostic"]
+
+
+async def test_a_huge_match_set_is_counted_not_fetched(graph):
+    """Above the ceiling it reports the count and reads nothing. A truncated
+    row set would not say which matches were dropped, and a response big
+    enough to hit the byte cap is indistinguishable from finding nothing."""
+    class ManyMatchesClient(FakeClient):
+        def _query(self, query, params):
+            if "(count ?block)" in query:
+                return 5000
+            raise AssertionError("rows must not be fetched above the ceiling")
+
+    verified = VerifiedContent(ManyMatchesClient(graph))  # type: ignore[arg-type]
+
+    found = await verified.search_blocks("the")
+
+    assert found["matches"] == 5000
+    assert found["returned"] == 0
+    assert found["truncated"] is True
+    assert "Narrow the search" in found["diagnostic"]
+
+
+async def test_search_is_scoped_to_a_page_when_asked(graph, content):
+    elsewhere = graph.add("OTHER", None, None, name="other",
+                          tags=[PAGE_CLASS_ID])
+    graph.add("Agressive stance", graph.page["id"], graph.page["id"])
+    graph.add("Agressive again", elsewhere["id"], elsewhere["id"])
+
+    everywhere = await content.search_blocks("Agressive")
+    scoped = await content.search_blocks(
+        "Agressive", page_uuid=elsewhere["uuid"])
+
+    assert everywhere["matches"] == 2
+    assert scoped["matches"] == 1
+    assert scoped["results"][0]["title"] == "Agressive again"
+
+
+async def test_matching_is_case_sensitive(graph, content):
+    """Pinned as a deliberate limitation: case folding would mean a second
+    predicate over every title, and an exact misspelling is the target."""
+    graph.add("Benifit of the doubt", graph.page["id"], graph.page["id"])
+
+    assert (await content.search_blocks("Benifit"))["matches"] == 1
+    assert (await content.search_blocks("benifit"))["matches"] == 0
+
+
+async def test_non_latin_text_is_found(graph, content):
+    """A stray 麻木 mid-sentence was one of the things that could not be found
+    again. The needle goes through json.dumps, so it survives as an EDN string
+    literal whatever it contains."""
+    graph.add("the road was 麻木 and long",
+              graph.page["id"], graph.page["id"])
+
+    found = await content.search_blocks("麻木")
+
+    assert found["matches"] == 1
+
+
+async def test_a_quote_in_the_search_text_does_not_break_the_query(
+        graph, content):
+    graph.add('he said "Sesion Zero" twice', graph.page["id"],
+              graph.page["id"])
+
+    found = await content.search_blocks('"Sesion Zero"')
+
+    assert found["matches"] == 1
+
+
+async def test_a_page_title_typo_is_reported_as_a_page(graph, content):
+    graph.add("Campaing Notes", None, None, name="campaing notes",
+              tags=[PAGE_CLASS_ID])
+
+    found = await content.search_blocks("Campaing")
+
+    assert found["results"][0]["kind"] == "page"
+    assert found["results"][0]["page"] is None
+
+
+async def test_regex_refines_rather_than_widens(graph, content):
+    graph.add("Initive order 3", graph.page["id"], graph.page["id"])
+    graph.add("Initive order twelve", graph.page["id"], graph.page["id"])
+
+    found = await content.search_blocks("Initive", regex=r"\d+$")
+
+    assert found["matches"] == 2          # what the substring matched
+    assert found["returned"] == 1         # what the regex kept
+    assert found["results"][0]["title"] == "Initive order 3"
+    assert "did not widen" in found["diagnostic"]
+
+
+async def test_limit_truncates_and_says_so(graph, content):
+    for n in range(6):
+        graph.add(f"fufill {n}", graph.page["id"], graph.page["id"])
+
+    found = await content.search_blocks("fufill", limit=2)
+
+    assert found["matches"] == 6
+    assert found["returned"] == 2
+    assert found["truncated"] is True
+    assert "raise limit" in found["diagnostic"]
+
+
+async def test_a_too_short_search_is_refused(content):
+    with pytest.raises(ValueError, match="at least 2 characters"):
+        await content.search_blocks("a")
+
+
+async def test_an_invalid_regex_is_refused_before_querying(graph):
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="regex is not valid"):
+        await verified.search_blocks("Eqipment", regex="(unclosed")
+
+    assert client.calls == []
+
+
+async def test_an_absurd_limit_is_refused(content):
+    with pytest.raises(ValueError, match="limit must be between"):
+        await content.search_blocks("Advanatage", limit=10_000)
 
 
 # --------------------------------------------- outline is the batching path

@@ -24,8 +24,8 @@ still true.
 **Reads**
 
 `capabilities` · `getPageUUID` · `isTitleAvailable` · `inspectPage` ·
-`pageStats` · `getBlockUUID` · `getBlock` · `getBlockTree` · `findBacklinks` ·
-`findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
+`pageStats` · `getBlockUUID` · `getBlock` · `searchBlocks` · `getBlockTree` ·
+`findBacklinks` · `findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
 `getPropertyIndent` · `getProperyUsers`
 
 **Lists** — each returns a whole kind; the two page listings take
@@ -50,6 +50,17 @@ between. The same applies to `addProperty`.
 `getBlockTree` reads one block's subtree and reports `truncated` when a bound
 stopped it; like `getBlockUUID` it walks `:block/parent`, so a block whose
 `:block/page` disagrees still appears.
+
+`searchBlocks(text)` finds a string anywhere in the graph and returns terse
+rows — uuid, kind, title, order, page — which is what `updateBlock` needs. It
+is the only tool that runs a **predicate** inside Logseq's DB worker, the one
+query shape known to be able to wedge it, so it is single-attempt, never
+retried, and worth scoping with `page_uuid`. Two details that matter in use:
+matching is **case-sensitive** and substring-only, and the match count is a
+separate query from the rows, so `matches: 0` means genuinely nothing found
+rather than a result set too large to send. Above 500 matches it reports the
+count and fetches nothing, because a silently truncated list would not say
+which matches were dropped.
 
 `inspectPage` takes a `detail` selector: `page`, `blocks`, `tags`,
 `properties`, `declared`, or `all`. These are not interchangeable. A page's own
