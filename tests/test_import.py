@@ -476,13 +476,16 @@ async def test_a_bullet_line_inside_a_block_is_refused(graph, importer):
     """Refused rather than sent, because Logseq would truncate the block
     there and report success. Eight lines sent, two stored, verified true --
     that happened, and it is the failure this server exists to prevent."""
-    with pytest.raises(ValueError, match="truncates a block") as caught:
+    with pytest.raises(ValueError, match="truncates the block") as caught:
         await importer.import_page(
             graph.page["uuid"], [DASH_INSIDE_BLOCK])
 
-    # The message has to say what to do instead, since the content is valid
-    # and the caller has no other way to know.
-    assert "Split it into separate blocks" in str(caught.value)
+    # The message has to name the offending line and say what to do instead,
+    # since the content is valid and the caller has no other way to know.
+    message = str(caught.value)
+    assert "block 1" in message
+    assert "3a. On a tie" in message
+    assert "split it into separate blocks" in message
     assert graph.children(graph.page["id"]) == []
 
 
