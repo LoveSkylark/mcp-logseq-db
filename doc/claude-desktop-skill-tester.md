@@ -264,6 +264,47 @@ reversed this way before anyone looked.
 | T-228 | `last-child` on a block that is already the last child | `verified: true` with "no move was needed", and **no `moveBlock` call is issued** — the state was read, not written. Distinguish this from T-222. |
 | T-229 | `last-child` where the block lands under the right parent but not last | `verified: false`, diagnostic gives its position. Hard to provoke deliberately; if it happens, it is a real finding about the route. |
 
+#### Bulk moving
+
+`moveBlocks` is the bulk write for a flat run of siblings. It is **not
+atomic** and it **stops** at the first block that does not verify, so what
+these tests ask is whether a partial result is legible — not just whether the
+happy path works.
+
+Build a fixture page with ten numbered sibling blocks (`Para 01` … `Para 10`)
+and a second empty destination page. Verify every outcome by reading
+`:block/order` at the destination, never from the envelopes.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-242 | **Acceptance.** Move all ten to the empty destination, `placement=last-child` | All ten arrive in source order. `summary` reads `requested: 10, attempted: 10, landed: 10, failed: 0`, and `order_preserved: true`. |
+| T-243 | Count the API calls T-242 made | Roughly two per block plus a fixed handful. If it is nearer eight per block the hoisting has regressed and a large chapter will time out. |
+| T-244 | Move five more into the same destination with `last-child` | They append AFTER the ten already there; the first ten keep their order |
+| T-245 | The same five with `placement=child` | The run lands at the TOP of the destination, still internally in order |
+| T-246 | Move a run to a block target rather than a page | Every block's `:block/parent` is the target and `:block/page` is the target's page |
+| T-247 | Move a run where one block has descendants | Descendants follow; `stranded_descendants` is empty. A stranded descendant is a real child no page-scoped query can see. |
+| T-248 | Pass the same UUID twice | Refused before any write |
+| T-249 | Pass a parent and one of its own children in the same list | Refused before any write. A move carries the subtree, so the second move would pull the child back out. |
+| T-250 | Pass a target that sits inside one of the blocks' subtrees | Refused before any write |
+| T-251 | Pass 55 blocks | `attempted: 50`, `not_attempted: 5`, `verified: false`, and the five come back **in order**. Then pass those five in a second call with `last-child` and confirm they append correctly — that is the paging contract. |
+| T-252 | `all_or_nothing: true` on a run you can make fail part-way | `rolled_back` lists the landed blocks, and the diagnostic says **POSITION WAS NOT RESTORED**. Confirm in the UI that they are back under the original parent but grouped at its top. Hard to provoke; if you cannot, record it as unconstructable rather than as a pass. |
+
+### Importing
+
+| ID | Test | Expected |
+|---|---|---|
+| T-260 | `importPage` with a markdown STRING, nested | Tree correct, `blocks` matches, references escaped to `{{link:X}}` |
+| T-261 | **Acceptance.** `importPage` with a LIST whose second element is an eight-line numbered sequence containing a blank line and a nested `- 3a.` line | ONE block. Read it back and confirm it is byte-exact: the newlines, the blank line and the `- ` line are all content, not structure. |
+| T-262 | The same text as a markdown string | It FRAGMENTS — the `- ` line becomes a separate block. Record it; this is what the list form exists for, and it should stay reproducible. |
+| T-263 | A list with explicit depths `0, 1, 2, 0` | Two roots, one child, one grandchild. Confirm by reading `:block/parent`, not from the count. |
+| T-264 | A list element with `depth: 2` following a `depth: 0` element | Refused. A skipped level is an error here, unlike the string form which flattens and warns. |
+| T-265 | A list containing a fenced code block with indented lines | Stored verbatim, indentation intact |
+| T-266 | A list containing a markdown table | Stored as one block |
+| T-267 | A list element containing `[[Link]]` and `#tag` | Escaped exactly as in the string form. **Confirm no page or tag was minted** — the escaping is not a property of the string parser. |
+| T-268 | A list element that is `"alias:: X"` | Stored as block CONTENT. The list form has no page-property region, so `page_properties` must be empty. |
+| T-269 | An empty or whitespace-only list element | Refused |
+| T-270 | `dry_run: true` on a list | `verified: false`, correct `blocks`, and no `insertBatchBlock` call |
+
 ---
 
 ## Suite 3 — Tags
@@ -318,7 +359,9 @@ refusal are testing the guard, not looking for a workaround.
 | T-501 | `inspectPage detail=declared` on a page tagged `Task` | Status, Priority, Deadline, Scheduled listed as declared |
 | T-502 | Same page, `detail=properties` | Only properties **with values**; declared-but-unset ones absent |
 | T-503 | A page's own tags vs its blocks' tags | `inspectPage detail=tags` covers both; confirm each holder is identified |
-| T-504 | `listClosedValues` | **Expected empty on current builds.** The permitted set is reported by `getAllProperties` as `:property/closed-values`, but no such datom exists — the tool queries the real attribute, `:block/closed-value-property`, which lives on each VALUE pointing back at its property. `Status` reports type `default` with a `:logseq.property/default-value` and no permitted set. Record if that changes. |
+| T-504 | `listClosedValues` | **Returns values — corrected.** This table previously said "expected empty on current builds, no closed-value relationship exists". That was checked live on 2026-09-20 and is wrong: `Status` carries six values (Backlog, Todo, Doing, In Review, Done, Canceled) and `Priority` four (Low, Medium, High, Urgent), exactly as `SKILL.md` claims. Three more enum properties also appear: `:logseq.property.repeat/recur-unit` (6), `:logseq.property.repeat/repeat-type` (3), `:logseq.property.pdf/hl-color` (5) and `:logseq.property.view/type` (3). The attribute is `:block/closed-value-property`, on each VALUE pointing back at its property — `:property/closed-values` is what `getAllProperties` reports and matches nothing. Confirm the counts on this graph and record any difference. |
+| T-505 | `addProperty` on `:logseq.property/status` with one of T-504's value entities | Refused — `:logseq.property/*` is outside the sandbox. This is the guard working, not a closed-value failure. |
+| T-506 | `createProperty` with a closed-value schema of your own | Record whether the schema is accepted and whether `listClosedValues` then reports it. If it is, closed-value ENFORCEMENT becomes testable for the first time: set an allowed value, then a disallowed one, and record both. |
 
 ---
 
@@ -409,9 +452,11 @@ will not resolve, which is exactly the state that misled a repair. Run it.
 `:logseq.property/*` built-in, outside the sandbox. There is no way to set one
 and watch it move from `declared` to `properties`.
 
-**Closed-value enforcement.** No closed-value relationship exists on current
-builds, so "set an allowed value" and "reject a disallowed one" have nothing to
-enforce against.
+**Closed-value enforcement.** Values themselves DO exist — see the corrected
+T-504 — but every property carrying them is a `:logseq.property/*` built-in,
+outside the writable sandbox, so there is nothing writable to enforce against.
+T-506 asks whether a caller-owned closed property can be created at all; if it
+can, this entry is obsolete.
 
 ---
 
@@ -447,6 +492,13 @@ all.
 Within Suite 1, run the alias tests (T-126 to T-132) before anything that
 deletes a page, and construct the alias fixture by hand in the Logseq UI —
 there is no tool that can create one.
+
+Within Suite 2, run Searching (T-230 to T-241) LAST of the three block
+sections, after Moving and Importing. It is the only predicate query in the
+surface and the most likely thing to wedge the worker, so a wedge there costs
+you nothing that has not already run. Bulk moving (T-242 to T-252) needs the
+ten-block fixture built first, and Importing (T-260 to T-270) is the cheapest
+way to build it.
 
 After the run, update `scripts/live_reliability.py` with any assumption that
 turned out to be wrong. It now checks the ones these tools depend on,

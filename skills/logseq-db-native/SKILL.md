@@ -20,7 +20,7 @@ Observed:
 
 | Call | Response | What happened |
 | --- | --- | --- |
-| a page *name* where a parent UUID belongs | `{:block 1}` | nothing created |
+| a page *name* where a parent UUID belongs | the created block | **a block created at the top of that page.** `insertBlock` RESOLVES a page title — confirmed 2026-09-20. It used to write nothing, which is where the "names are inert" rule came from; that was `upsertNodes`, a route nothing uses now. So a mistyped argument no longer fails harmlessly, and the tools' UUID validation is the only thing stopping it. |
 | `removeProperty` given a UUID | `null` | nothing removed |
 | `upsertProperty` with an explicit ident | full entity | ident silently discarded |
 | `removeBlock` given a UUID | `null` | block actually deleted |

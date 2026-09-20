@@ -7,24 +7,6 @@ Every item traces to something that actually cost us in this session, noted unde
 
 ---
 
-### Instruction 9 — `importPage` multi-line blocks
-
-**Signature:** accept `markdown` as `string[]` where each element is one block, or support a `---` / blank-line delimiter.
-
-**Why:** the line-based format cannot express a block containing newlines.
-
-**Addresses:** your 8-step Resolution Sequence is one block with eight embedded newlines. Import would either break it into eight blocks or mangle it, so it needed a `createBlock` fallback mid-import.
-
-**Works with:** any import of real manuscript content — numbered lists, markdown tables, code blocks.
-
-**Implementation:** `createBlock` already accepts embedded newlines and preserves them, so the storage layer is fine. This is purely the input format.
-
-**Concerns:** keep the existing line format working. Indentation-as-structure gets ambiguous with multi-line values, so require explicit depth in the array form rather than inferring it.
-
-**Done when:** an 8-line numbered list imports as one block.
-
----
-
 ## Phase 3 — Valuable, but verify upstream first
 
 ### Instruction 10 — `purgeRecycled(uuid)` and `restorePage(uuid)` **[pair]**

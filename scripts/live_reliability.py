@@ -18,6 +18,7 @@ was of this kind:
     property writes were assumed unrestricted; they are namespaced
     a success response was treated as evidence; it is not
     upsertNodes was assumed to work everywhere; it fails on synced graphs
+    a page NAME was assumed never to resolve; insertBlock resolves one
 
 A contract check that starts failing means Logseq changed, or we were wrong.
 Either way the fakes are now lying and the code needs revisiting.
@@ -324,19 +325,44 @@ async def writes(client: LogseqDBClient, settings: Settings) -> None:
         fail("insertBatchBlock returns one entity per requested block",
              f"asked for 2, got {len(batch_uuids)}")
 
-    # A name where a uuid belongs: success, and nothing written. This is the
-    # failure mode the whole verification layer exists for.
+    # A name where a uuid belongs. THE BELIEF THIS CHECKED WAS WRONG, and it
+    # was wrong about the route rather than the behaviour: "names never
+    # resolve" was established against `upsertNodes`, whose `page-id` field
+    # silently ignored a page name. Block creation moved to `insertBlock` and
+    # nobody re-tested it. Observed 2026-09-20 on
+    # 2.0.1-alpha+nightly.20260826: insertBlock RESOLVES a page title and
+    # creates a top-level block on that page.
+    #
+    # Neither outcome is a fault, so this records which one holds rather than
+    # failing. What matters is that the tool surface validates UUIDs at the
+    # boundary -- `create_block` calls `_validated_uuid`, so a name never
+    # reaches this method through a tool. That guard used to be belt and
+    # braces; now it is the only thing between a mistyped argument and a
+    # block created somewhere nobody asked for.
     await client.call(
-        "logseq.DB.insertBlock", [title, "should not exist", {"sibling": False}])
-    stray = await client.call("logseq.DB.datascriptQuery", [
-        '[:find (count ?block) . :where '
-        '[?block :block/title "should not exist"]]'])
-    if not stray:
-        ok("a page NAME as the parent still fails silently",
-            "reported success, wrote nothing")
+        "logseq.DB.insertBlock", [title, "name resolution probe",
+                                  {"sibling": False}])
+    landed = await client.call("logseq.DB.datascriptQuery", [
+        "[:find [(pull ?block [:db/id :block/uuid "
+        "{:block/page [:db/id]} {:block/parent [:db/id]}]) ...] "
+        ':where [?block :block/title "name resolution probe"]]']) or []
+    on_this_page = [
+        b for b in landed
+        if isinstance(b, dict)
+        and (b.get("page") or {}).get("id") == page_id
+    ]
+    if not landed:
+        ok("a page NAME as the parent writes nothing",
+           "the pre-2026 behaviour; the boundary guard is belt and braces")
+    elif on_this_page:
+        ok("a page NAME as the parent RESOLVES to the page",
+           f"{len(on_this_page)} block(s) created -- insertBlock accepts a "
+           "title where upsertNodes ignored one, so boundary UUID validation "
+           "is load-bearing")
     else:
-        fail("a page NAME as the parent still fails silently",
-             "it created a block -- names may now resolve")
+        fail("a page NAME as the parent lands somewhere predictable",
+             f"{len(landed)} block(s) were created but none on this page; "
+             "the name resolved to something else entirely")
 
     # Moving, which this file once recorded as having no route at all.
     if nested_uuid and batch_uuids:

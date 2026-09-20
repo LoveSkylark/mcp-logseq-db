@@ -19,7 +19,7 @@ Observed cases:
 
 | Call | Response | What happened |
 |---|---|---|
-| `upsertNodes` with `page-id` set to a page *name* | `{:block 1}` | nothing created |
+| `upsertNodes` with `page-id` set to a page *name* | `{:block 1}` | nothing created — but see §4: `insertBlock` RESOLVES a name |
 | `removeProperty` with a UUID | `null` | nothing removed |
 | `upsertProperty` with an explicit `ident` | full entity | ident silently discarded |
 | `removeBlock` with a UUID | `null` | block actually deleted |
@@ -203,10 +203,18 @@ Each entity kind has one canonical key. Passing the wrong one fails silently.
 | property | `:db/ident` | UUID fails silently |
 | `:db/id` | queries only | integers are not stable across rebuilds; never persist |
 
-**Names are never identifiers.** No argument resolves page names —
-`upsertNodes`'s `page-id` notably looked as if it might. `removeProperty` does
-not accept a title. Name lookup is a separate, explicit resolution step that
-must return exactly one match or fail.
+**Names are not identifiers, but they are no longer inert.** The rule held
+for `upsertNodes`, whose `page-id` silently ignored a page name — which is
+where "a name fails silently" came from. Block creation moved to
+`insertBlock` and nobody re-tested it: observed 2026-09-20 on
+`2.0.1-alpha+nightly.20260826`, `insertBlock` RESOLVES a page title and
+creates a top-level block on that page. `removeProperty` still does not take a
+title. Name lookup is still a separate, explicit resolution step that must
+return exactly one match or fail — and because a name can now land a write
+somewhere plausible rather than nowhere, the boundary UUID check is
+load-bearing rather than belt and braces. A page title passed where a block
+UUID belongs used to do nothing; now it creates a block at the top of that
+page.
 
 The MCP surface accepts UUIDs uniformly and resolves internally to whatever
 each route requires. Callers should never need to know that properties are
@@ -332,9 +340,10 @@ as live pages. Backlinks to a recycled page are not rewritten.
 the entities it created**, so a parent's UUID is known before its own children
 are inserted. Building an outline is therefore one call per parent that has
 children — not the 2d−1 an earlier version of this section described, which
-assumed creation returned nothing and names did not resolve. The second half of
-that assumption still holds: names do not resolve, which is why the returned
-entities matter.
+assumed creation returned nothing and names did not resolve. Creation
+returning entities is what makes it work; the second half of that assumption
+turned out to be false as well, since `insertBlock` does resolve a page name
+(§4) — but the returned entities are what the builder relies on either way.
 
 ---
 
