@@ -90,6 +90,10 @@ MIN_SEARCH_TEXT = 2
 # bounded rather than allowed to crawl a large graph.
 MAX_FUZZY_TITLES = 2000
 
+# Parts one splitBlock call will produce. A delimiter split on a long pasted
+# block can otherwise fan out unboundedly, and each part costs writes.
+MAX_SPLIT_PARTS = 20
+
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
@@ -1485,6 +1489,179 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "content or references. They may be two intentional pages: "
                 "a plural and a singular, or two short words one character "
                 "apart. Read them before assuming otherwise."),
+        }
+
+    @serialized_write
+    async def split_block(
+        self,
+        block_uuid: str,
+        *,
+        offset: int | None = None,
+        delimiter: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Split one block into several, in document order, losing no text.
+
+        The inverse of a merge, which the surface had no way to express:
+        `updateBlock` sets a title and nothing else, so a heading fused onto
+        the tail of a pasted paragraph could not be promoted out of it.
+
+        ORDER OF OPERATIONS IS THE SAFETY PROPERTY. The tails are CREATED
+        FIRST and the original is truncated LAST. So at the worst moment the
+        text exists twice, never zero times: a failure between the steps
+        leaves a duplicate, which is visible and repairable, instead of a
+        truncated paragraph, which is lost prose. This is not atomic and
+        cannot be -- there is no transaction across calls -- so the failure
+        mode is chosen rather than hoped about, and reported with the UUIDs
+        needed to undo it.
+
+        `delimiter` splits on EVERY occurrence, because the case this exists
+        for has several headings trapped in one block and one call should free
+        them all. The delimiter itself is consumed. `offset` splits once, at a
+        character index.
+
+        Refused before any write: a split that would produce an empty part
+        (the split point is wrong, and an empty block is not what anyone
+        meant), a delimiter that does not occur, and any part containing a
+        line beginning with `- `, which Logseq would truncate on write.
+        """
+        block_uuid = self._require_entity(self._validated_uuid(block_uuid))
+        if (offset is None) == (delimiter is None):
+            raise ValueError(
+                "Pass exactly one of offset or delimiter")
+
+        block = await self._preflight_block(block_uuid, role="source")
+        title = str(block.get("title") or "")
+        parts = self._split_parts(title, offset=offset, delimiter=delimiter)
+
+        for index, part in enumerate(parts, start=1):
+            reject_truncating_content(part, role=f"part {index}")
+
+        head, tails = parts[0], parts[1:]
+        parent_id = self._reference_id(block.get("parent"))
+        if parent_id is None:
+            raise RuntimeError(
+                "The block has no parent, so it has no siblings to split "
+                "into; splitting a page is not meaningful")
+
+        # CREATE FIRST, as CHILDREN of the original, then move them out to be
+        # its siblings. Creating them under the original rather than under the
+        # parent avoids needing the parent's UUID, which the block read gives
+        # only as a `:db/id` -- and an extra query to resolve it would be one
+        # more thing to fail between creating the text and truncating it.
+        #
+        # Either way each tail's text now exists twice: in the new block and
+        # still in the untruncated original.
+        created: list[dict[str, Any]] = []
+        for index, part in enumerate(tails, start=1):
+            result = await self.create_block(block_uuid, part)
+            if not result.verified or not result.verified_entities:
+                return self._split_report(
+                    block_uuid, parts, created, verified=False,
+                    diagnostic=(
+                        f"Stopped before truncating anything: part {index + 1} "
+                        "could not be created. "
+                        + (result.diagnostic or "")
+                        + " The original block is UNCHANGED and still holds "
+                        "the whole text. Remove any blocks listed in created "
+                        "and try again."))
+            created.append(result.verified_entities[0])
+
+        # Promote them from children to siblings, in order. One call for the
+        # run.
+        if created:
+            placement = await self.move_blocks(
+                [entity["uuid"] for entity in created], block_uuid,
+                placement="after")
+            if not placement["verified"]:
+                return self._split_report(
+                    block_uuid, parts, created, verified=False,
+                    diagnostic=(
+                        "The parts were created but could not all be moved "
+                        "out to sit after the original, so some are still "
+                        f"NESTED UNDER it. {placement['diagnostic']} Nothing "
+                        "has been truncated: the original still holds the "
+                        "whole text, so the created blocks are duplicates and "
+                        "can be removed."))
+
+        # TRUNCATE LAST.
+        update = await self.update_block(block_uuid, head)
+        if not update.verified:
+            return self._split_report(
+                block_uuid, parts, created, verified=False,
+                diagnostic=(
+                    "The parts were created and placed, but the original "
+                    "could not be truncated to the first part. "
+                    + (update.diagnostic or "")
+                    + " NO TEXT IS LOST -- the tail now exists both in the "
+                    "original and in the created blocks. Either remove the "
+                    "created blocks to undo, or retry the truncation."))
+
+        return self._split_report(
+            block_uuid, parts, created, verified=True,
+            diagnostic=(
+                f"Split into {len(parts)} block(s) in document order, with no "
+                "text lost. Not atomic: the parts were created before the "
+                "original was truncated, so any failure would have left a "
+                "duplicate rather than a gap."))
+
+    @staticmethod
+    def _split_parts(
+        title: str, *, offset: int | None, delimiter: str | None
+    ) -> list[str]:
+        """
+        Work out the parts, refusing anything that is not a real split.
+
+        Whitespace around a delimiter is stripped from each part, because the
+        delimiter is usually a blank line and the parts would otherwise start
+        or end with stray newlines. An offset split is NOT stripped: an exact
+        index is a claim about exact text.
+        """
+        if delimiter is not None:
+            if not delimiter:
+                raise ValueError("delimiter cannot be empty")
+            if delimiter not in title:
+                raise ValueError(
+                    f"The delimiter {delimiter!r} does not occur in this "
+                    "block, so there is nothing to split. Read the block "
+                    "first -- a blank line is '\\n\\n', and Logseq may have "
+                    "rewritten the text since you last saw it.")
+            parts = [p.strip() for p in title.split(delimiter)]
+        else:
+            if not 0 < offset < len(title):  # type: ignore[operator]
+                raise ValueError(
+                    f"offset must be between 1 and {len(title) - 1} for this "
+                    f"block, which is {len(title)} characters. An offset at "
+                    "either end would produce an empty part.")
+            parts = [title[:offset], title[offset:]]
+
+        if any(not part for part in parts):
+            raise ValueError(
+                "The split would produce an empty part, which means the split "
+                "point is wrong -- a repeated or trailing delimiter, most "
+                "likely. Nothing was written.")
+        if len(parts) > MAX_SPLIT_PARTS:
+            raise ValueError(
+                f"That delimiter would produce {len(parts)} parts, over the "
+                f"limit of {MAX_SPLIT_PARTS}. Split in stages, or use a "
+                "delimiter that occurs less often.")
+        return parts
+
+    @staticmethod
+    def _split_report(
+        block_uuid: str,
+        parts: list[str],
+        created: list[dict[str, Any]],
+        *,
+        verified: bool,
+        diagnostic: str,
+    ) -> dict[str, Any]:
+        return {
+            "verified": verified,
+            "block_uuid": block_uuid,
+            "parts": len(parts),
+            "created": [entity_digest(entity) for entity in created],
+            "diagnostic": diagnostic,
         }
 
     async def find_block_tree(

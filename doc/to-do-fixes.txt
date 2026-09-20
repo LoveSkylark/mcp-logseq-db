@@ -6,21 +6,6 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
----
-
-### Instruction 11 — `findDuplicateTitles(normalize?)` **[pair with 4]**
-
-**Why:** I eyeballed 330 titles for near-matches. That doesn't scale and it misses things.
-
-**Addresses:** the natural front end to repair.md's Class A–E triage. Should return, per pair, both content counts, both ref counts, and alias status — so classification happens before any write.
-
-**Works with:** every duplicate repair; a periodic graph audit.
-
-**Implementation:** normalised grouping — case, whitespace, punctuation, singular/plural, small edit distance. Include tags, since tags and pages share one title space.
-
-**Concerns:** edit distance will produce false positives on legitimately distinct short titles (`Thread`/`Threads`, `Maneuver`/`Maneuvers` may both be intentional). Report and rank; never act. Must surface alias status or it'll recommend deleting working aliases — the `Abilties` trap.
-
-**Done when:** it groups the known pairs and flags `Abilties` as an alias rather than a duplicate.
 
 ---
 

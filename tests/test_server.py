@@ -31,6 +31,7 @@ EXPECTED_TOOLS = {
     "findOrphans",
     "findBacklinks", "createBlock",
     "createPageofBlocks", "importPage", "repairLinks", "updateBlock",
+    "splitBlock",
     "removeBlock",
     "moveBlock", "moveBlocks",
     # Tags

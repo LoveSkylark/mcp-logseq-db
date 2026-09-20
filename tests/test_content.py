@@ -1382,6 +1382,150 @@ async def test_counted_page_listing_excludes_recycled_pages(graph, content):
     assert rows["TEST-PAGE"]["content_blocks"] == 1
 
 
+# ------------------------------------------------------- splitting a block
+#
+# updateBlock sets a title and nothing else, so a heading fused onto the tail
+# of a pasted paragraph could not be promoted out of it. The safety property
+# is the ORDER: parts created first, original truncated last, so a mid-way
+# failure duplicates prose rather than losing it.
+
+FUSED = ("Both dice succeed [1]\n\n**Modifiers:**\n\n**Equipment:**")
+
+
+async def test_a_fused_heading_splits_into_ordered_blocks(graph, content):
+    """The acceptance case: one call frees every trapped heading, in order,
+    with no text lost."""
+    block = (await content.create_block(
+        graph.page["uuid"], FUSED)).verified_entities[0]
+
+    result = await content.split_block(block["uuid"], delimiter="\n\n")
+
+    assert result["verified"] is True
+    assert result["parts"] == 3
+    titles = [b["title"]
+              for b in await content._children_of(graph.page["uuid"])]
+    assert titles == [
+        "Both dice succeed [1]",
+        "**Modifiers:**",
+        "**Equipment:**",
+    ]
+
+
+async def test_no_text_is_lost_in_a_split(graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], FUSED)).verified_entities[0]
+
+    await content.split_block(block["uuid"], delimiter="\n\n")
+
+    titles = [b["title"]
+              for b in await content._children_of(graph.page["uuid"])]
+    assert "\n\n".join(titles) == FUSED
+
+
+async def test_an_offset_split_preserves_text_exactly(graph, content):
+    """An exact index is a claim about exact text, so unlike a delimiter
+    split nothing is stripped."""
+    block = (await content.create_block(
+        graph.page["uuid"], "HeadTail")).verified_entities[0]
+
+    result = await content.split_block(block["uuid"], offset=4)
+
+    assert result["verified"] is True
+    titles = [b["title"]
+              for b in await content._children_of(graph.page["uuid"])]
+    assert titles == ["Head", "Tail"]
+
+
+async def test_the_original_is_truncated_last(graph):
+    """THE SAFETY PROPERTY. If the truncation fails, the tail must still
+    exist in the original -- duplicated prose is repairable, lost prose is
+    not."""
+    class UpdateFailsClient(FakeClient):
+        def _update_block(self, block_uuid, title):
+            return None          # reports success, changes nothing
+
+    client = UpdateFailsClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    block = (await verified.create_block(
+        graph.page["uuid"], "Head\n\nTail")).verified_entities[0]
+
+    result = await verified.split_block(block["uuid"], delimiter="\n\n")
+
+    assert result["verified"] is False
+    assert "NO TEXT IS LOST" in result["diagnostic"]
+    # The created part is named so it can be removed to undo.
+    assert result["created"][0]["uuid"]
+    # And the original still holds the whole text.
+    assert graph.entities[block["uuid"]]["title"] == "Head\n\nTail"
+
+
+async def test_a_missing_delimiter_is_refused_before_any_write(graph):
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    block = (await verified.create_block(
+        graph.page["uuid"], "One block")).verified_entities[0]
+    client.calls.clear()
+
+    with pytest.raises(ValueError, match="does not occur"):
+        await verified.split_block(block["uuid"], delimiter="\n\n")
+
+    assert not any(m for m, _ in client.calls
+                   if m != "logseq.DB.datascriptQuery")
+
+
+async def test_a_split_producing_an_empty_part_is_refused(graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], "Head\n\n\n\nTail")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="empty part"):
+        await content.split_block(block["uuid"], delimiter="\n\n")
+
+
+async def test_an_offset_at_either_end_is_refused(graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], "Whole")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="offset must be between"):
+        await content.split_block(block["uuid"], offset=0)
+    with pytest.raises(ValueError, match="offset must be between"):
+        await content.split_block(block["uuid"], offset=5)
+
+
+async def test_both_or_neither_split_argument_is_refused(graph, content):
+    block = (await content.create_block(
+        graph.page["uuid"], "Head\n\nTail")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="exactly one of offset or"):
+        await content.split_block(block["uuid"])
+    with pytest.raises(ValueError, match="exactly one of offset or"):
+        await content.split_block(
+            block["uuid"], offset=2, delimiter="\n\n")
+
+
+async def test_a_part_logseq_would_truncate_is_refused(graph, content):
+    """A part beginning a line with '- ' would be truncated on write, so the
+    split is refused rather than performed and lost."""
+    block = (await content.create_block(
+        graph.page["uuid"], "Head")).verified_entities[0]
+    graph.entities[block["uuid"]]["title"] = "Head\n\nTail\n- bullet"
+
+    with pytest.raises(ValueError, match="truncates the block"):
+        await content.split_block(block["uuid"], delimiter="\n\n")
+
+
+async def test_splitting_a_nested_block_keeps_it_nested(graph, content):
+    parent = (await content.create_block(
+        graph.page["uuid"], "Parent")).verified_entities[0]
+    block = (await content.create_block(
+        parent["uuid"], "Head\n\nTail")).verified_entities[0]
+
+    result = await content.split_block(block["uuid"], delimiter="\n\n")
+
+    assert result["verified"] is True
+    titles = [b["title"] for b in await content._children_of(parent["uuid"])]
+    assert titles == ["Head", "Tail"]
+
+
 # ------------------------------------------------ duplicate title triage
 #
 # 330 titles were once read by eye for near-matches. These tests care about

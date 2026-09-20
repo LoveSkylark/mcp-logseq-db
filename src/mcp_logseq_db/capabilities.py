@@ -114,6 +114,10 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "getBlockTree":         ("logseq.DB.datascriptQuery",),
     "createBlock":          ("logseq.DB.insertBlock",),
     "updateBlock":          ("logseq.DB.updateBlock",),
+    "splitBlock":           ("logseq.DB.insertBlock",
+                             "logseq.DB.moveBlock",
+                             "logseq.DB.updateBlock",
+                             "logseq.DB.datascriptQuery"),
     "removeBlock":          ("logseq.DB.removeBlock",),
     "moveBlock":            ("logseq.DB.moveBlock",),
     "moveBlocks":           ("logseq.DB.moveBlock",
@@ -210,6 +214,16 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "the block ending up last, not merely under the right parent.",
         "placement is child, last-child, before or after. A page has no "
         "siblings, so a page target requires child or last-child.",
+    ),
+    "splitBlock": (
+        "Composed from createBlock, moveBlocks and updateBlock. NOT atomic, "
+        "and the order is deliberate: the parts are created BEFORE the "
+        "original is truncated, so a mid-way failure duplicates text rather "
+        "than losing it. Every failure reports the created UUIDs.",
+        "delimiter splits on every occurrence and consumes it; offset splits "
+        "once and preserves whitespace exactly. Capped at 20 parts.",
+        "Refused before any write: an empty part, a delimiter that does not "
+        "occur, and any part with a line starting with '- '.",
     ),
     "moveBlocks": (
         "Two API calls per block, not the eight a single moveBlock needs: "

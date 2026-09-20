@@ -350,6 +350,18 @@ def create_server(
         return (await content().update_block(
             block_uuid, title, dry_run=dry_run)).to_dict(verbose)
 
+    @server.tool(name="splitBlock", structured_output=True)
+    async def split_block(
+        block_uuid: str,
+        offset: int | None = None,
+        delimiter: str | None = None,
+    ) -> dict[str, Any]:
+        """Split one block into several siblings, in document order, losing no text -- the inverse of a merge, which updateBlock cannot express since it only sets a title. Use it to free a heading that is fused onto the tail of a pasted paragraph. Pass exactly one of offset (a character index, one split) or delimiter (splits on EVERY occurrence and consumes it, so one call frees several trapped headings; a blank line is '\n\n'). NOT ATOMIC, and the order is the safety property: the new parts are CREATED FIRST and the original truncated LAST, so a failure mid-way leaves the text duplicated rather than truncated -- visible and repairable instead of lost prose. Any failure reports the created UUIDs so it can be undone. Refused before any write: a split producing an empty part, a delimiter that does not occur, and any part containing a line starting with '- ', which Logseq would truncate."""
+        block_uuid = require_uuid(
+            block_uuid, role="block_uuid", hint="getBlockUUID")
+        return await content().split_block(
+            block_uuid, offset=offset, delimiter=delimiter)
+
     @server.tool(name="moveBlock", structured_output=True)
     async def move_block(
         block_uuid: str,
@@ -729,6 +741,11 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "consistent and never jumps more than one level."
         ),
         "update_block": "Pass an exact block UUID and a non-empty title.",
+        "split_block": (
+            "Pass an exact block UUID and exactly one of offset or "
+            "delimiter. Read the block first -- the delimiter must occur in "
+            "the text as Logseq stored it, which may not be as you sent it."
+        ),
         "move_blocks": (
             "Pass the blocks in the order they should end up, then the "
             "target. They must be a flat set -- one cannot be a descendant "
