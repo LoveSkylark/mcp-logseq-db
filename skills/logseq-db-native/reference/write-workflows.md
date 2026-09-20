@@ -157,7 +157,37 @@ is not enough.
 
 ```
 moveBlock(block_uuid, target_uuid, placement="child")
+moveBlocks(block_uuids[], target_uuid, placement="last-child",
+                                       all_or_nothing=false)
 ```
+
+**Use `moveBlocks` for more than one block.** It is the bulk write for a flat
+run of siblings — the journal-to-page shape — and costs two API calls per
+block rather than the eight a single `moveBlock` needs. The first block is
+placed by `placement`; each later one is placed after the one before it, which
+is what preserves the order you gave. `last-child` appends the run after
+whatever the target already held.
+
+It returns a verdict per block and a summary, no entity payloads. Three
+things to know:
+
+- **It stops at the first block that does not verify.** `moved` lists every
+  block with its own verdict, so a partial result tells you exactly which
+  UUIDs landed. It stops rather than continuing because each block's position
+  is defined by the previous one.
+- **Order is verified separately**, by reading the destination once. Check
+  `order_preserved`: `true`, `false`, or `null` when it could not be checked.
+- **`all_or_nothing` is a partial remedy.** It moves the landed blocks back
+  under their original parents, but cannot put them back where they sat —
+  `:block/order` is unwritable, so they end up grouped at the top of the old
+  parent. Read the diagnostic; for a chapter pulled out of a journal, that may
+  or may not be better than leaving it where it landed.
+
+Refused before any write: a list containing the same block twice, a list where
+one block is a descendant of another (a move carries the subtree, so the
+second move would pull the child back out), and a target inside any of their
+subtrees. Capped at 50 per call; the rest come back in `not_attempted`, in
+order.
 
 `child` and `last-child` put the block under the target; a page target moves
 it to that page's top level. `before` and `after` place it as a sibling, so

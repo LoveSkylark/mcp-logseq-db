@@ -159,9 +159,18 @@ So prefer the tool that loops internally over the loop you write yourself:
 
 - `repairLinks()` with no page over one call per page
 - `importPage` over a `createBlock` per line
+- `moveBlocks` over a `moveBlock` per block
 - `pageStats` over `inspectPage` when you only need counts
 - `listJournals(with_counts=true)` over a `pageStats` per journal
 - `clearPage` over a `removeBlock` per block
+
+**Relocating a run of blocks is one call.** `moveBlocks(block_uuids[],
+target_uuid)` moves a list in the order given, at two API calls per block
+rather than the eight a single `moveBlock` needs. This is the journal-to-page
+migration shape, and it is the difference between a chapter being affordable
+to move and being rewritten by hand. It stops at the first block that does not
+verify and reports which UUIDs landed, so a partial result is legible rather
+than a mystery.
 
 **Triage with counts, not with reads.** `listJournals(with_counts=true)` and
 `listPages(with_counts=true)` attach `own_blocks`, `content_blocks` and `refs`
@@ -271,7 +280,9 @@ Prefer the narrowest tool that answers the question.
    many pages with them is expensive and this is not.
 6. `getTagUsers(tag_uuid)` and `getProperyUsers(ident)` answer "what uses
    this?" — run either before deleting, and report the count to the user.
-7. The `list*` tools take no arguments and return a whole kind.
+7. The `list*` tools return a whole kind. Most take no arguments;
+   `listPages` and `listJournals` take `with_counts`, which is the cheap way
+   to find which pages hold content.
 
 Keep `uuid` and `ident` in the working plan. Do not reduce an entity to its
 display text; titles are not unique and are not identifiers.
@@ -415,8 +426,8 @@ Three behaviours matter when using it directly:
 - **`child` prepends; `last-child` appends.** Moving several siblings left to
   right with `child` reverses them at the destination. Use `last-child` — it
   costs one extra read, and verifies the block ended up *last* rather than
-  merely under the right parent. (`after <previous sibling>` also works and is
-  what `last-child` does internally, but it makes you track the anchor.)
+  merely under the right parent. For a whole run, use `moveBlocks`, which
+  chains the placement for you and reports order separately.
 - **A move carries the subtree**, and descendants' `:block/page` follows.
 
 Those three matter whenever you move blocks, and there is no bulk repair tool
@@ -531,7 +542,8 @@ that to the user rather than setting it reflexively.
 pages. Three behaviours to know when calling it directly: it no-ops when the
 position would not change (reported as `verified: false`, which is correct),
 `placement=child` prepends while `last-child` appends, and a move carries the
-subtree.
+subtree. For more than one block, use `moveBlocks` — it is not atomic, stops
+at the first block that does not verify, and reports which UUIDs landed.
 
 ## Tools
 
@@ -540,13 +552,16 @@ subtree.
 `findOrphans`, `getTagUUID`, `getTag`, `getTagUsers`, `getPropertyIndent`,
 `getProperyUsers`
 
-**Lists** (no arguments) — `listPages`, `listJournals`, `listTags`,
+**Lists** — `listPages`, `listJournals`, `listTags`,
 `listProperties`, `listClosedValues`, `listOrphanTags`,
 `listOrphanProperties`, `listAssets`, `listStatus`, `listRecycled`
 
+Most take no arguments; `listPages` and `listJournals` take `with_counts` and
+`limit`.
+
 **Writes** — `importPage`, `repairLinks`, `createPage`, `renamePage`,
-`deletePage`, `clearPage`, `createBlock`, `createPageofBlocks`, `updateBlock`,
-`moveBlock`,
+`retitleOverDuplicate`, `deletePage`, `clearPage`, `createBlock`,
+`createPageofBlocks`, `updateBlock`, `moveBlock`, `moveBlocks`,
 `removeBlock`, `creatTag`, `deleteTag`, `addTag`, `removeTag`,
 `createProperty`, `deleteProperty`, `addProperty`, `removeProperty`
 

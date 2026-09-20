@@ -115,6 +115,8 @@ TOOL_ROUTES: dict[str, tuple[str, ...]] = {
     "updateBlock":          ("logseq.DB.updateBlock",),
     "removeBlock":          ("logseq.DB.removeBlock",),
     "moveBlock":            ("logseq.DB.moveBlock",),
+    "moveBlocks":           ("logseq.DB.moveBlock",
+                             "logseq.DB.datascriptQuery"),
     "createPageofBlocks":   ("logseq.DB.insertBatchBlock",
                              "logseq.DB.datascriptQuery"),
     # Pages
@@ -206,6 +208,26 @@ TOOL_CONSTRAINTS: dict[str, tuple[str, ...]] = {
         "the block ending up last, not merely under the right parent.",
         "placement is child, last-child, before or after. A page has no "
         "siblings, so a page target requires child or last-child.",
+    ),
+    "moveBlocks": (
+        "Two API calls per block, not the eight a single moveBlock needs: "
+        "the target is read once and the guards run once over the whole set. "
+        "This is the bulk write for a flat run of siblings.",
+        "Order comes from CHAINING -- each block is placed after the one "
+        "before it -- and is verified by reading the destination once, "
+        "because a correct parent with the wrong order is the failure the "
+        "tool exists to prevent.",
+        "NOT atomic, and it STOPS at the first block that does not verify. "
+        "Every block gets its own verdict, so a partial result says exactly "
+        "where it stopped and which UUIDs landed.",
+        "all_or_nothing restores parentage but NOT position: :block/order "
+        "cannot be written, so rolled-back blocks end up grouped at the top "
+        "of their old parent. It is a partial remedy and says so.",
+        "Capped at 50 blocks per call; the remainder are returned untouched "
+        "and in order, to pass in a further call.",
+        "Refuses a list in which one block is a descendant of another -- a "
+        "move carries the whole subtree, so the second move would pull the "
+        "child back out of the parent that just carried it.",
     ),
     "createPageofBlocks": (
         "Costs one call per parent that has children -- not 2d-1. Creation "

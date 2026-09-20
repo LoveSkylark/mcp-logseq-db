@@ -211,6 +211,7 @@ which is what removed the read-back cycle from outline building.
 | `createPageofBlocks(page, outline)` | `insertBatchBlock` per parent | **verified** |
 | `updateBlock(uuid, title)` | `updateBlock` | **verified** |
 | `moveBlock(uuid, target, placement)` | `moveBlock` | **verified, all placements**; `last-child` is built on `before:false` |
+| `moveBlocks(uuids, target, placement)` | `moveBlock` per block | **verified**, not atomic, capped at 50 |
 | `removeBlock(uuid)` | `removeBlock` | **verified** |
 
 Every block on a page, at any depth. This walks `:block/parent` recursively
@@ -254,6 +255,23 @@ descendants followed.
 ```json
 {"method": "logseq.DB.moveBlock", "args": ["$BLOCK_UUID", "$TARGET_UUID", {"children": true}]}
 ```
+
+The `moveBlocks` TOOL moves a list in one call, at two calls per block: the
+first block is placed by `placement`, and each later one with
+`{"before": false}` against the block that just landed. That chaining is what
+preserves the order, and it is why a failure stops the batch — the next
+block's position is defined by the previous one. The sources are read in a
+single query rather than one each:
+
+```json
+{"method": "logseq.DB.datascriptQuery", "args": ["[:find [(pull ?e [:db/id :block/uuid :block/title :block/order {:block/page [:db/id :block/uuid]} {:block/parent ...}]) ...] :where (or [?e :block/uuid #uuid \"$A\"] [?e :block/uuid #uuid \"$B\"])]"]}
+```
+
+A UUID cannot be bound as a parameter and matched against `:block/uuid` — a
+JSON string does not equal a uuid value — so the literals are interpolated,
+after validation. `{:block/parent ...}` recurses, so each block arrives with
+its whole ancestor chain, which turns the subtree guards into set tests
+instead of a query per block.
 
 The `moveBlock` TOOL exposes a fourth placement, `last-child`, which appends.
 It has no route of its own: nothing in this API can write `:block/order`, so it

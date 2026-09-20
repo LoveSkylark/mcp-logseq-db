@@ -6,32 +6,6 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
-
-
-
-
----
-
-## Phase 2 — Highest value
-
-### Instruction 7 — `moveBlocks(block_uuids[], target_uuid, placement)`
-
-**Signature:** relocate a list in the given order in one call; return per-block `{uuid, verified}` plus a summary.
-
-**Why:** flat sibling runs are the dominant shape in this graph. Feb 10th is 115 of them, Feb 11th 31, Feb 28th 17. One call per block is the wrong granularity.
-
-**Addresses:** exactly your "cost lives at the tool boundary" principle — this is the one bulk write still missing.
-
-**Works with:** journal-to-page migration, which was essentially the entire job today.
-
-**Implementation:** iterate internally using the `last-child` logic from Instruction 1 to preserve order; verify each; return one summary. Depends on Instruction 1.
-
-**Concerns:** **not atomic** — a mid-list failure leaves a partially moved chapter, the state I flagged as worse than not starting. So report exactly which UUIDs landed, and consider an `all_or_nothing` mode that moves them back on failure. Cap the batch and paginate rather than risking a 4-minute client timeout on 115 blocks.
-
-**Done when:** a 31-block chapter moves in one call, in order, byte-exact.
-
-**Evidence:** this plus Instruction 2 would have let the entire Feb 2026 rewrite move byte-exact in a handful of calls. I'd never have needed `importPage`, and the 5,500-word retyping risk would not have existed.
-
 ---
 
 ### Instruction 8 — `searchBlocks(text, page_uuid?, limit?)`

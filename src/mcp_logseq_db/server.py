@@ -345,6 +345,27 @@ def create_server(
         return (await content().move_block(
             block_uuid, target_uuid, placement=placement)).to_dict(verbose)
 
+    @server.tool(name="moveBlocks", structured_output=True)
+    async def move_blocks(
+        block_uuids: list[str],
+        target_uuid: str,
+        placement: Literal[
+            "child", "last-child", "before", "after"
+        ] = "last-child",
+        all_or_nothing: bool = False,
+    ) -> dict[str, Any]:
+        """Relocate a LIST of blocks, in the order given, in one call -- the tool for moving a flat run of siblings from a journal to a page. The first block is placed by placement (last-child appends the run after whatever the target already held; child puts it at the top), and each later block is placed after the one before it, which is what preserves the order. Costs two calls per block rather than the eight a single moveBlock needs, because the target is read once and the guards run once over the whole set. Returns a verdict per block plus a summary, with no entity payloads. NOT ATOMIC: it stops at the first block that does not verify, and moved says exactly which landed -- the rest of the list would otherwise be positioned relative to a block that did not move. Order is verified by reading the destination once, since a correct parent with the wrong order is the failure this exists to prevent. all_or_nothing moves the landed blocks back under their original parents, but CANNOT restore their position there -- :block/order is unwritable -- so read its note before relying on it. Capped at 50 per call; the remainder come back in not_attempted, in order, to pass in a further call."""
+        block_uuids = [
+            require_uuid(u, role=f"block_uuids[{i}]", hint="getBlockUUID")
+            for i, u in enumerate(block_uuids or [])
+        ]
+        target_uuid = require_uuid(
+            target_uuid, role="target_uuid",
+            hint="getBlockUUID or getPageUUID")
+        return await content().move_blocks(
+            block_uuids, target_uuid, placement=placement,
+            all_or_nothing=all_or_nothing)
+
     @server.tool(name="removeBlock", structured_output=True)
     async def remove_block(
         block_uuid: str, verbose: bool = True
@@ -677,6 +698,12 @@ def _failure_suggestion(tool_name: str, error: Exception) -> str:
             "consistent and never jumps more than one level."
         ),
         "update_block": "Pass an exact block UUID and a non-empty title.",
+        "move_blocks": (
+            "Pass the blocks in the order they should end up, then the "
+            "target. They must be a flat set -- one cannot be a descendant "
+            "of another, since a move carries the whole subtree. Use "
+            "last-child to append the run."
+        ),
         "move_block": (
             "Pass the block to move, then the target, then placement. The "
             "target may be a block, or a page when placement is child or "

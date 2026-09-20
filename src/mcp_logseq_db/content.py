@@ -58,6 +58,17 @@ MAX_SUBTREE_NODES = 1000
 # reintroduce the cost counts were added to remove.
 MAX_COUNTED_ROWS = 500
 
+# Blocks moved per moveBlocks call. Two API calls per block -- the move and
+# its read-back -- plus a fixed handful, so 50 is a few seconds. 115 in one
+# call would risk the client timing out MID-LIST, which is the one outcome
+# worse than not starting: a partially moved chapter with no report of where
+# it stopped.
+MAX_MOVE_BATCH = 50
+
+# Levels the stranded-descendant sweep will walk. One query per level, so
+# this bounds a pathological chain rather than the ordinary case.
+MAX_SUBTREE_DEPTH = 50
+
 # Resolved to a :db/id at call time. Integer ids are renumbered when a graph is
 # rebuilt, so nothing here hardcodes them.
 PROPERTY_CLASS = ":logseq.class/Property"
@@ -1588,6 +1599,426 @@ class VerifiedContent(VerifiedWriteHelpers):
             "aliases": [a for a in aliases if isinstance(a, dict)],
             "aliased_by": [h for h in aliased_by if isinstance(h, dict)],
         }
+
+    @serialized_write
+    async def move_blocks(
+        self,
+        block_uuids: list[str],
+        target_uuid: str,
+        *,
+        placement: str = "last-child",
+        all_or_nothing: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Relocate a list of blocks, in the given order, in one call.
+
+        WHY THIS IS NOT A LOOP OVER `move_block`. That would cost about eight
+        API calls per block -- preflight, target read, subtree check, sibling
+        read, the move, and three read-backs -- so a 31-block chapter would be
+        some 250 calls and a 115-block one would time out. Everything that
+        does not change per block is hoisted: the target is read once, all the
+        sources are read in one query, and the guards run once over the whole
+        set. That leaves two calls per block, the move and its read-back.
+
+        ORDER COMES FROM CHAINING, not from recomputing the last child each
+        time. The first block is placed according to `placement`; every
+        subsequent block is placed AFTER the one before it. So the list
+        arrives in the order given, and the position is established by the
+        block that just landed rather than by a query. `last-child` therefore
+        appends the run to whatever the target already held, and `child`
+        places the run at the top -- in order, in both cases.
+
+        NOT ATOMIC, and the batch stops at the first block that does not
+        verify. `moved` reports every block with its own verdict, so a partial
+        result says exactly where it stopped and which UUIDs landed. The chain
+        is why it stops rather than continuing: the next block's position is
+        defined by the previous one, and placing it after a block that did not
+        move would put it somewhere nobody asked for.
+
+        `all_or_nothing` attempts to move the landed blocks back to their
+        original parents. Read the limitation in `_rollback_moves` before
+        relying on it: parentage is restorable, POSITION IS NOT, because
+        nothing in this API can write `:block/order`, so the blocks come back
+        grouped at the top of their old parent rather than where they sat.
+
+        Capped at MAX_MOVE_BATCH. Anything beyond the cap is returned
+        untouched in `not_attempted`, in order, so the next call continues
+        where this one stopped -- with `last-child`, appending after what has
+        already arrived.
+        """
+        if not isinstance(block_uuids, list) or not block_uuids:
+            raise ValueError("block_uuids must be a non-empty list")
+        if placement not in {"child", "last-child", "before", "after"}:
+            raise ValueError(
+                "placement must be child, last-child, before, or after")
+
+        uuids = [self._require_entity(self._validated_uuid(u))
+                 for u in block_uuids]
+        if len(set(uuids)) != len(uuids):
+            raise ValueError(
+                "block_uuids contains the same block twice; the second move "
+                "would relocate what the first placed")
+
+        target_uuid = self._validated_uuid(target_uuid)
+        if target_uuid in uuids:
+            raise ValueError("The target cannot also be one of the blocks")
+
+        target = await self._entity_by_uuid(target_uuid)
+        if placement in {"before", "after"} and target.get("name"):
+            raise ValueError(
+                "A page has no siblings; use placement=child or last-child to "
+                "move blocks to the top level of a page")
+
+        sources = await self._entities_by_uuids(uuids)
+        missing = [u for u in uuids if u not in sources]
+        if missing:
+            raise ValueError(
+                f"{len(missing)} of the {len(uuids)} blocks do not exist: "
+                f"{missing[:3]}")
+
+        source_ids = {sources[u]["id"] for u in uuids}
+
+        # Moving a block beneath its own descendant detaches the subtree. One
+        # recursive parent pull gave every ancestor chain already, so this is
+        # a set test rather than a query per block.
+        target_ancestors = self._ancestor_ids(target) | {target["id"]}
+        inside = [u for u in uuids if sources[u]["id"] in target_ancestors]
+        if inside:
+            raise ValueError(
+                f"The target is inside the subtree of {len(inside)} of these "
+                f"blocks ({inside[:3]}); moving there would detach them from "
+                "the graph")
+
+        # A block that is a descendant of another in the same list travels
+        # with it, and then gets pulled back out -- an outcome nobody asks
+        # for, so it is refused rather than performed.
+        nested = [u for u in uuids
+                  if self._ancestor_ids(sources[u]) & source_ids]
+        if nested:
+            raise ValueError(
+                f"{len(nested)} of these blocks are descendants of others in "
+                f"the same list ({nested[:3]}). Move the ancestors alone -- "
+                "a move carries the whole subtree.")
+
+        expected_parent = (target["id"] if placement in {"child", "last-child"}
+                           else self._reference_id(target.get("parent")))
+        expected_page = (target["id"] if target.get("name")
+                         else self._reference_id(target.get("page")))
+        if expected_parent is None or expected_page is None:
+            raise RuntimeError(
+                "The target is missing the parent or page reference needed to "
+                "place blocks relative to it")
+
+        attempted, not_attempted = (uuids[:MAX_MOVE_BATCH],
+                                    uuids[MAX_MOVE_BATCH:])
+
+        anchor, options = await self._first_placement(
+            target, target_uuid, placement, source_ids)
+
+        moved: list[dict[str, Any]] = []
+        landed: list[str] = []
+        stopped: str | None = None
+
+        for block_uuid in attempted:
+            _response, timed_out = await self._call_ambiguous(
+                "logseq.DB.moveBlock", [block_uuid, anchor, options])
+            current = await poll_readback(
+                self._client,
+                lambda u=block_uuid: self._entity_by_uuid(u),
+                lambda e: (self._reference_id(e.get("parent"))
+                           == expected_parent
+                           and self._reference_id(e.get("page"))
+                           == expected_page))
+            landed_here = (
+                self._reference_id(current.get("parent")) == expected_parent
+                and self._reference_id(current.get("page")) == expected_page)
+            moved.append({
+                "uuid": block_uuid,
+                "verified": landed_here,
+                "recovered_after_timeout": timed_out,
+            })
+            if not landed_here:
+                stopped = (
+                    f"Stopped at {block_uuid}: the move returned without "
+                    "error but the block is not under the target. Each "
+                    "block's position is defined by the one before it, so "
+                    "continuing would place the rest somewhere nobody asked "
+                    "for.")
+                break
+            landed.append(block_uuid)
+            # The block that just landed anchors the next one. This is what
+            # preserves the given order without a query per block.
+            anchor, options = block_uuid, {"before": False}
+
+        return await self._summarise_moves(
+            moved=moved, landed=landed, attempted=attempted,
+            not_attempted=not_attempted, stopped=stopped,
+            sources=sources, target=target, target_uuid=target_uuid,
+            placement=placement, expected_page=expected_page,
+            all_or_nothing=all_or_nothing)
+
+    async def _first_placement(
+        self,
+        target: dict[str, Any],
+        target_uuid: str,
+        placement: str,
+        source_ids: set[int],
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Where the FIRST block goes. Every later one goes after its
+        predecessor.
+
+        `last-child` resolves to "after the target's current last child",
+        skipping any child that is itself being moved -- anchoring to a block
+        that is about to move would place the run relative to something that
+        will not be there.
+        """
+        if placement == "last-child":
+            siblings = [c for c in await self._children_of(target_uuid)
+                        if c.get("id") not in source_ids]
+            if siblings:
+                return siblings[-1]["uuid"], {"before": False}
+            return target_uuid, {"children": True}
+        if placement == "child":
+            return target_uuid, {"children": True}
+        return target_uuid, {"before": placement == "before"}
+
+    async def _entities_by_uuids(
+        self, uuids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """
+        Read many entities by UUID in one query, keyed by uuid.
+
+        A UUID cannot be passed as a parameter and matched against
+        `:block/uuid` -- a JSON string does not equal a uuid value -- so the
+        literals are interpolated, which is safe because every one has already
+        been through `_validated_uuid`. `or` rather than one query per block:
+        50 round trips to read 50 blocks is the cost this tool exists to
+        remove.
+
+        `{:block/parent ...}` recurses, so each entity arrives with its whole
+        ancestor chain. That is what makes the subtree guards set tests
+        instead of queries.
+        """
+        clauses = " ".join(
+            f'[?e :block/uuid #uuid "{u}"]' for u in uuids)
+        found = await self._query_list(
+            "[:find [(pull ?e [:db/id :block/uuid :block/title :block/order "
+            "{:block/page [:db/id :block/uuid]} {:block/parent ...}]) ...] "
+            f":where (or {clauses})]",
+            "Bulk block lookup")
+        return {e["uuid"]: e for e in found
+                if isinstance(e, dict) and e.get("uuid")}
+
+    @staticmethod
+    def _ancestor_ids(entity: dict[str, Any]) -> set[int]:
+        """Every id above this entity, from a recursive parent pull."""
+        ancestors: set[int] = set()
+        parent = entity.get("parent")
+        while isinstance(parent, dict):
+            if isinstance(parent.get("id"), int):
+                ancestors.add(parent["id"])
+            parent = parent.get("parent")
+        return ancestors
+
+    async def _summarise_moves(
+        self,
+        *,
+        moved: list[dict[str, Any]],
+        landed: list[str],
+        attempted: list[str],
+        not_attempted: list[str],
+        stopped: str | None,
+        sources: dict[str, dict[str, Any]],
+        target: dict[str, Any],
+        target_uuid: str,
+        placement: str,
+        expected_page: int,
+        all_or_nothing: bool,
+    ) -> dict[str, Any]:
+        """
+        Build the result, after two checks that only make sense over the
+        whole set.
+
+        Order is verified by reading the destination's children ONCE, not from
+        the per-block read-backs. Each of those confirms a parent, and a
+        correct parent with the wrong order is exactly the failure this tool
+        exists to prevent.
+        """
+        landed_ids = {sources[u]["id"] for u in landed}
+        stranded = await self._stranded_below(landed_ids, expected_page)
+        order_preserved = await self._order_preserved(
+            landed, target, target_uuid, placement)
+
+        rolled_back: list[dict[str, Any]] = []
+        rollback_note = ""
+        if stopped and all_or_nothing and landed:
+            rolled_back, rollback_note = await self._rollback_moves(
+                landed, sources)
+            landed = [u for u in landed
+                      if not any(r["uuid"] == u and r["verified"]
+                                 for r in rolled_back)]
+
+        verified = (not stopped and not stranded
+                    and order_preserved is not False
+                    and not not_attempted)
+
+        diagnostic = (
+            f"{len(landed)} of {len(attempted)} attempted block(s) landed "
+            f"under the target, in the order given."
+            if not stopped else stopped)
+        if stranded:
+            diagnostic += (
+                f" {len(stranded)} descendant(s) of moved blocks still belong "
+                "to the old page and are invisible to page-scoped queries "
+                "until repaired.")
+        if order_preserved is False:
+            diagnostic += (
+                " The blocks are under the target but NOT in the order given "
+                "-- read the destination before treating this as done.")
+        elif order_preserved is None:
+            diagnostic += (
+                " Order could not be verified: the destination's own UUID was "
+                "not available to read its children back.")
+        if not_attempted:
+            diagnostic += (
+                f" {len(not_attempted)} block(s) were not attempted, capped "
+                f"at {MAX_MOVE_BATCH} per call. Pass them in a further call "
+                "with the same placement; last-child appends after what has "
+                "already arrived.")
+        diagnostic += rollback_note
+
+        return {
+            "verified": verified,
+            "target_uuid": target_uuid,
+            "placement": placement,
+            "moved": moved,
+            "summary": {
+                "requested": len(attempted) + len(not_attempted),
+                "attempted": len(attempted),
+                "landed": len(landed),
+                "failed": len(attempted) - len(landed) - len(rolled_back),
+                "not_attempted": len(not_attempted),
+            },
+            "order_preserved": order_preserved,
+            "not_attempted": not_attempted,
+            "rolled_back": rolled_back,
+            "stranded_descendants": entity_digests(stranded),
+            "diagnostic": diagnostic,
+        }
+
+    async def _order_preserved(
+        self,
+        landed: list[str],
+        target: dict[str, Any],
+        target_uuid: str,
+        placement: str,
+    ) -> bool | None:
+        """
+        Do the landed blocks appear among their new siblings in the order
+        given?
+
+        Returns None rather than True when the destination cannot be read --
+        an unverifiable claim must not be reported as a verified one.
+        """
+        if len(landed) < 2:
+            return True
+        parent_uuid = (
+            target_uuid if placement in {"child", "last-child"}
+            else (target.get("parent") or {}).get("uuid"))
+        if not parent_uuid:
+            return None
+        siblings = await self._children_of(parent_uuid)
+        observed = [c["uuid"] for c in siblings if c["uuid"] in set(landed)]
+        return observed == landed
+
+    async def _stranded_below(
+        self, roots: set[int], expected_page: int
+    ) -> list[dict[str, Any]]:
+        """
+        Descendants of the moved blocks whose owning page did not follow.
+
+        Breadth-first, ONE QUERY PER LEVEL rather than per block: a flat run
+        of siblings costs a single query, and depth is what costs more rather
+        than width. A subtree left pointing at the old page is a real child of
+        the target that no page-scoped query can see, which is the same
+        invisible-orphan failure a single move checks for.
+        """
+        stranded: list[dict[str, Any]] = []
+        frontier = set(roots)
+        seen: set[int] = set(roots)
+        for _ in range(MAX_SUBTREE_DEPTH):
+            if not frontier:
+                break
+            children = await self._query_list(
+                "[:find [(pull ?child [:db/id :block/uuid :block/title "
+                "{:block/page [:db/id]} {:block/parent [:db/id]}]) ...] "
+                ":in $ [?parent ...] :where [?child :block/parent ?parent]]",
+                "Stranded descendant sweep", sorted(frontier))
+            frontier = set()
+            for child in children:
+                if not isinstance(child, dict) or child["id"] in seen:
+                    continue
+                seen.add(child["id"])
+                frontier.add(child["id"])
+                if self._reference_id(child.get("page")) != expected_page:
+                    stranded.append(child)
+        return stranded
+
+    async def _rollback_moves(
+        self, landed: list[str], sources: dict[str, dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], str]:
+        """
+        Move the landed blocks back under their original parents.
+
+        WHAT THIS DOES NOT RESTORE: position. Nothing in this API can write
+        `:block/order`, so a block can only be put back UNDER its old parent,
+        not back where it sat among that parent's children. Blocks returning
+        to the same parent keep their order relative to each other, and
+        nothing else about the original arrangement survives.
+
+        That makes rollback a partial remedy, which is why it is opt-in and
+        why the result says what it did rather than reporting "restored".
+        Read it before relying on it: for a chapter pulled out of a journal,
+        "back under the journal, at the end" may or may not be better than
+        leaving it where it landed.
+        """
+        restored: list[dict[str, Any]] = []
+        anchors: dict[str, str] = {}
+        for block_uuid in landed:
+            parent = sources[block_uuid].get("parent") or {}
+            parent_uuid = parent.get("uuid")
+            if not parent_uuid:
+                restored.append({"uuid": block_uuid, "verified": False})
+                continue
+            if parent_uuid in anchors:
+                anchor, options = anchors[parent_uuid], {"before": False}
+            else:
+                anchor, options = parent_uuid, {"children": True}
+            await self._call_ambiguous(
+                "logseq.DB.moveBlock", [block_uuid, anchor, options])
+            current = await poll_readback(
+                self._client,
+                lambda u=block_uuid: self._entity_by_uuid(u),
+                lambda e, p=parent.get("id"): (
+                    self._reference_id(e.get("parent")) == p))
+            back = self._reference_id(current.get("parent")) == parent.get("id")
+            if back:
+                anchors[parent_uuid] = block_uuid
+            restored.append({"uuid": block_uuid, "verified": back})
+
+        succeeded = sum(1 for r in restored if r["verified"])
+        note = (
+            f" all_or_nothing: {succeeded} of {len(restored)} landed block(s) "
+            "were moved back under their original parents. POSITION WAS NOT "
+            "RESTORED -- `:block/order` cannot be written through this API, "
+            "so they sit grouped at the TOP of the original parent, in their "
+            "original relative order, rather than where they were.")
+        if succeeded != len(restored):
+            note += (
+                " The remainder are still under the target; read both places "
+                "before acting further.")
+        return restored, note
 
     async def _page_by_uuid(self, page_uuid: str) -> dict[str, Any]:
         page = await self._entity_by_uuid(page_uuid)

@@ -30,7 +30,7 @@ EXPECTED_TOOLS = {
     "findBacklinks", "createBlock",
     "createPageofBlocks", "importPage", "repairLinks", "updateBlock",
     "removeBlock",
-    "moveBlock",
+    "moveBlock", "moveBlocks",
     # Tags
     "getTagUUID", "getTag", "getTagUsers", "creatTag", "deleteTag",
     "addTag", "removeTag",

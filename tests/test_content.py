@@ -186,6 +186,23 @@ class FakeClient:
         self.graph.entities[block_uuid] = {**current, "title": title}
         return None
 
+    def _with_parent_chain(self, entity):
+        """Attach the ancestor chain, as a recursive parent pull returns it.
+        The subtree guards in move_blocks are set tests over this rather than
+        a query per block, so the shape has to be faithful."""
+        copy = dict(entity)
+        chain = copy
+        parent_id = (entity.get("parent") or {}).get("id")
+        while parent_id is not None:
+            parent = self.graph.by_id(parent_id)
+            if parent is None:
+                break
+            nested = {"id": parent["id"], "uuid": parent["uuid"]}
+            chain["parent"] = nested
+            chain = nested
+            parent_id = (parent.get("parent") or {}).get("id")
+        return copy
+
     def _rename(self, page_uuid, new_title):
         """Updates :block/title AND :block/name. The tool verifies the name
         survived, because a rename that stripped page identity would
@@ -335,6 +352,20 @@ class FakeClient:
                     if target in wanted:
                         rows[target] = rows.get(target, 0) + 1
             return [[target, n] for target, n in rows.items()]
+        if "(or [?e :block/uuid" in query:
+            # The bulk read: many UUIDs in one query, since a uuid cannot be
+            # bound as a parameter. Each entity comes back with its whole
+            # ancestor chain, because `{:block/parent ...}` recurses.
+            wanted = set(re.findall(r'#uuid "([0-9a-fA-F-]+)"', query))
+            return [self._with_parent_chain(e)
+                    for e in self.graph.entities.values()
+                    if e["uuid"] in wanted]
+        if ":in $ [?parent ...]" in query:
+            # One level of the stranded-descendant sweep: children of a whole
+            # frontier at once, rather than a query per block.
+            wanted = set(params[0])
+            return [e for e in self.graph.entities.values()
+                    if (e.get("parent") or {}).get("id") in wanted]
         if "(pull ?holder" in query and ":block/alias ?target" in query:
             # Inbound: something declares this page as ITS alias. Both
             # attribute spellings are matched, because the code queries both
@@ -1548,6 +1579,218 @@ async def test_a_partial_application_reports_how_to_undo(graph):
     assert holder["uuid"] in result["diagnostic"]
     assert result["parked"]["title"] == "Creativity (parked)"
     assert graph.entities[keeper["uuid"]]["title"] == "Creatvity"
+
+
+# ------------------------------------------------- moving a list of blocks
+#
+# Flat sibling runs are the dominant shape: one journal day was 115 of them.
+# One call per block was the wrong granularity, and a loop over move_block
+# would be ~8 calls each. These tests care about call count and order as much
+# as about the blocks arriving.
+
+async def test_a_chapter_moves_in_one_call_in_order(graph):
+    """The acceptance case: 31 blocks, one call, source order preserved."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    titles = [f"Paragraph {n:02d}" for n in range(31)]
+    blocks = [graph.add(t, graph.page["id"], graph.page["id"]) for t in titles]
+    destination = graph.add("CHAPTER", None, None, name="chapter",
+                            tags=[PAGE_CLASS_ID])
+
+    result = await verified.move_blocks(
+        [b["uuid"] for b in blocks], destination["uuid"])
+
+    assert result["verified"] is True
+    assert result["summary"] == {
+        "requested": 31, "attempted": 31, "landed": 31,
+        "failed": 0, "not_attempted": 0}
+    assert result["order_preserved"] is True
+    arrived = await verified._children_of(destination["uuid"])
+    assert [b["title"] for b in arrived] == titles
+
+
+async def test_the_bulk_move_does_not_cost_a_read_per_block(graph):
+    """Two calls per block plus a fixed handful. A loop over move_block would
+    be roughly eight each, which is what made chained moves unaffordable."""
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    blocks = [graph.add(f"B{n}", graph.page["id"], graph.page["id"])
+              for n in range(10)]
+    destination = graph.add("DEST", None, None, name="dest",
+                           tags=[PAGE_CLASS_ID])
+    client.calls.clear()
+
+    await verified.move_blocks(
+        [b["uuid"] for b in blocks], destination["uuid"])
+
+    assert len([m for m, _ in client.calls
+                if m == "logseq.DB.moveBlock"]) == 10
+    assert len(client.calls) < 30
+
+
+async def test_the_run_appends_after_what_was_already_there(graph, content):
+    existing = graph.add("Was here first", None, None, name="dest",
+                         tags=[PAGE_CLASS_ID])
+    resident = graph.add("Resident", existing["id"], existing["id"])
+    arrivals = [graph.add(f"New {n}", graph.page["id"], graph.page["id"])
+                for n in range(3)]
+
+    await content.move_blocks(
+        [a["uuid"] for a in arrivals], existing["uuid"])
+
+    titles = [c["title"]
+              for c in await content._children_of(existing["uuid"])]
+    assert titles == ["Resident", "New 0", "New 1", "New 2"]
+    assert resident["id"] is not None
+
+
+async def test_placement_child_puts_the_run_at_the_top_still_in_order(
+        graph, content):
+    destination = graph.add("DEST", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+    graph.add("Resident", destination["id"], destination["id"])
+    arrivals = [graph.add(f"New {n}", graph.page["id"], graph.page["id"])
+                for n in range(3)]
+
+    await content.move_blocks(
+        [a["uuid"] for a in arrivals], destination["uuid"],
+        placement="child")
+
+    titles = [c["title"]
+              for c in await content._children_of(destination["uuid"])]
+    assert titles == ["New 0", "New 1", "New 2", "Resident"]
+
+
+async def test_a_mid_list_failure_reports_exactly_what_landed(graph):
+    """The state flagged as worse than not starting. It must be legible: which
+    UUIDs moved, where it stopped, and why it did not carry on."""
+    class FailsOnThirdClient(FakeClient):
+        def __init__(self, graph):
+            super().__init__(graph)
+            self.moves = 0
+
+        def _move(self, block_uuid, target_uuid, options=None):
+            self.moves += 1
+            if self.moves == 3:
+                return None          # reports success, does nothing
+            return super()._move(block_uuid, target_uuid, options)
+
+    client = FailsOnThirdClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    blocks = [graph.add(f"B{n}", graph.page["id"], graph.page["id"])
+              for n in range(5)]
+    destination = graph.add("DEST", None, None, name="dest",
+                           tags=[PAGE_CLASS_ID])
+
+    result = await verified.move_blocks(
+        [b["uuid"] for b in blocks], destination["uuid"])
+
+    assert result["verified"] is False
+    assert result["summary"]["landed"] == 2
+    assert [m["verified"] for m in result["moved"]] == [True, True, False]
+    assert blocks[2]["uuid"] in result["diagnostic"]
+    assert "position is defined by the one before it" in result["diagnostic"]
+    # It stopped rather than placing the rest relative to a block that never
+    # moved.
+    assert len(result["moved"]) == 3
+
+
+async def test_all_or_nothing_moves_the_landed_blocks_back(graph):
+    class FailsOnThirdClient(FakeClient):
+        def __init__(self, graph):
+            super().__init__(graph)
+            self.moves = 0
+
+        def _move(self, block_uuid, target_uuid, options=None):
+            self.moves += 1
+            if self.moves == 3:
+                return None
+            return super()._move(block_uuid, target_uuid, options)
+
+    client = FailsOnThirdClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    origin = graph.add("ORIGIN", None, None, name="origin",
+                       tags=[PAGE_CLASS_ID])
+    blocks = [graph.add(f"B{n}", origin["id"], origin["id"])
+              for n in range(4)]
+    destination = graph.add("DEST", None, None, name="dest",
+                           tags=[PAGE_CLASS_ID])
+
+    result = await verified.move_blocks(
+        [b["uuid"] for b in blocks], destination["uuid"],
+        all_or_nothing=True)
+
+    assert result["verified"] is False
+    assert [r["verified"] for r in result["rolled_back"]] == [True, True]
+    # Back under the original parent...
+    back = await verified._children_of(origin["uuid"])
+    assert {b["title"] for b in back} >= {"B0", "B1"}
+    # ...but the result must not claim the position was restored.
+    assert "POSITION WAS NOT RESTORED" in result["diagnostic"]
+
+
+async def test_beyond_the_cap_is_returned_untouched_and_in_order(graph):
+    client = FakeClient(graph)
+    verified = VerifiedContent(client)  # type: ignore[arg-type]
+    blocks = [graph.add(f"B{n:03d}", graph.page["id"], graph.page["id"])
+              for n in range(55)]
+    destination = graph.add("DEST", None, None, name="dest",
+                           tags=[PAGE_CLASS_ID])
+
+    result = await verified.move_blocks(
+        [b["uuid"] for b in blocks], destination["uuid"])
+
+    assert result["summary"]["attempted"] == 50
+    assert result["summary"]["not_attempted"] == 5
+    assert result["not_attempted"] == [b["uuid"] for b in blocks[50:]]
+    # A capped call is not a finished job.
+    assert result["verified"] is False
+    assert "capped" in result["diagnostic"]
+
+
+async def test_a_nested_pair_is_refused(graph, content):
+    """A move carries the subtree, so moving a parent and its child in the
+    same list would carry the child along and then pull it back out."""
+    parent = graph.add("Parent", graph.page["id"], graph.page["id"])
+    child = graph.add("Child", parent["id"], graph.page["id"])
+    destination = graph.add("DEST", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+
+    with pytest.raises(ValueError, match="descendants of others"):
+        await content.move_blocks(
+            [parent["uuid"], child["uuid"]], destination["uuid"])
+
+
+async def test_a_repeated_uuid_is_refused(graph, content):
+    block = graph.add("Once", graph.page["id"], graph.page["id"])
+    destination = graph.add("DEST", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+
+    with pytest.raises(ValueError, match="same block twice"):
+        await content.move_blocks(
+            [block["uuid"], block["uuid"]], destination["uuid"])
+
+
+async def test_moving_into_the_lists_own_subtree_is_refused(graph, content):
+    parent = graph.add("Parent", graph.page["id"], graph.page["id"])
+    child = graph.add("Child", parent["id"], graph.page["id"])
+    other = graph.add("Other", graph.page["id"], graph.page["id"])
+
+    with pytest.raises(ValueError, match="inside the subtree"):
+        await content.move_blocks(
+            [parent["uuid"], other["uuid"]], child["uuid"])
+
+
+async def test_the_subtree_of_a_moved_block_follows_it(graph, content):
+    parent = graph.add("Parent", graph.page["id"], graph.page["id"])
+    graph.add("Descendant", parent["id"], graph.page["id"])
+    destination = graph.add("DEST", None, None, name="dest",
+                            tags=[PAGE_CLASS_ID])
+
+    result = await content.move_blocks([parent["uuid"]], destination["uuid"])
+
+    assert result["verified"] is True
+    assert result["stranded_descendants"] == []
 
 
 # --------------------------------------------- outline is the batching path

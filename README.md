@@ -39,9 +39,9 @@ still true.
 
 `importPage` · `repairLinks` · `createPage` · `renamePage` ·
 `retitleOverDuplicate` · `deletePage` · `clearPage` · `createBlock` ·
-`createPageofBlocks` · `updateBlock` · `moveBlock` · `removeBlock` ·
-`creatTag` · `deleteTag` · `addTag` · `removeTag` · `createProperty` ·
-`deleteProperty` · `addProperty` · `removeProperty`
+`createPageofBlocks` · `updateBlock` · `moveBlock` · `moveBlocks` ·
+`removeBlock` · `creatTag` · `deleteTag` · `addTag` · `removeTag` ·
+`createProperty` · `deleteProperty` · `addProperty` · `removeProperty`
 
 There is one `addTag`, not an `addPageTag` and an `addBlockTag` — a page **is**
 a block in the DB, so the target is uniform and there is nothing to choose
@@ -148,6 +148,23 @@ this server routes through it any more.
 pages. It no-ops when the position would not change, which the tool reports as
 `verified: false` rather than a false success — so moving a block to the parent
 it already has takes two moves, out and back.
+
+**`moveBlocks` is the bulk form**, and the one to reach for when relocating a
+run of siblings — a journal-to-page migration, typically. It takes a list and
+moves it in the order given, at two API calls per block rather than the eight
+a single `moveBlock` needs: the target is read once and the guards run once
+over the whole set. Order comes from chaining each block after the one before
+it, and is verified by reading the destination once, because a correct parent
+with the wrong order is precisely the failure being prevented.
+
+It is not atomic, and it stops at the first block that does not verify — the
+rest of the list would otherwise be positioned relative to a block that never
+moved. Every block gets its own verdict, so a partial result says exactly
+where it stopped. `all_or_nothing` moves the landed blocks back under their
+original parents but **cannot restore their position** there, since
+`:block/order` is unwritable; it is a partial remedy and the result says so.
+Capped at 50 per call, with the remainder returned in order to pass in a
+further call.
 
 **`placement=child` prepends; use `last-child` to append.** That is the
 route's own behaviour and it is left alone, because callers depend on it — but
