@@ -106,6 +106,7 @@ or the build changed underneath it.
 | T-014 | `listOrphanProperties` | Returns. Built-ins with no namespace are skipped rather than interpolated into a query. |
 | T-015 | `moveBlock` with `placement=last-child` | Available and appends — see the Moving section. |
 | T-016 | Any write with `verbose: false` | `verified` is identical to the same write with `verbose: true`; only the payload differs. Shaping must never change the verdict. |
+| T-017 | `insertBlock` with a page NAME as the parent, called DIRECTLY (not through `createBlock`) | A block is created at the top of that page. Recorded, not a fault — the old belief that names are inert came from `upsertNodes`, which nothing uses now. It matters because `createBlock`'s UUID validation is then the only thing preventing a mistyped argument from landing a real write. See T-704. |
 
 ---
 
@@ -386,7 +387,7 @@ refusal are testing the guard, not looking for a workaround.
 | T-701 | Any tool with a malformed UUID | Clean `validation` failure naming the argument; no mutation |
 | T-702 | A tag tool given the tag's **ident** instead of its UUID | Rejected at the boundary, diagnosed as an ident |
 | T-703 | A property tool given a **UUID** instead of an ident | Rejected; this is the silent no-op the guard exists for |
-| T-704 | `createBlock` with a page **name** as the parent | Rejected at the boundary |
+| T-704 | `createBlock` with a page **name** as the parent | Rejected at the boundary. **This guard is now load-bearing:** the underlying `insertBlock` RESOLVES a page title and creates a top-level block on that page (confirmed 2026-09-20). It used to write nothing, so a mistyped argument was harmless; it no longer is. Confirm the rejection happens before any API call, and that no block appeared on the named page. |
 | T-705 | A normal call immediately after a failed one | Succeeds — no session poisoning |
 | T-706 | A query with a `clojure.string/*` predicate, isolated session | Record whether it errors cleanly or wedges the worker. **Run last; may need a Logseq restart.** |
 | T-707 | After any timeout: re-probe, re-read the target | Establish committed state; check `recovered_after_timeout` and whether `capabilities` reports `writes_disabled` |

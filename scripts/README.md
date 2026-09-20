@@ -44,6 +44,7 @@ corresponds to something that was once wrong:
 | `createPage`, `insertBlock`, `insertBatchBlock`, `moveBlock`, `renamePage` reachable | Every write tool sits on these, and each one replaced an `upsertNodes` path. |
 | `upsertProperty` rejects a namespaced title | The namespace comes from caller identity and cannot be chosen. |
 | Recycled pages still queryable | They keep the Page class, so every page listing must exclude them explicitly. |
+| Which way a page NAME behaves as a parent | Recorded rather than asserted. `insertBlock` resolves one as of 2026-09-20, where `upsertNodes` ignored one — so a mistyped argument now lands a real write, and the boundary UUID check is load-bearing rather than belt and braces. |
 
 Three checks were dropped when `upsertNodes` left the allowlist: that
 `edit`+`page` was unsupported, that `operation` was still `add`\|`edit`, and
@@ -57,10 +58,11 @@ validation error proves a method exists without mutating anything.
 `--write` adds the findings that need a real write: that `createPage` is
 idempotent on title, that `insertBlock` returns the entity it created, that a
 **block** UUID as the parent nests *and* leaves `:block/page` pointing at the
-page, that a page **name** as the parent reports success while writing
-nothing, that `moveBlock` reparents and then no-ops on a repeat, and that
-`deletePage` accepts a UUID and recycles rather than destroys. It works on a
-scratch page and recycles it afterwards; nothing existing is touched.
+page, what a page **name** as the parent now does (it resolves — see the table
+above), that `moveBlock` reparents and then no-ops on a repeat, that
+`children: true` still prepends, and that `deletePage` accepts a UUID and
+recycles rather than destroys. It works on a scratch page and recycles it
+afterwards; nothing existing is touched.
 
 `--explore` reports rather than checks: which `logseq.DB.*` routes would close
 the remaining gaps in the tool surface (tag inheritance, tag-level property
