@@ -1,23 +1,8 @@
-# MCP Tool Improvement Plan
+update the reead me files, content missung such as sctipts/build-skill
+we allso  need to be able to build skill natvily on a mac
+same thing with intsall
 
-Ordered so each instruction is independently shippable. Phase 1 is cheap and safe; Phase 2 is where the real cost savings are; Phase 3 needs upstream verification first. Two pairs are marked where splitting them makes no sense.
+when it comes to properties we need the skill to take over the heaqv load on that sicne we cant edit skill directly wee need to output an instructions to 
 
-Every item traces to something that actually cost us in this session, noted under *Evidence*.
+we may also need a new skill especial on how to contrcucte a logseq graph detail on what belong where what are the best way to organize the document, but hsi need to be flexible as well and take queues form the user adn try to emulate his style instead of scrapping the structure and rewriting it.
 
-
-
-
-
-
-
-## Cross-cutting concerns
-
-**Document the two behaviours we found the hard way.** Recycled pages can be renamed and this releases the title; `getPageUUID` and the write path disagree on recycled titles. Both contradict the current reference files, and both caused mistakes today. Also correct write-workflows' stale "There is **no move**. No route exists for it" and data-modeling's "No block movement — yet."
-
-**Keep verification, cut the echo.** The read-back-and-compare discipline is the best thing about this toolset and caught real failures. Instruction 2 targets the response size, not the checking.
-
-**Prefer additive changes.** Every item here is a new tool, a new enum value, or a new optional parameter. Nothing redefines existing behaviour, so nothing needs a coordinated client update.
-
-**Sequencing:** 1 → 2 → 7 unlocks the most, in that order. Instruction 1 is a prerequisite for 7; 7 is a prerequisite for 13. Everything else is independent.
-
-I can put this in a document if you want it outside the chat.
