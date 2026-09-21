@@ -6,3 +6,75 @@ when it comes to properties we need the skill to take over the heaqv load on tha
 
 we may also need a new skill especial on how to contrcucte a logseq graph detail on what belong where what are the best way to organize the document, but hsi need to be flexible as well and take queues form the user adn try to emulate his style instead of scrapping the structure and rewriting it.
 
+# To investigate
+
+Open items parked for later. Nothing here has been acted on.
+
+## Template APIs under `logseq.App.*`
+
+Found 2026-09-20 in the `com.logseq/libs` API surface (`com.logseq.app`
+namespace). Six template functions exist in the plugin API:
+
+| Clojure name | JS name |
+| --- | --- |
+| `create-template` | `logseq.App.createTemplate` |
+| `exist-template` | `logseq.App.existTemplate` |
+| `get-template` | `logseq.App.getTemplate` |
+| `get-current-graph-templates` | `logseq.App.getCurrentGraphTemplates` |
+| `insert-template` | `logseq.App.insertTemplate` |
+| `remove-template` | `logseq.App.removeTemplate` |
+
+The changelog records "Support more template-related APIs" being added, so
+this family was extended deliberately at some point.
+
+### Why it might not work, in order of likelihood
+
+1. **Wrong namespace.** These are `logseq.App.*`; everything this server uses
+   is `logseq.DB.*`, and the client allowlist rejects other namespaces. That
+   restriction is ours, but it was written against the HTTP surface we mapped.
+   Whether the HTTP endpoint dispatches `App` methods at all is unknown and is
+   the first thing to settle — if it does not, nothing else here matters.
+2. **File-graph model.** `insertTemplate(targetUuid, templateName)` looks up a
+   template BY NAME, which is how file graphs worked (`template:: my-template`).
+   In DB graphs a template is a block tagged `#Template` whose behaviour comes
+   from `:logseq.property/template-applied-to`. So the method may dispatch and
+   still resolve nothing.
+3. **Different code path.** The `/template` slash command is a frontend
+   command. A frontend command and a plugin API function of the same name are
+   not necessarily the same code.
+4. **Weak counter-evidence.** `logseq-plugin-default-template`, which exists
+   specifically to auto-apply page templates, states it supports file-based
+   graphs only.
+
+### The probe, which needs no code changes
+
+POST to `http://127.0.0.1:12315/api` with the token:
+
+    { "method": "logseq.App.getCurrentGraphTemplates", "args": [] }
+
+- A list of templates -> the `App` namespace dispatches AND DB templates are
+  visible to it. `insertTemplate` is then worth trying.
+- `null` or an empty list -> the namespace dispatches but DB templates do not
+  register in the legacy structure, so insertion will silently do nothing.
+- Method-not-found -> `App` is not exposed over HTTP. Question closed.
+
+If the first, follow up against a scratch page:
+
+    { "method": "logseq.App.insertTemplate", "args": ["<block-uuid>", "<name>"] }
+
+Then READ THE PAGE BACK. This API family returns `null` either way, so the
+response is not evidence.
+
+### What it would and would not buy
+
+Content insertion only. In the DB model the TAG owns the properties and the
+template owns the content, so `addTag` remains the mechanism for the property
+side whichever way this goes. `user.property/*` values stay unwritable
+regardless — see `architecture.md` on the property sandbox.
+
+## Also parked
+
+See `doc/README.md` -> Status -> Open for the five items from the 2026-09-20
+session: the `createPage` phantom, `insertBatchBlock` prepending,
+`all_or_nothing` never having executed, no call counter in envelopes, and the
+restore/purge UI check.
