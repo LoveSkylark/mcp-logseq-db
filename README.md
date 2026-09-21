@@ -23,10 +23,10 @@ still true.
 
 **Reads**
 
-`capabilities` · `getPageUUID` · `isTitleAvailable` · `inspectPage` ·
-`pageStats` · `getBlockUUID` · `getBlock` · `searchBlocks` · `getBlockTree` ·
-`findBacklinks` · `findOrphans` · `getTagUUID` · `getTag` · `getTagUsers` ·
-`getPropertyIndent` · `getProperyUsers`
+`capabilities` · `getPageUUID` · `isTitleAvailable` · `findDuplicateTitles` ·
+`inspectPage` · `pageStats` · `getBlockUUID` · `getBlock` · `searchBlocks` ·
+`getBlockTree` · `findBacklinks` · `findOrphans` · `getTagUUID` · `getTag` ·
+`getTagUsers` · `getPropertyIndent` · `getProperyUsers`
 
 **Lists** — each returns a whole kind; the two page listings take
 `with_counts`
@@ -39,9 +39,10 @@ still true.
 
 `importPage` · `repairLinks` · `createPage` · `renamePage` ·
 `retitleOverDuplicate` · `deletePage` · `clearPage` · `createBlock` ·
-`createPageofBlocks` · `updateBlock` · `moveBlock` · `moveBlocks` ·
-`removeBlock` · `creatTag` · `deleteTag` · `addTag` · `removeTag` ·
-`createProperty` · `deleteProperty` · `addProperty` · `removeProperty`
+`createPageofBlocks` · `updateBlock` · `splitBlock` · `moveBlock` ·
+`moveBlocks` · `migratePage` · `removeBlock` · `creatTag` · `deleteTag` ·
+`addTag` · `removeTag` · `createProperty` · `deleteProperty` ·
+`addProperty` · `removeProperty`
 
 There is one `addTag`, not an `addPageTag` and an `addBlockTag` — a page **is**
 a block in the DB, so the target is uniform and there is nothing to choose
@@ -222,7 +223,9 @@ with the title you want is enough to make `createPage` refuse.
 
 ## Install
 
-Python 3.11 or newer.
+Python 3.11 or newer. The package is platform-neutral — it talks HTTP to
+`127.0.0.1:12315` and touches no OS-specific APIs — so macOS, Linux and
+Windows all work. Only the helper scripts are PowerShell.
 
 ```bash
 git clone https://github.com/LoveSkylark/mcp-logseq-db.git
@@ -243,6 +246,27 @@ py -3.13 -m pip wheel --no-deps . -w dist
 py -3.13 -m pip install --force-reinstall --no-deps .\dist\mcp_logseq_db-0.3.0-py3-none-any.whl
 ```
 
+`scripts/install.ps1` does the same thing with verification — it checks that
+the package imports, that the entry point imports, and that the console script
+resolves, because pip reporting success is not the same as the server being
+launchable. It writes no client configuration. It needs PowerShell 7, which
+runs on macOS and Linux, and it resolves the interpreter as `py` then
+`python3` then `python`, so it is portable in principle — but it has only ever
+been run on Windows. Without PowerShell the `pip install` above is equivalent
+minus the checks.
+
+**Where the console script lands.** `pip` generates it per platform:
+`Scripts\mcp-logseq-db.exe` on Windows, `bin/mcp-logseq-db` on macOS and
+Linux. Same entry point either way; the `.exe` is pip's wrapper format, not
+part of this package.
+
+**Install into the interpreter your MCP client will launch.** This is the
+easiest thing to get wrong, on any OS: installing into a virtualenv and then
+pointing the client at the system Python gives
+`ModuleNotFoundError: No module named 'mcp_logseq_db'` while `pytest` passes
+happily. Either use the venv's absolute path in the client config, or install
+into the interpreter the config names.
+
 Smoke test — enable **Settings → Features → HTTP APIs server** in Logseq first
 and copy its token:
 
@@ -250,6 +274,8 @@ and copy its token:
 export LOGSEQ_API_TOKEN="your-token"
 python -m mcp_logseq_db.server
 ```
+
+On Windows: `$env:LOGSEQ_API_TOKEN = "your-token"`.
 
 ## Configuration
 
@@ -342,17 +368,31 @@ never in skill text, model instructions, or committed files.
 ## Tests
 
 ```bash
-pytest                      # everything except tests marked `live`
-scripts/test.ps1 -Docker    # clean container, no local Python involved
+pytest -q -m "not live"     # everything except tests marked `live`
 ```
+
+Or through the wrapper, which cleans stale bytecode and reports which copy of
+the package was imported — `[src]` rather than an installed one:
+
+```powershell
+.\scripts\test.ps1 -Clean
+.\scripts\test.ps1 -Docker   # clean container, no local Python involved
+```
+
+`test.ps1` needs PowerShell 7 on macOS and Linux; plain `pytest` is the
+portable path and runs the same suite.
 
 Nothing in the suite needs Logseq running.
 
 Separately, `scripts/live_reliability.py` checks whether the server's
 assumptions about Logseq are still true — that a block UUID is accepted where a
-parent is expected, that property writes are still namespaced, that a page name
-still fails silently. The unit tests cannot answer those questions, because the
-fakes encode the same beliefs the code does. Run it after a Logseq upgrade.
+parent is expected, that property writes are still namespaced, that
+`children: true` still prepends, and what a page NAME now does where a parent
+UUID belongs. That last one changed: `insertBlock` RESOLVES a page title,
+where the `upsertNodes` route it replaced ignored one, so a mistyped argument
+lands a real write rather than failing harmlessly. The unit tests cannot
+answer these questions, because the fakes encode the same beliefs the code
+does. Run it after a Logseq upgrade.
 
 ## Documentation
 

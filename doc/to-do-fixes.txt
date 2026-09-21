@@ -8,21 +8,7 @@ Every item traces to something that actually cost us in this session, noted unde
 
 
 
----
 
-### Instruction 13 — `migratePage(source_page, target_page, filter?)`
-
-**Why:** journal-to-page migration was the whole job and has no primitive.
-
-**Addresses:** the complete workflow — enumerate top-level blocks, move them in order, verify, report what's left.
-
-**Works with:** the remaining Feb 10th and Feb 11th chapters; any future journal cleanup.
-
-**Implementation:** build on Instruction 7. Do this last — it's a convenience wrapper, and it's only worth writing once the batch move underneath it is solid.
-
-**Concerns:** don't let it decide *what* to migrate. Placement judgement — which cluster belongs on which page — was the irreducibly human part of this session, and the one the tool shouldn't touch. Keep it mechanical: "move these blocks there", not "work out where this belongs".
-
----
 
 ## Cross-cutting concerns
 

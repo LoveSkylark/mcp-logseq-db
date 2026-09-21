@@ -1323,9 +1323,12 @@ class VerifiedContent(VerifiedWriteHelpers):
                 f"{len(reports)} group(s) among {len(candidates)} pages and "
                 "tags. Ranked cheapest-certainty first; `alias` and "
                 "`genuine_split` groups are NOT actionable and are ranked "
-                "last. Nothing here has been changed, and no classification "
-                "is an instruction -- confirm a symptom in the Logseq UI "
-                "before any write."),
+                "last. `block_refs` counts :block/refs ONLY -- tag holders "
+                "and property values are inbound references too and are not "
+                "counted here, so a 0 does not mean nothing points at the "
+                "page; pageStats reports all three. Nothing here has been "
+                "changed, and no classification is an instruction -- confirm "
+                "a symptom in the Logseq UI before any write."),
         }
 
     def _group_titles(
@@ -1415,7 +1418,14 @@ class VerifiedContent(VerifiedWriteHelpers):
                 **{k: v for k, v in member.items() if k != "id"},
                 "own_blocks": own.get(member["id"], 0),
                 "content_blocks": content,
-                "refs": refs.get(member["id"], 0),
+                # NAMED `block_refs`, not `refs`, because that is all it
+                # counts: `:block/refs`. Tag holders and property values are
+                # inbound references too and are NOT here -- pageStats reports
+                # those separately, and the alias that started all of this was
+                # spotted through a property holder. A field called `refs`
+                # reading 0 invites "nothing points here", which is the
+                # inference that precedes a recycle.
+                "block_refs": refs.get(member["id"], 0),
                 "alias": member["id"] in aliased,
             })
 
@@ -1448,8 +1458,8 @@ class VerifiedContent(VerifiedWriteHelpers):
                     "read both pages. No tool should choose for you."),
             }
 
-        stubs = [m for m in empty_members if m["refs"] == 0]
-        referenced = [m for m in empty_members if m["refs"] > 0]
+        stubs = [m for m in empty_members if m["block_refs"] == 0]
+        referenced = [m for m in empty_members if m["block_refs"] > 0]
         same_title = len(titles) == 1
 
         if with_content and stubs and not referenced:
@@ -1459,10 +1469,12 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "classification": "dead_stub",
                 "rank": 0 if same_title else 1,
                 "reading": (
-                    f"{len(stubs)} empty, unreferenced entity(s) beside one "
-                    "holding content. The safest class -- but confirm the "
-                    "counts for that specific page before recycling it, and "
-                    "remember a recycled page keeps its title."),
+                    f"{len(stubs)} empty entity(s) with no BLOCK references, "
+                    "beside one holding content. The safest class -- but "
+                    "block_refs does not count tag holders or property "
+                    "values, so run pageStats on the specific page before "
+                    "recycling it, and remember a recycled page keeps its "
+                    "title."),
             }
 
         if with_content and referenced:
@@ -1614,8 +1626,11 @@ class VerifiedContent(VerifiedWriteHelpers):
 
         Whitespace around a delimiter is stripped from each part, because the
         delimiter is usually a blank line and the parts would otherwise start
-        or end with stray newlines. An offset split is NOT stripped: an exact
-        index is a claim about exact text.
+        or end with stray newlines. An offset split is not stripped either --
+        but an offset that FALLS on whitespace is refused, because Logseq
+        trims a block's edges on write and that character cannot survive in
+        either part. This used to claim it preserved whitespace exactly, and
+        silently lost a space.
         """
         if delimiter is not None:
             if not delimiter:
@@ -1634,6 +1649,27 @@ class VerifiedContent(VerifiedWriteHelpers):
                     f"block, which is {len(title)} characters. An offset at "
                     "either end would produce an empty part.")
             parts = [title[:offset], title[offset:]]
+
+            # WHITESPACE AT THE SPLIT POINT CANNOT SURVIVE, so the split is
+            # refused rather than performed with a character quietly missing.
+            # Logseq trims the edges of a block on write: leave the space at
+            # the end of the head and it is rstripped, move it to the start of
+            # the tail and it is lstripped. Either way it is gone.
+            #
+            # Measured 2026-09-20: `"Head tail"` at offset 5 stored `"Head"`
+            # and `"tail"`, joining back to `"Headtail"` -- and it reported
+            # verified: true, because the content check rstrips both sides to
+            # tolerate exactly this trimming. This code claimed to preserve
+            # whitespace exactly; it never could.
+            if parts[0] != parts[0].rstrip() or parts[1] != parts[1].lstrip():
+                raise ValueError(
+                    f"An offset of {offset} falls on whitespace, which Logseq "
+                    "trims from the edges of a block on write -- so that "
+                    "character would be lost whichever part it went to, and "
+                    "the two parts would no longer rejoin into the original. "
+                    "Choose an offset that does not fall on a space or "
+                    "newline. If the separator must be kept, split on it as a "
+                    "delimiter instead, which consumes it by design.")
 
         if any(not part for part in parts):
             raise ValueError(
@@ -2762,6 +2798,7 @@ class VerifiedContent(VerifiedWriteHelpers):
             "not_attempted": not_attempted,
             "rolled_back": rolled_back,
             "stranded_descendants": entity_digests(stranded),
+            "stranded_count": len(stranded),
             "diagnostic": diagnostic,
         }
 
@@ -3553,10 +3590,13 @@ class VerifiedContent(VerifiedWriteHelpers):
             "levels": depth_max + 1,
             "calls": parent_count,
             # The outline was supplied by the caller, so echoing every created
-            # block's title back is the one payload they already have.
+            # block's title back is the one payload they already have. The
+            # UUIDs are NOT truncated: they are the only way to address what
+            # was just made, and a count beside a short list reads as a
+            # complete answer.
             **({"created": created} if verbose else {
                 "created_count": len(created),
-                "created": entity_digests(created),
+                "created": entity_digests(created, limit=None),
             }),
         }
 

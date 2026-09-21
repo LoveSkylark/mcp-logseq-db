@@ -1266,6 +1266,21 @@ async def test_clear_page_keeps_the_record_of_what_it_destroyed(graph, content):
     assert terse["previous_count"] == 1
 
 
+async def test_terse_outline_returns_every_uuid_it_created(graph, content):
+    """Found live: 55 blocks reported `created_count: 55` beside 20 UUIDs,
+    because the digest helper caps at 20. The blocks past the cap were
+    unaddressable and nothing said so. A count that disagrees with the list
+    beside it is worse than a long list."""
+    outline = "\n".join(f"Block {n:03d}" for n in range(55))
+
+    result = await content.create_page_of_blocks(
+        graph.page["uuid"], outline, verbose=False)
+
+    assert result["created_count"] == 55
+    assert len(result["created"]) == 55
+    assert len({row["uuid"] for row in result["created"]}) == 55
+
+
 async def test_terse_outline_returns_uuids_not_the_outline_back(graph, content):
     result = await content.create_page_of_blocks(
         graph.page["uuid"], "Alpha\n    Beta\n", verbose=False)
@@ -1581,6 +1596,38 @@ async def test_no_text_is_lost_in_a_split(graph, content):
     assert "\n\n".join(titles) == FUSED
 
 
+async def test_an_offset_on_whitespace_is_refused(graph, content):
+    """Found live: "Head tail" at offset 5 stored "Head" + "tail", rejoining
+    to "Headtail", and reported verified: true. Logseq trims a block's edges
+    on write, so the character at the split point cannot survive in either
+    part -- and the content check rstrips both sides to tolerate exactly that
+    trimming, so it was blind to the loss. The claim was wrong, not the
+    check."""
+    block = (await content.create_block(
+        graph.page["uuid"], "Head tail")).verified_entities[0]
+
+    with pytest.raises(ValueError, match="falls on whitespace"):
+        await content.split_block(block["uuid"], offset=5)
+
+    # Nothing written, and the block is untouched.
+    assert graph.entities[block["uuid"]]["title"] == "Head tail"
+    assert await content._children_of(graph.page["uuid"]) != []
+
+
+async def test_an_offset_mid_word_still_works(graph, content):
+    """The refusal must not swallow the case offset is for."""
+    block = (await content.create_block(
+        graph.page["uuid"], "HeadTail")).verified_entities[0]
+
+    result = await content.split_block(block["uuid"], offset=4)
+
+    assert result["verified"] is True
+    titles = [b["title"]
+              for b in await content._children_of(graph.page["uuid"])]
+    assert titles == ["Head", "Tail"]
+    assert "".join(titles) == "HeadTail"
+
+
 async def test_an_offset_split_preserves_text_exactly(graph, content):
     """An exact index is a claim about exact text, so unlike a delimiter
     split nothing is stripped."""
@@ -1710,7 +1757,12 @@ async def test_an_exact_duplicate_is_grouped_as_a_dead_stub(graph, content):
     members = {m["uuid"]: m for m in group["members"]}
     assert members[real["uuid"]]["content_blocks"] == 1
     assert members[stub["uuid"]]["content_blocks"] == 0
-    assert members[stub["uuid"]]["refs"] == 0
+    assert members[stub["uuid"]]["block_refs"] == 0
+    # The field is named for what it counts. A `refs: 0` would read as
+    # "nothing points here", and tag holders and property values are not
+    # counted -- the alias that motivated the guard was found via a property.
+    assert "refs" not in members[stub["uuid"]]
+    assert "pageStats" in group["reading"]
 
 
 async def test_an_alias_is_flagged_as_an_alias_not_a_duplicate(
@@ -1789,6 +1841,8 @@ async def test_a_referenced_empty_page_is_a_split_identity(graph, content):
     group = next(g for g in result["groups"] if "Dawnspire" in g["titles"])
     assert group["classification"] == "split_identity"
     assert "retitleOverDuplicate" in group["reading"]
+    assert next(m for m in group["members"]
+                if m["uuid"] == empty["uuid"])["block_refs"] == 1
 
 
 async def test_a_tag_clashing_with_a_page_is_reported(graph, content):

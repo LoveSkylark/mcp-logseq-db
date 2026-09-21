@@ -19,10 +19,12 @@ the second question.
    is missing** — test it anyway and record what happened.
 2. Before any write, state the target UUID or ident, the operation, and how it
    is reversed.
-3. **Reuse the fixture pages; do not create one per run.** The convention is
-   two long-lived pages, `MCP Test Fixture A` and `MCP Test Fixture B`,
-   emptied with `clearPage` at the START of a run. Never test against real
-   content.
+3. **Reuse the fixture pages; create them if they do not exist yet.** The
+   convention is two long-lived pages, `MCP Test Fixture A` and
+   `MCP Test Fixture B`, emptied with `clearPage` at the START of a run.
+   Check with `isTitleAvailable` first — on a graph where no run has used
+   this convention they will be genuinely free, and creating them is
+   permanent state worth reporting. Never test against real content.
 
    Why not a fresh `MCP T <date> <run>` page each time, which is what earlier
    runs did: `deletePage` RECYCLES, a recycled page keeps its title, and there
@@ -310,7 +312,11 @@ you created.
 | T-249 | Pass a parent and one of its own children in the same list | Refused before any write. A move carries the subtree, so the second move would pull the child back out. |
 | T-250 | Pass a target that sits inside one of the blocks' subtrees | Refused before any write |
 | T-251 | Pass 55 blocks | `attempted: 50`, `not_attempted: 5`, `verified: false`, and the five come back **in order**. Then pass those five in a second call with `last-child` and confirm they append correctly — that is the paging contract. |
-| T-252 | `all_or_nothing: true` on a run you can make fail part-way | `rolled_back` lists the landed blocks, and the diagnostic says **POSITION WAS NOT RESTORED**. Confirm in the UI that they are back under the original parent but grouped at its top. Hard to provoke; if you cannot, record it as unconstructable rather than as a pass. |
+| T-252 | `all_or_nothing: true` on a run you can make fail part-way | `rolled_back` lists the landed blocks, and the diagnostic says **POSITION WAS NOT RESTORED**. Confirm in the UI that they are back under the original parent but grouped at its top. **Known unconstructable as of 2026-09-20:** every reachable failure (missing, duplicate, descendant-of-another, target-inside-subtree) is caught before the loop, so a genuine mid-list stop needs `moveBlock` to return clean without landing the block, which cannot be induced from the client. Record it as unconstructable rather than as a pass — `rolled_back` and that diagnostic are unverified, and the remedy is partial by design. |
+| T-253 | `moveBlocks` with `placement=before` against a BLOCK target | The run lands immediately before the target, internally in order. The enum accepts this and no test covered it until now. |
+| T-254 | `moveBlocks` with `placement=after` against a block target | The run lands immediately after the target, in order, without displacing the target's own following siblings |
+| T-255 | `moveBlocks` with `placement=before` against a PAGE target | Refused — a page has no siblings |
+| T-256 | `createPageofBlocks` with more than 20 blocks, `verbose: false` | `created_count` equals `len(created)`. Found live at 55 blocks: the count said 55 and the list held 20, so everything past the cap was unaddressable. Fixed; this pins it. |
 
 ### Importing
 
@@ -329,6 +335,56 @@ you created.
 | T-268 | A list element that is `"alias:: X"` | Stored as block CONTENT. The list form has no page-property region, so `page_properties` must be empty. |
 | T-269 | An empty or whitespace-only list element | Refused |
 | T-270 | `dry_run: true` on a list | `verified: false`, correct `blocks`, and no `insertBatchBlock` call |
+
+### Duplicate triage
+
+`findDuplicateTitles` is read-only, which makes it the safest of the new
+tools to run first — and the one whose wrong answer is most expensive, since
+its output is what a repair acts on.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-271 | `findDuplicateTitles` with `normalize=exact` | Groups of identical titles only. Confirm it does NOT group `Loom-Weaver` with `Loom Weaver` — `exact` once folded punctuation because the mode was passed as a boolean. |
+| T-272 | `normalize=loose` | Folds case, whitespace, punctuation and simple plurals. Report the group count and elapsed time. |
+| T-273 | `normalize=fuzzy` | Adds edit-distance pairs. Report the count and time, and how many groups are new versus T-272. |
+| T-274 | **Acceptance.** Any group containing a known alias | Classified `alias`, `rank: 5`, `reading` says NOT a duplicate. **Find the pair first rather than assuming one:** an alias only forms a group if its title collides with something, and `anotheralias` → `NamespaceTest` does NOT collide under any normalisation, so that pair cannot exercise this test. On 2026-09-20 the pair that did was `testalias` ↔ `MCP T 2026-09-20 R1`. If no group comes back `alias`, cross-check `pageStats` on a page you know is aliased before recording this as unconstructable. **If an aliased page appears in a group classified as anything else, STOP** — the guard is the only thing preventing a recommendation to delete a relation these tools cannot rebuild. |
+| T-275 | Cross-check two groups against `pageStats` for the same pages | `own_blocks` and `content_blocks` agree exactly — they query the same attributes, so a disagreement means one is wrong. `block_refs` should equal `pageStats`' `refs`, and is EXPECTED to be lower than `refs + tag_holders + property_values`: it counts `:block/refs` only. Confirm a page with `property_values: 1` still shows `block_refs: 0` and that the group's reading says to check `pageStats`. |
+| T-276 | A group where both sides hold content | `genuine_split`, `rank: 4`, and the reading defers to a human |
+| T-277 | A page and a tag sharing a title | Both appear in one group with `kind` distinguishing them — they share one title space |
+| T-278 | Any recycled page holding a title | Present with `recycled: true`, and absent when `include_recycled=false`. **Note the interaction with Protocol §11:** a group can exist only because a RECYCLED sibling supplies the title collision, so `include_recycled=false` can make an alias group disappear even when the aliased page itself is live. Observed 2026-09-20. The cheap sweep can therefore hide an alias relation — run the default before acting on anything. |
+| T-279 | `normalize` set to something else | Refused |
+
+### Splitting a block
+
+All on `MCP Test Fixture A`. The safety property is the ORDER of operations,
+so the failure cases matter more than the happy path.
+
+| ID | Test | Expected |
+|---|---|---|
+| T-280 | **Acceptance.** `createBlock` with `Head paragraph\n\n**Modifiers:**\n\n**Equipment:**`, then `splitBlock` on `\n\n` | THREE blocks in that order. Verify by reading `:block/order` on all three, not from the envelope. |
+| T-281 | Join the three stored titles with `\n\n` | Identical to what you sent. No text lost is the whole point. |
+| T-282 | `splitBlock` with `offset` falling mid-WORD (no space at the index) | Two blocks, split exactly there, rejoining into the original |
+| T-282b | `splitBlock` with `offset` falling on a SPACE | Refused. Logseq trims a block's edges on write, so that character cannot survive in either part. Found 2026-09-20: `"Head tail"` at offset 5 stored `"Head"` + `"tail"` — rejoining to `"Headtail"` — and reported `verified: true`, because the content check rstrips both sides to tolerate Logseq's trimming. The tool claimed to preserve whitespace exactly; it never could. |
+| T-283 | A delimiter that does not occur | Refused at `failure_stage: validation`, nothing written |
+| T-284 | `offset: 0`, and an offset equal to the block's length | Both refused — either would produce an empty part |
+| T-285 | Both `offset` and `delimiter`, then neither | Both refused |
+| T-286 | A block containing a line starting with `- `, split on `\n\n` | Refused. Logseq would truncate that part on write, so the split would destroy the prose it was meant to rescue. |
+| T-287 | `splitBlock` on a NESTED block | The parts stay under the same parent, in order — they are briefly created as children of the original before being promoted to siblings, so check the final state rather than the intermediate one |
+| T-288 | A block with a repeated delimiter (`Head\n\n\n\nTail`) | Refused — the split point is wrong and would produce an empty part |
+
+### Migrating a page
+
+| ID | Test | Expected |
+|---|---|---|
+| T-290 | Build ten top-level blocks on Fixture A with `createBlock` in a loop, and record `:block/order` for all ten | That recorded order is the baseline. **Do not build this with `importPage`** — it prepends on this build, so the fixture would arrive reversed. |
+| T-291 | `migratePage` A → B with `dry_run: true` | Writes nothing, `verified: false`, `planned` lists all ten in order with a text preview each. Confirm B is still empty afterwards. |
+| T-292 | **Acceptance.** The same call for real | All ten arrive at B in the baseline order, `remaining: 0`, `order_preserved: true`. Verify order at the destination by reading `:block/order`. |
+| T-293 | Mixed blocks on A, then `contains` matching some of them | Only the matching blocks move; the rest stay. `remaining` equals the number left, read back from the source rather than subtracted. |
+| T-294 | The same `contains` with the case changed | Nothing selected, `planned: []`. The selector is case-sensitive on purpose — a selector that guesses at intent is what this tool refuses to be. |
+| T-295 | A page whose top-level block has children | Only the parent is listed in `planned`; the child travels with it and is still nested at the destination |
+| T-296 | `migratePage` with source and target the same page | Refused |
+| T-297 | `contains` set to whitespace | Refused — omit it to migrate everything |
+| T-298 | An empty source page | `verified: true`, `planned: []`, and the diagnostic says the page is empty. Not an error. |
 
 ---
 
