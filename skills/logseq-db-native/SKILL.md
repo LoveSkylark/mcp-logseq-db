@@ -95,6 +95,30 @@ stripped, and a line starting with `- ` becomes a child of the block instead
 of part of it. An eight-step numbered sequence, a markdown table or a fenced
 code block therefore needs the list form, or it fragments.
 
+**A tag is behaviour, not a label.** A built-in class declares properties on
+whatever carries it, and some change how the node renders: `#Code` turns a
+block into a code block, `#Task` gives it Status, Priority, Deadline and
+Scheduled. Those four are PROPERTIES, not text markers — there is no `TODO`
+keyword in the content.
+
+Declared is not set. A property a class declares has **no datom** until it
+holds a value, so it appears in no block read at all; `inspectPage
+detail=declared` is the only way to see it. And none of the built-ins are
+writable from here — the sandbox permits `plugin.property.<caller>/*` only —
+so the pattern is: define the class and its properties once in the Logseq UI,
+then `addTag` from the API.
+
+**Tagging also fires templates.** A template is a block tagged `#Template`
+pointing at a tag; tag anything with that tag and the template's child blocks
+are inserted, `addTag` included. Only CONTENT travels — the template's own
+property values stay on the template, because the tag owns properties and the
+template owns blocks. Each inserted block is stamped with
+`:logseq.property/used-template`, on the CHILDREN rather than on the node you
+tagged, and `getBlockTree` does not return that attribute — use
+`getProperyUsers(":logseq.property/used-template")`. See
+`reference/built-ins.md` for the full inventory, the closed enums, and what
+tagging does and does not copy.
+
 ## A page is a block
 
 Pages, blocks, tags, and properties share one entity store. A page carries
@@ -616,6 +640,10 @@ Read before the matching work, not otherwise:
 
 - `reference/data-modeling.md` — page vs block vs tag vs property, schema
   types, import order. Read before designing a schema or a multi-entity import.
+- `reference/built-ins.md` — the built-in classes (`#Task`, `#Code`,
+  `#Query`…), what each declares, the closed enums, and which of it is
+  writable. Read before setting a property or expecting a tag to do
+  something.
 - `reference/write-workflows.md` — exact shapes and verification steps for each
   write. Read before an unfamiliar write.
 - `reference/troubleshooting.md` — ambiguous results, timeouts,
