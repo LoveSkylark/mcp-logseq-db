@@ -1,117 +1,23 @@
-Feature request: mcp-logseq-db — raw :block/link lookup tool
-Problem
+# MCP Tool Improvement Plan
 
-Logseq's DB-native storage has a low-level Datascript attribute, :block/link, that represents a raw block-to-entity reference edge. It is distinct from the user-facing "property" system: it does not appear in listProperties, and getProperyUsers explicitly refuses it —
+Ordered so each instruction is independently shippable. Phase 1 is cheap and safe; Phase 2 is where the real cost savings are; Phase 3 needs upstream verification first. Two pairs are marked where splitting them makes no sense.
 
-Expected an exact namespaced property ident such as :plugin.property.my_plugin/Effort
-for property ident, not a title or a UUID: 'link'
-
-— because link isn't a namespaced user property, it's a schema-level attribute.
-
-We hit this directly while repairing a graph migrated from classic file-based Logseq (OG) into DB-native Logseq. The crash pattern (documented in the logseq-db-import-repair skill) was: an otherwise-empty block (content: "") carrying a stray :block/link edge to another entity — almost certainly a leftover from an OG ((block-reference)) embed whose display text was cleared during migration but whose underlying reference edge was not. These blocks are invisible in the Logseq UI (no content to render) but reliably crashed the DB-native renderer when the page was opened.
-
-Current workaround (expensive)
-
-The only way to surface these edges today with the existing toolset:
-
-Call inspectPage(page_uuid, detail="properties") on a page.
-This returns every property value on the page — routinely tens of thousands of characters for a page of even moderate size, almost always too large to return inline (saved to a file instead).
-Locally filter the returned array for entries where property.ident == "link".
-For each match, check whether holder.content == "" to guess whether it's a dangling stub vs. a legitimate reference on real content.
-Repeat per page — there is no way to scan the whole graph in one call.
-
-This is a lot of overhead to find what is usually a handful of junk blocks, and it can't be run proactively at graph scale (e.g. "scan everything before I open it").
-
-Additionally: once a raw link target is found, its value is a bare internal integer id (e.g. 3130), not a UUID. There is currently no tool that resolves that raw id back to a UUID, a title, or even confirms the target entity still exists. This makes a found edge a dead end for further inspection.
+Every item traces to something that actually cost us in this session, noted under *Evidence*.
 
 
 
-Requested tool
-
-findRawBlockLinks
-
-Input:
-
-page_uuid (optional) — scope the search to one page. Omitted, scan the whole graph.
-empty_holders_only (optional, default true) — when true, only return matches whose holder block has empty content (the corruption-signal case); when false, also return legitimate content blocks that happen to carry a :block/link edge.
-
-Behavior: query directly against the :block/link Datascript attribute (not through the property-definition/listProperties machinery, which does not model it at all).
-
-Output: one row per match:
-
-holder_uuid, holder_page (uuid + title)
-holder_content (so the caller doesn't need a follow-up getBlock call just to check emptiness)
-link_target_uuid — the raw target resolved to a UUID (and title, if the target is a page or has one), not a bare integer id. This is the single biggest gap today: a raw id like 3130 cannot currently be resolved back to anything inspectable.
-link_target_exists (boolean) — whether the target entity still resolves at all, to help distinguish "dangling/orphaned edge" from "legitimate cross-reference to something that still exists."
-
-Why this matters: this pattern is a known, reproducible source of DB-native crashes after an OG→DB migration, and it's scattered — we found 13 instances across a single page's content during one repair session, each one silent until the page was opened. A cheap, targeted, graph-wide lookup would turn a proactive "scan before it crashes" step into one call, and would turn root-cause diagnosis (which currently requires manual binary-search bisection across disposable scratch pages, since no JS stack trace is available through MCP) into a direct lookup.
-
-Context / reproduction
-
-See the logseq-db-import-repair skill for the full repair playbook, including the two confirmed crash patterns (this one, and a second unrelated pattern: a heading block whose entire content is a single wiki-link). Example of a found instance from this session:
-
-json
-// getBlock result for a crash-causing block
-{
-  "uuid": "6a93617c-3d7f-4148-b850-fc762844f811",
-  "content": "",
-  "title": "",
-  "link": {"id": 3130}
-}
-
-3130 could not be resolved to a UUID, title, or page with any tool available in this session.
 
 
 
-mcp-logseq-db: tool requests to make crash-repair work safer and cheaper
 
-Everything below comes from real repair work this session (pages "Dice", "Combat", "Mysteries" — all hit the same page-entity corruption, documented as "Pattern 3" in the logseq-db-import-repair skill). Ranked by how much pain each one would remove.
+## Cross-cutting concerns
 
-1. setPageParent(page_uuid, new_parent_uuid_or_null) — HIGHEST VALUE
+**Document the two behaviours we found the hard way.** Recycled pages can be renamed and this releases the title; `getPageUUID` and the write path disagree on recycled titles. Both contradict the current reference files, and both caused mistakes today. Also correct write-workflows' stale "There is **no move**. No route exists for it" and data-modeling's "No block movement — yet."
 
-The root cause of every crash fixed this session was a page's own parent attribute pointing at a stale/wrong id. No exposed tool can write this field — renamePage doesn't touch it, and nothing else does either. That forced a full UUID-migration workaround every time: create a new page, move all content over, re-attach tags/properties, rewrite every inbound reference graph-wide (29, 32, 5 updateBlock calls respectively), then swap titles with retitleOverDuplicate, then permanently park the corrupted original because any real nested sub-pages it held (Maneuver, Campaign Planning, etc.) can't be extracted from it either.
+**Keep verification, cut the echo.** The read-back-and-compare discipline is the best thing about this toolset and caught real failures. Instruction 2 targets the response size, not the checking.
 
-If this one tool existed, the entire fix would be: setPageParent(page_uuid, null). One call, zero data movement, zero backlink rewriting, zero orphaned "ZZ ... do not delete" parked pages left behind forever.
+**Prefer additive changes.** Every item here is a new tool, a new enum value, or a new optional parameter. Nothing redefines existing behaviour, so nothing needs a coordinated client update.
 
-2. movePage(page_uuid, new_parent_uuid_or_null)
+**Sequencing:** 1 → 2 → 7 unlocks the most, in that order. Instruction 1 is a prerequisite for 7; 7 is a prerequisite for 13. Everything else is independent.
 
-moveBlock/moveBlocks explicitly refuse on a page-entity ("Source UUID identifies a page, not a block") — only a nested page's children can be relocated, never the nested page itself. This is why every corrupted page that held a real nested sub-page (Dice→Rules sets, Combat→Maneuver, Mysteries→Campaign Planning + Forging an Epic Campaign) had to leave its parked, permanently-undeletable husk behind just to keep that nested page's namespace valid. A tool that can re-parent a page (including onto no parent, i.e. promote it to top-level) would let those nested pages be rescued onto the new clean page instead of stranding them under a "do not delete" placeholder forever. This is really the same underlying primitive as #1, generalized to any page rather than just clearing corruption.
-
-3. rewriteReferences(old_uuid, new_uuid) (bulk, server-side)
-
-Every UUID migration needed a findBacklinks call followed by one updateBlock per hit — 29 calls for Dice, 32 for Combat, 5 for Mysteries. That's slow, and it's a place where a step can be silently missed (only caught by re-running findBacklinks afterward). A single call that atomically rewrites every literal [[old_uuid]] occurrence graph-wide to [[new_uuid]] — and reports what it changed — would remove both the tedium and the risk. Should also cover (or clearly report separately, since it may not be able to fix) any raw :block/link property values pointing at the old uuid, since those currently can't be rewritten by any tool (see #5).
-
-4. A page-level "entity anomaly" scan, e.g. findAnomalousPages()
-
-Finding the two additional Pattern-3 cases (Combat, Mysteries) required a subagent to call inspectPage(detail="page") on all 620 live pages individually and check each one's parent field by hand against a manually-built "valid id" set — a ~700k-token, 650-tool-call sweep for what should be a cheap structural check. A tool that does this server-side — flagging any top-level page with a parent field that doesn't resolve to a sensible visible content page (not a hidden system page like "Library"/"Favorites"/"Views") — would turn a full-graph health check into one call instead of hundreds.
-
-5. Write access to raw :block/link, e.g. setBlockLink(block_uuid, target_uuid_or_null)
-
-Found this session: a $$$favorites entry still carries a raw :block/link pointing at a migrated-away (now-parked) page uuid, and there's no tool that can repoint or clear it — updateBlock only rewrites plain content strings. This is the same gap the existing findRawBlockLinks request (below) is about, but for writing rather than just finding.
-
-6. Alias read/write access, e.g. addAlias/removeAlias
-
-alias/is_alias_of is a native Logseq attribute outside this server's writable property namespace. During the Mysteries migration, its alias relation to "Campaign" had no way to be carried over to the new page — it's now stranded on the parked/corrupted uuid, silently breaking [[Campaign]] resolution until a human recreates it by hand in the Logseq UI. If the underlying Logseq plugin API allows reading/writing this relation at all, exposing it here would remove the one step in this whole repair process that currently requires manual follow-up in the app.
-
-7. findTitleHolder(title) — resolve who currently holds a title across the shared namespace
-
-Pages, tags, blocks and properties all share one title space, but the only way to find out what holds a given title when something refuses a rename is findDuplicateTitles (pages only) or a manual searchBlocks guess. This session, retitleOverDuplicate refused because a plain heading block on a "Contents" page happened to contain the literal text "Combat" — finding that took extra digging. A single lookup that says "title X is currently held by: page P / tag T / block B (with its content) / property R" would remove the guesswork entirely and reduce the temptation to just delete whatever's in the way without reading it first (which caused actual data loss on the Mysteries fix).
-
-8. removeBlock should refuse (or require an explicit recursive=true + return full content) on any block with children
-
-Currently removeBlock silently cascades to children with no confirmation and no way to see what was removed afterward — previous_count tells you how many blocks were deleted, never what they said. This is exactly how a Contents-page subtree got permanently deleted this session without its content ever being read. Either (a) refuse by default when a block has children and require an explicit recursive flag, or (b) always return the full recursively-read content of everything actually deleted in the response, so a caller (or a human reviewing the tool call afterward) can catch a mistake before it's unrecoverable.
-
-Already requested (unchanged): findRawBlockLinks
-
-Add a tool that looks up the raw :block/link Datascript attribute directly. It's a low-level schema attribute, not a user-facing property — it doesn't show up in listProperties, and getProperyUsers rejects it outright since it isn't a namespaced property ident.
-
-Input: page_uuid (optional — omit to scan the whole graph).
-
-Output: one row per block that carries a :block/link value:
-
-holder_uuid, holder_page (uuid + title)
-holder_content (so callers can spot empty holders without a follow-up getBlock)
-link_target_uuid — the target resolved to a UUID/title, not a bare internal integer id (today there's no way to resolve an id like 3130 back to anything)
-link_target_exists — whether that target still resolves at all
-
-Why: empty blocks carrying a dangling :block/link are a real, reproducible crash cause in Logseq DB-native pages migrated from OG (see the logseq-db-import-repair skill, Pattern 2). Right now finding them means calling inspectPage(detail="properties") per page — a huge payload — and filtering it by hand. This tool would make that a single, cheap, targeted call.
+I can put this in a document if you want it outside the chat.
