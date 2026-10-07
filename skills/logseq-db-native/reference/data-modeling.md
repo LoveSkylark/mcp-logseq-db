@@ -38,6 +38,13 @@ An older graph may therefore already contain pairs the tools would now reject.
 **Blocks: title only at creation.** Tags, properties, and position are all
 follow-up calls. A block with a tag and two properties is four calls, not one.
 
+**Linked embeds: native MCP only.** When `createEmbed` is available, use it
+for a live view of an existing page or block rather than copying its content
+or writing a text link. The embed is its own block and points at the target by
+UUID; target content is not copied or expanded into the parent. `listEmbeds`
+can inventory these links by owning page or exact target. The Python
+`mcp-logseq-db` server does not currently expose these two tools.
+
 **Properties: your namespace only.** You can create and set
 `plugin.property.<caller>/*`, where `<caller>` is assigned by Logseq from the
 API server's identity rather than chosen — on the graph this was developed

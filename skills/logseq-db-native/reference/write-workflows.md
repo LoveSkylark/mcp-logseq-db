@@ -224,6 +224,33 @@ which would detach it from the graph, and sibling placement against a page.
 confirms the arguments are well formed and the targets exist; it cannot
 confirm the write will succeed.
 
+### Linked embeds (native MCP only)
+
+```text
+createEmbed(parent_uuid, target_uuid, dry_run=false, verbose=true)
+listEmbeds(page_uuid?, target_uuid?, limit=100)
+```
+
+Use exact UUIDs for both the destination page/block and the page/block being
+displayed. Resolve titles with `getPageUUID` or `getBlockUUID`; neither embed
+argument accepts a title. The destination is the embed's structural parent,
+and the target is linked, not copied. Self and ancestor targets are refused
+to prevent render cycles.
+
+`createEmbed` dry-run checks UUID resolution and ancestry only. It does not
+run all write-time graph/type/recycled validation. After a real call, require
+`verified: true`. If verification fails or the result is ambiguous, call
+`listEmbeds` with the owning `page_uuid` and `target_uuid` before considering
+a retry; the embed may already exist. The filters combine, and `page_uuid`
+means owning page rather than recursive nested-page scope. Check `truncated`
+when relying on a listing.
+
+An embed is a block with its own UUID; removing it with `removeBlock` leaves
+the target intact. Never remove the target as a way to remove the embed.
+`getBlock`, `getBlockUUID`, and `getBlockTree` include target metadata but do
+not expand target content. An empty embed title is not evidence of an empty
+block.
+
 ### Outlines
 
 ```

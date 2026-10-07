@@ -1,12 +1,14 @@
 ---
 name: logseq-db-native
-description: "Use when reading or modifying a Logseq 2.x DB graph through the mcp-logseq-db server. Covers DB queries, exact identifiers, verified writes, the property namespace sandbox, and recovery from ambiguous results. Never use file-graph or non-DB Logseq tools."
+description: "Use when reading or modifying a Logseq 2.x DB graph through the Python mcp-logseq-db or Logseq native MCP server. Covers DB queries, exact identifiers, verified writes, the property namespace sandbox, and recovery from ambiguous results; linked-embed tools are native-only. Never use file-graph or non-DB Logseq tools."
 ---
 
 # Logseq DB-Native MCP
 
-For `mcp-logseq-db` against a Logseq 2.x **DB** graph. Do not load a
-file-graph or legacy Logseq skill in the same conversation.
+For a Logseq 2.x **DB** graph connected through the Python `mcp-logseq-db` or
+Logseq native MCP server. Their tool surfaces differ; use only tools exposed
+by the connected server. Do not load a file-graph or legacy Logseq skill in
+the same conversation.
 
 ## The governing fact
 
@@ -139,6 +141,30 @@ A page's own tags and its blocks' tags are separate queries. So are properties
 that hold a value and properties that are merely *declared* by the page's
 classes — the latter have no datoms and appear in no query over the page.
 `inspectPage` separates these with its `detail` selector for that reason.
+
+### Linked embeds (native MCP)
+
+The native Logseq MCP adds `createEmbed` and `listEmbeds`; the Python
+`mcp-logseq-db` server does not currently register them. Check the connected
+server's tool list before relying on either tool.
+
+An embed is a block with its own UUID that displays a linked page or block. It
+is not a copy, a text reference, or an empty placeholder. `getBlock`,
+`getBlockUUID`, and `getBlockTree` expose embed target metadata, but do not
+expand the target's content. An empty title does not make an embed empty.
+
+- `listEmbeds(page_uuid?, target_uuid?, limit=100)` discovers embeds without
+  writing. Filters combine; `page_uuid` scopes to the owning page, not nested
+  pages, and `target_uuid` matches the exact linked entity. Check `truncated`
+  before treating a result as complete.
+- `createEmbed(parent_uuid, target_uuid, dry_run?, verbose?)` uses exact UUIDs
+  for the destination page/block and target page/block. Resolve titles first;
+  self/ancestor targets are refused. A dry run checks UUID resolution and
+  ancestry only, not every write-time condition.
+- If `createEmbed` returns `verified: false` or verification fails after the
+  call, do not retry blindly: inspect `listEmbeds` for that page and target
+  first. To remove an embed, pass the embed block's own UUID to `removeBlock`;
+  never pass the target UUID.
 
 **`:block/page` can disagree with `:block/parent`, and that is harmless.**
 On some graphs a block's `:block/page` points at an ancestor block rather than

@@ -13,6 +13,8 @@ being accepted.
 | `failure_stage: logseq_error` | Logseq returned an error. | Read it; it is usually specific. `"Editing a page, tag or property isn't supported yet"` is a hard limit, not a transient failure. |
 | `failure_stage: transport` | Never got a reply. | The outcome is unknown. Read the target to find out. |
 | `failure_stage: readback_mismatch` | The write returned, the read-back disagreed. | Same as `verified=false` above. |
+| `createEmbed` verification failed or timed out | The embed may already have been created even though verification did not complete. | On the native MCP server, inspect `listEmbeds` using the owning page and target UUIDs before retrying. The Python server does not currently expose these tools. |
+| An embed has an empty title | Linked target content is not copied into the embed block's title. | On the native MCP server, use `getBlock` or `listEmbeds` to inspect target metadata. Do not treat a confirmed embed as an empty placeholder or remove its target. |
 | `writes_disabled` in `capabilities` | A previous write timed out ambiguously and the circuit opened. | See below. |
 | A read is fine but every write is refused | Same circuit. | See below. |
 | `PermissionError` on a write | An operator scope (`LOGSEQ_WRITE_*`) excludes the target. | Configuration, not a bug. Tell the user which scope. |

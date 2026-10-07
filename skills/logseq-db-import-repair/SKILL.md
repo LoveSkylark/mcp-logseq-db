@@ -1,6 +1,6 @@
 # Logseq DB import repair
 
-This skill documents crash-causing corruption patterns found in graphs migrated from Logseq OG (file-based) to Logseq DB-native, how to diagnose them with only the `mcp-logseq-db` MCP tools (no JS stack trace is available through this interface), and how to fix them while changing as little of the original document as possible.
+This skill documents crash-causing corruption patterns found in graphs migrated from Logseq OG (file-based) to Logseq DB-native, how to diagnose them with Logseq DB-graph MCP tools (no JS stack trace is available through this interface), and how to fix them while changing as little of the original document as possible. Tool availability differs between the Python `mcp-logseq-db` and native Logseq MCP servers; use only tools exposed by the connected server.
 
 ## Guiding principle: repair, don't rebuild
 
@@ -40,6 +40,15 @@ They are usually found as the sole child of an otherwise ordinary content block 
 
 **Fix:** `removeBlock` on the empty block directly. Since it has no content, this cannot lose any visible information. Do not remove or alter its parent (the visible block it's attached to) — only the empty stub child itself.
 
+**Guard against deleting a real embed.** The native Logseq MCP exposes
+`listEmbeds` and returns embed target metadata from `getBlock`. If those tools
+are available, check the suspect UUID in the owning page's embed listing first.
+If it is a listed embed, it is a linked view, not an empty stub: preserve it
+unless the user explicitly wants that embed removed. `removeBlock` must receive
+the embed's UUID; its target remains intact. The Python `mcp-logseq-db` server
+does not currently expose `listEmbeds`, so use the property scan below there
+and do not infer that an empty title proves the block is junk.
+
 ## Diagnostic method: bisection via non-destructive moves
 
 There is no way to get a JS stack trace or crash log through the `mcp-logseq-db` tools. When a page crashes and the cause isn't obviously one of the two patterns above, use binary-search bisection:
@@ -56,7 +65,7 @@ There is no way to get a JS stack trace or crash log through the `mcp-logseq-db`
 
 ## Proactively scanning a page for Pattern 2 before it causes a crash
 
-`:block/link` is a raw internal Datascript attribute, not a Logseq "property" in the user-facing sense — it does **not** appear in `listProperties`, and `getProperyUsers` refuses it ("not a title or a UUID" — it wants a full namespaced ident like `:user.property/foo-xxxx`, and `link` isn't namespaced). The only way to surface it with current tools is:
+`:block/link` is a raw internal Datascript attribute, not a Logseq "property" in the user-facing sense — it does **not** appear in `listProperties`, and `getProperyUsers` refuses it ("not a title or a UUID" — it wants a full namespaced ident like `:user.property/foo-xxxx`, and `link` isn't namespaced). `listEmbeds` can identify native embeds, but is not a general query for every raw `:block/link` value. To inspect the attribute on suspected stubs, use:
 
 1. Call `inspectPage(page_uuid, detail="properties")` on the page (this can be a large payload for a big page — expect it to be saved to a file rather than returned inline; read it with the file-reading tool and grep/parse with a short script rather than paging through it by hand).
 2. Filter the returned `properties` array for entries where `property.ident == "link"`.
