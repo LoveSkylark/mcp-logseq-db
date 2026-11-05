@@ -368,6 +368,17 @@ async def test_import_builds_the_whole_tree(graph, importer):
     assert "## Core Elements" in titles
 
 
+async def test_nested_heading_import_verifies_by_block_count(graph, importer):
+    result = await importer.import_page(
+        graph.page["uuid"],
+        "- Parent\n  - ## Heading\n    - Nested child\n",
+    )
+
+    assert result.verified is True
+    assert result.blocks == 3
+    assert result.diagnostic is None
+
+
 async def test_import_does_not_mint_pages_for_links(graph, importer):
     """The whole reason the escaping exists. Without it this import creates
     stub pages for Dawnspire, City and Plants."""

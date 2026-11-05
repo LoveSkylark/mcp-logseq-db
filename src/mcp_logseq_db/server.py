@@ -174,7 +174,7 @@ def create_server(
     async def create_page(
         title: str, dry_run: bool = False, verbose: bool = True
     ) -> dict[str, Any]:
-        """Create one page. Routed through logseq.DB.createPage, which is idempotent on title -- unlike upsertNodes, which fails outright on synced graphs. A title already held by any page, tag or block is rejected, since the three share one title space. verbose=false returns identity and position only."""
+        """Create one page. Routed through logseq.DB.createPage, which is idempotent on title -- unlike upsertNodes, which fails outright on synced graphs. This tool rejects any existing page, tag, block or property title before calling the route; repeating the tool call returns an error rather than the existing page. verbose=false returns identity and position only."""
         return (await content().create_page(
             title, dry_run=dry_run)).to_dict(verbose)
 
@@ -302,7 +302,7 @@ def create_server(
         regex: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
-        """Find every entity whose title contains a string -- the way to locate a typo, a phrase, or duplicated content without re-reading whole pages. Returns terse rows: uuid, kind, title, order, and the page each sits on, which is what updateBlock needs. MATCHING IS CASE-SENSITIVE and substring-only; regex refines those rows afterwards rather than widening the search. matches is counted separately from the rows returned, so zero means genuinely nothing found rather than a result set too large to send -- and when there are more matches than can safely be fetched, it reports the count and fetches nothing rather than returning a silently truncated list. Scope with page_uuid where you can: this runs a predicate inside Logseq's DB worker, which is the one query shape known to be able to wedge it, so it is single-attempt and never retried. Pages, tags and property definitions carry titles too and will match; each row says which kind it is."""
+        """Find every entity whose title contains a string -- the way to locate a typo, a phrase, or duplicated content without re-reading whole pages. Returns terse rows: uuid, kind, title, order, and the page each sits on, which is what updateBlock needs. MATCHING IS CASE-SENSITIVE and substring-only; returned rows are checked against the exact substring in Python, and regex refines those rows rather than widening the search. When there are more database candidates than can safely be fetched, it reports that candidate count, marks exact matches unverified in the diagnostic, and fetches nothing rather than returning a silently truncated list. Scope with page_uuid where you can: this runs a predicate inside Logseq's DB worker, which is the one query shape known to be able to wedge it, so it is single-attempt and never retried. Pages, tags and property definitions carry titles too and will match; each row says which kind it is."""
         if page_uuid is not None:
             page_uuid = require_uuid(
                 page_uuid, role="page_uuid", hint="getPageUUID")
@@ -516,7 +516,7 @@ def create_server(
         options: dict[str, Any] | None = None,
         verbose: bool = True,
     ) -> dict[str, Any]:
-        """Create a property definition. Pass a plain title, never a namespaced ident -- spaces are stripped from it, so "MCPT Check" becomes MCPTCheck. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen. The stored type is verified against the requested one. verbose=false still returns the assigned ident, which every other property tool needs."""
+        """Create a property definition. Pass a plain title, never a namespaced ident. Logseq may normalize the title on write (for example, stripping spaces: "MCPT Check" becomes "MCPTCheck"); use the returned ident and read-back title for later operations. schema takes a type: default (text), number, string, datetime, checkbox, url, node, page, class, property, or map. The namespace is assigned from caller identity and cannot be chosen. The stored type is verified against the requested one. verbose=false still returns the assigned ident, which every other property tool needs."""
         return (await mutations().create_property(
             title, schema, options)).to_dict(verbose)
 

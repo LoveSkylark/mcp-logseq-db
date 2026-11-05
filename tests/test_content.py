@@ -524,6 +524,10 @@ class FakeClient:
             return [e for e in self.graph.entities.values()
                     if any(r.get("id") == params[0]
                            for r in e.get("refs", []))]
+        if "[?entity :block/refs ?page]" in query:
+            return [e for e in self.graph.entities.values()
+                    if any(r.get("id") == params[0]
+                           for r in e.get("refs", []))]
         if "[?e :block/tags ?target]" in query:
             return [e for e in self.graph.entities.values()
                     if any(t.get("id") == params[0]
@@ -810,6 +814,42 @@ async def test_create_page_refuses_a_duplicate_before_writing(graph, content):
         await verified.create_page("TEST-PAGE")
 
     assert not any(m == "logseq.DB.createPage" for m, _ in client.calls)
+
+
+async def test_delete_ignores_builtin_reference_view_blocks(graph, content):
+    page = graph.add("Disposable", None, None, name="disposable",
+                     tags=[PAGE_CLASS_ID])
+    linked = graph.add("Linked references", graph.page["id"], graph.page["id"])
+    unlinked = graph.add("Unlinked references", graph.page["id"], graph.page["id"])
+    real = graph.add("A real link", graph.page["id"], graph.page["id"])
+    for referrer in (linked, unlinked, real):
+        referrer["refs"] = [{"id": page["id"]}]
+
+    result = await content.delete_page(page["uuid"])
+
+    assert result.verified is False
+    assert "1 real reference(s)" in (result.diagnostic or "")
+    assert "2 built-in reference view block(s) were excluded" in (
+        result.diagnostic or "")
+    assert {e["title"] for e in result.observed_entities} == {
+        "Linked references", "Unlinked references", "A real link"}
+    assert page.get(":logseq.property/deleted-at") is None
+
+
+async def test_delete_without_real_references_ignores_builtin_views(
+        graph, content):
+    page = graph.add("Disposable", None, None, name="disposable",
+                     tags=[PAGE_CLASS_ID])
+    for title in ("Linked references", "Unlinked references"):
+        view = graph.add(title, graph.page["id"], graph.page["id"])
+        view["refs"] = [{"id": page["id"]}]
+
+    result = await content.delete_page(page["uuid"])
+
+    assert result.verified is True
+    assert "0 real inbound reference(s)" in (result.diagnostic or "")
+    assert "2 built-in reference view block(s)" in (result.diagnostic or "")
+    assert graph.entities[page["uuid"]][":logseq.property/deleted-at"] is not None
 
 
 async def test_dry_run_does_not_report_verified_true(graph, content):
@@ -2406,6 +2446,32 @@ async def test_a_typo_is_found_with_its_page_in_one_call(graph, content):
     assert row["kind"] == "block"
     assert row["page"]["title"] == "TEST-PAGE"
     assert "Opions" in row["title"]
+
+
+async def test_search_filters_backend_false_positives(graph):
+    class OvermatchingClient(FakeClient):
+        def _query(self, query, params):
+            if "(count ?block)" in query and "includes?" in query:
+                return 3
+            if "[:find [(pull ?block" in query:
+                return [
+                    self._with_page_titles(e)
+                    for e in (
+                        graph.add("contains teh", graph.page["id"],
+                                  graph.page["id"]),
+                        graph.add("MCP Test Alpha", graph.page["id"],
+                                  graph.page["id"]),
+                        graph.add("Nested child of block one",
+                                  graph.page["id"], graph.page["id"]),
+                    )
+                ]
+            return super()._query(query, params)
+
+    content = VerifiedContent(OvermatchingClient(graph))  # type: ignore[arg-type]
+    found = await content.search_blocks("teh")
+
+    assert found["matches"] == 1
+    assert [row["title"] for row in found["results"]] == ["contains teh"]
 
 
 async def test_no_match_is_a_definite_zero(graph, content):

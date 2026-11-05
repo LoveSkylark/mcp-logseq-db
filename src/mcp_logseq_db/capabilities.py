@@ -636,6 +636,8 @@ ABSENT_MARKERS = (
 PRESENT_MARKERS = (
     "invalid", "missing required key", "disallowed key", "should be either",
     "can't include", "cannot be", "required", "expected",
+    "entity not found", "page not found", "block not found",
+    "no entity", "no page", "no block",
 )
 
 

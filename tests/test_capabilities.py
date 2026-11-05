@@ -105,6 +105,8 @@ async def test_probing_can_be_skipped_without_claiming_availability() -> None:
          State.AVAILABLE),
         (Exception("should be either add or edit"), State.AVAILABLE),
         (Exception('Page name can\'t include "/".'), State.AVAILABLE),
+        (Exception("Block not found for UUID"), State.AVAILABLE),
+        (Exception("No entity exists for the supplied UUID"), State.AVAILABLE),
         (Exception("Editing a page, tag or property isn't supported yet"),
          State.UNAVAILABLE),
         (Exception("Unknown method"), State.UNAVAILABLE),

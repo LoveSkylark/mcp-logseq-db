@@ -58,12 +58,10 @@ and a property the user can edit in the UI can never be written by an API
 client. `scripts/live_reliability.py --explore` reports the caller id and the
 namespaces actually present in the graph.
 
-**Tags: creation works; the delete ROUTE has never succeeded.** Every write in
-this server reads back and reports `verified`, `deleteTag` included — the
-uncertainty is not in the checking but in whether `deletePage` (the route
-underneath it) does anything when handed a tag. Until a live run says
-otherwise, treat tag deletion as likely to come back `verified: false`, and do
-not design something that depends on cleaning up tags.
+**Tags: creation and deletion are verified.** `deleteTag` was confirmed against
+Logseq 2.0.2, including its read-back. It removes the tag and its references
+from entities that carried it; the safeguards and acknowledgement requirements
+still apply because this affects multiple entities.
 
 **Blocks can be moved.** `moveBlock(block_uuid, target_uuid, placement)`
 relocates a block and its subtree — `child`, `before` or `after` — including

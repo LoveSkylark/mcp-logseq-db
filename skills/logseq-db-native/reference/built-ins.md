@@ -1,8 +1,8 @@
 # Built-in classes and properties
 
-Read from a live graph on 2026-09-20, Logseq `2.0.1-alpha+nightly.20260826`,
-via `listTags`, `listProperties` and `listClosedValues`. Entity ids are from
-that graph and are NOT stable across a rebuild — the idents are.
+Read from live graphs on Logseq `2.0.1-alpha+nightly.20260826` and 2.0.2 via
+`listTags`, `listProperties` and `listClosedValues`. Entity ids are from those
+graphs and are NOT stable across a rebuild — the idents are.
 
 Tagging is not decoration. A built-in class carries behaviour: it declares
 properties, and in some cases changes how the node renders. `#Code` turns a
@@ -67,10 +67,11 @@ property** — that is worth knowing before treating its output as an inventory.
 | Apply template to tags | `:logseq.property/template-applied-to` | class, many | On the template, naming its target tag |
 
 **Closed enums.** `Status` and `Priority` take one of a fixed set of VALUE
-ENTITIES, not a string. Call `listClosedValues` and pass the entity id. Status
-has six (Backlog, Todo, Doing, In Review, Done, Canceled) and Priority four
-(Low, Medium, High, Urgent). Note that `getAllProperties` reports the set as
-`:property/closed-values`, but no such datom exists — the real attribute is
+ENTITIES, not a string. Call `listClosedValues` and pass the entity id. On
+Logseq 2.0.2, a fresh graph returned six Status values (Backlog, Todo, Doing,
+In Review, Done, Canceled) and four Priority values (Low, Medium, High, Urgent).
+Note that `getAllProperties` reports the set as `:property/closed-values`, but
+no such datom exists — the real attribute is
 `:block/closed-value-property`, on each value pointing back at its property.
 
 **`Description` holds a block.** Its value is an entity id referring to a

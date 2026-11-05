@@ -520,13 +520,12 @@ routes that would serve them.
 > are validated at the boundary, because this API's characteristic failure is
 > success that did nothing.
 
-§2 states the standard; §3 records how far the current surface meets it. Two
-write tools — `deleteTag` and `deleteProperty` — are still shipping on
-unverified routes, and both are destructive: `deleteTag` strips the tag from
+§2 states the standard; §3 records how far the current surface meets it.
+`deleteTag` was verified against Logseq 2.0.2; `deleteProperty` remains on an
+unverified route. Both are destructive: `deleteTag` strips the tag from
 everything carrying it, and `deleteProperty` takes every value of the property
-with it. Until they are run against a live graph they are assumptions, which is
-why both gate on an explicit acknowledgement and why their read-backs are the
-only thing standing between a silent no-op and a reported success.
+with it. Their acknowledgement guards remain necessary, and read-back
+verification is required to distinguish a completed write from a silent no-op.
 
 ---
 

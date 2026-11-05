@@ -391,9 +391,10 @@ successful dry run as though the change were made.
 
 ### Pages
 
-`createPage(title)` rejects a title already held by any page, tag or block —
-the three share one title space. Its route is idempotent on title, so a repeat
-returns the existing page rather than duplicating it.
+`createPage(title)` rejects a title already held by any page, tag, block or
+property — they share one title space. A repeated call through this tool returns
+a duplicate-title error; it does not return the existing page, even though the
+underlying Logseq route is idempotent.
 
 `renamePage(page_uuid, new_title)` verifies by UUID, not by the new title —
 reading back by title cannot distinguish a rename from Logseq having created a
@@ -564,17 +565,12 @@ page holds, and `createPage` refuses one a tag holds.
 `addTag(target, tag)` and `removeTag(target, tag)` take two UUIDs, **target
 first**. Removal affects that one relation only.
 
-`deleteTag` runs on an **unverified route**: it goes through `deletePage`,
-which has never been confirmed against a tag and whose identifier type is
-unknown there. The read-back is the only thing standing between that and a
-false success, so check `verified` and report `verified: false` as a failure
-rather than as a caveat.
-
-When it does work it cascades: `:block/tags` and `:block/refs` are cleared on
-everything that carried the tag. Because that touches many entities and cannot
-be undone, it requires `acknowledge_detach` when anything holds the tag, and
-`acknowledge_child_reparent` when child tags would move. Run `getTagUsers`
-first and report what will be affected.
+`deleteTag` was verified against Logseq 2.0.2, including its read-back. It
+cascades: `:block/tags` and `:block/refs` are cleared on everything that carried
+the tag. Because that touches many entities and cannot be undone, it requires
+`acknowledge_detach` when anything holds the tag, and
+`acknowledge_child_reparent` when child tags would move. Run `getTagUsers` first
+to see what will be affected.
 
 ## Constraints worth stating to the user
 
@@ -599,11 +595,10 @@ tags the block as well. This is why `importPage` escapes both — an import
 whose links point at pages that do not exist yet would create a stub for every
 one of them.
 
-**`listClosedValues` works.** `Status` and `Priority` carry permitted values
-on a mature graph — six and four respectively. A freshly created graph has
-none, so an empty result means this graph has no enums rather than that the
-feature is missing. Both are built-ins and outside the sandbox, so they remain
-read-only.
+**`listClosedValues` works.** On Logseq 2.0.2, a freshly created graph returned
+the built-in `Status` and `Priority` values (six and four respectively). An
+empty response should not be assumed to mean the route is missing. Both are
+built-ins and outside the sandbox, so they remain read-only.
 
 **A dry run is not a write.** `dry_run` returns `verified: false` by design.
 It validates the payload, not the transaction: a graph carrying invalid

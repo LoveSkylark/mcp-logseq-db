@@ -189,10 +189,9 @@ than merely under the right parent. Nothing in this API can write
 **Destructive tools require acknowledgement.** `deletePage`, `deleteTag` and
 `deleteProperty` refuse until you confirm, listing what would be affected.
 
-**`listClosedValues` depends on the graph.** `Status` and `Priority` carry
-permitted values on a mature graph but not on a freshly created one, so an
-empty result means this graph has no enums rather than that the feature is
-missing.
+**`listClosedValues` reports graph values.** Logseq 2.0.2 returned the built-in
+Status and Priority enums even on a freshly created graph. An empty result
+should not be interpreted as proof that the route is unavailable.
 
 **`:block/page` can disagree with `:block/parent`, and that is harmless.** On
 some graphs a block's `:block/page` points at an ancestor block rather than at

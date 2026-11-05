@@ -552,12 +552,13 @@ class VerifiedContent(VerifiedWriteHelpers):
                 "truncated": True,
                 "results": [],
                 "diagnostic": (
-                    f"{matches} entities match, more than the "
-                    f"{MAX_SEARCH_ROWS} this will fetch. Nothing was read "
-                    "back: a response that large risks the byte cap, and a "
-                    "truncated row set would not say which matches were "
-                    "dropped. Narrow the search with a longer string or scope "
-                    "it with page_uuid."),
+                    f"The database predicate returned {matches} candidate "
+                    f"entities, more than the {MAX_SEARCH_ROWS} this will "
+                    "fetch. Nothing was read back, so exact substring matches "
+                    "are unverified. A response that large risks the byte "
+                    "cap, and a truncated row set would not say which matches "
+                    "were dropped. Narrow the search with a longer string or "
+                    "scope it with page_uuid."),
             }
 
         rows = await self._query_list(
@@ -568,6 +569,10 @@ class VerifiedContent(VerifiedWriteHelpers):
             "Block search", *params)
 
         results = [self._search_row(r) for r in rows if isinstance(r, dict)]
+        # Keep the public contract exact even if a backend predicate behaves
+        # more broadly than Clojure's includes? should.
+        results = [r for r in results if needle in (r["title"] or "")]
+        matches = len(results)
         if pattern is not None:
             results = [r for r in results
                        if pattern.search(r["title"] or "")]
@@ -1938,8 +1943,9 @@ class VerifiedContent(VerifiedWriteHelpers):
             while `createPage`, `insertBlock` and `createTag` all write to the
             same graph without complaint. Local graphs are unaffected, which is
             why this went unnoticed.
-          - `createPage` is idempotent on title: calling it twice returns the
-            same entity rather than creating a duplicate.
+          - Logseq's `createPage` route is idempotent on title, but this tool
+            rejects an existing title before calling it so collisions with
+            pages, tags, blocks, and properties are explicit.
 
         The duplicate check below therefore reports a clearer error than
         Logseq would, but is no longer load-bearing.
@@ -2092,7 +2098,16 @@ class VerifiedContent(VerifiedWriteHelpers):
             raise ValueError("Page is already recycled")
 
         blocks = await self.get_block_uuid(page_uuid)
-        inbound = await self._inbound_references(page["id"])
+        all_inbound = await self._inbound_references(page["id"])
+        # These virtual UI views can appear as reference entities in DB graphs.
+        reference_views = [
+            entity for entity in all_inbound
+            if str(entity.get("title") or "").strip().casefold()
+            in {"linked references", "unlinked references"}
+        ]
+        inbound = [
+            entity for entity in all_inbound if entity not in reference_views
+        ]
         aliases = await self._alias_relations(page)
         previous = (page, *blocks)
 
@@ -2118,11 +2133,13 @@ class VerifiedContent(VerifiedWriteHelpers):
                 validation=None, response=None, verified_entities=(),
                 verified=False,
                 diagnostic=(
-                    f"{len(inbound)} entities reference this page and those "
-                    "references are not rewritten on delete; set "
+                    f"{len(inbound)} real reference(s) point to this page "
+                    f"and {len(reference_views)} built-in reference view "
+                    "block(s) were excluded. Real references are not "
+                    "rewritten on delete; set "
                     "acknowledge_reference_rewrite=true to proceed"),
                 previous_entities=previous,
-                observed_entities=tuple(inbound))
+                observed_entities=tuple(all_inbound))
 
         def deleted(value: dict[str, Any] | None) -> bool:
             # Either outcome counts: the entity may vanish, or survive carrying
@@ -2174,13 +2191,16 @@ class VerifiedContent(VerifiedWriteHelpers):
             recovered_after_timeout=timed_out,
             diagnostic=(
                 f"Page recycled via its {used}. It keeps its UUID and tags, "
-                f"and {len(inbound)} inbound reference(s) were not rewritten."
+                f"{len(inbound)} real inbound reference(s) were not "
+                f"rewritten; {len(reference_views)} built-in reference "
+                "view block(s) were excluded from the acknowledgement "
+                "check."
                 + (f" {len(alias_related)} alias relation(s) were broken and "
                    "cannot be rebuilt through this API."
                    if alias_related else "")
                 if current else f"Page removed via its {used}."),
             previous_entities=previous,
-            observed_entities=tuple(inbound))
+            observed_entities=tuple(all_inbound))
 
     @serialized_write
     async def clear_page(self, page_uuid: str) -> ContentResult:

@@ -42,9 +42,9 @@ free — it is recycle-blind by design.
 
 Routed through `logseq.DB.createPage`, not `upsertNodes`. Two reasons:
 `upsertNodes` fails outright on synced graphs, returning "The Imported EDN has
-N validation error(s)" for a write its own dry run accepts; and `createPage`
-is idempotent on title, so a repeat returns the existing page rather than a
-duplicate.
+N validation error(s)" for a write its own dry run accepts. The underlying
+`createPage` route is idempotent, but the MCP tool checks title availability
+first and rejects a repeat rather than returning the existing page.
 
 Its second argument is a PROPERTIES map, not options. Passing
 `{"dry-run": true}` creates the page anyway and mints a `dry-run` property in

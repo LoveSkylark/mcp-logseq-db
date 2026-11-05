@@ -64,7 +64,7 @@ with no value until one is assigned.
 | `getTag(uuid)` | `datascriptQuery` | verified |
 | `getTagUsers(uuid)` | `datascriptQuery` | verified |
 | `creatTag(title)` | `createTag` | probable — creation observed by read-back; the assigned ident shape is not pinned |
-| `deleteTag(uuid)` | `deletePage` | **untested — identifier type unconfirmed** |
+| `deleteTag(uuid)` | `deletePage` | **verified — tag deletion and read-back confirmed on Logseq 2.0.2** |
 | `addTag(target, tag)` | `addBlockTag` | probable |
 | `removeTag(target, tag)` | `removeBlockTag` | **verified** |
 
@@ -353,11 +353,12 @@ is a block, a page, or a tag or property definition — all of them carry
 | `importPage(target, markdown)` | `insertBatchBlock` + `datascriptQuery` | **verified** |
 | `repairLinks(...)` | `updateBlock` + `datascriptQuery` | **verified** |
 
-`createPage` is idempotent on title: calling it twice returns the same entity
-rather than a duplicate. Its second argument is a **properties map, not
-options** — passing `{"dry-run": true}` creates the page anyway *and* mints a
-`dry-run` property in the caller's namespace, so there is no server-side dry run
-here.
+The underlying `createPage` route is idempotent on title, but this tool rejects
+an existing title before calling it. Repeating `createPage` through this tool
+therefore returns a duplicate-title error; it does not return the existing page.
+Its second argument is a **properties map, not options** — passing
+`{"dry-run": true}` creates the page anyway *and* mints a `dry-run` property in
+the caller's namespace, so there is no server-side dry run here.
 
 It also seeds every new page with one empty block, which is why a block count
 on a page made through this API is never 0.
